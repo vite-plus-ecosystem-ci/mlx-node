@@ -1,16 +1,9 @@
-use std::sync::OnceLock;
-use std::time::Instant;
-
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
-use crate::array::mask::create_causal_mask;
-use crate::inference_trace::{
-    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
-};
+#[cfg(not(target_family = "wasm"))]
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
@@ -33,32 +26,13 @@ pub struct Qwen3_5Attention {
 
     rope: RoPE,
     /// Optional M-RoPE for VLM mode (3D position encoding: temporal, height, width)
+    #[cfg(not(target_family = "wasm"))]
     mrope: Option<MultimodalRoPE>,
 
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
-}
-
-fn paged_prefill_paged_attention_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default(
-            "MLX_PAGED_PREFILL_PAGED_ATTENTION",
-            true,
-        )
-    })
-}
-
-fn native_kv_write_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("MLX_QWEN35_NATIVE_KV_WRITE")
-            .or_else(|_| std::env::var("MLX_NATIVE_KV_WRITE"))
-            .map(|value| crate::inference_trace::env_flag_value_enabled(&value))
-            .unwrap_or(true)
-    })
 }
 
 impl Qwen3_5Attention {
@@ -108,6 +82,7 @@ impl Qwen3_5Attention {
             q_norm,
             k_norm,
             rope,
+            #[cfg(not(target_family = "wasm"))]
             mrope: None,
             num_heads,
             num_kv_heads,
@@ -178,25 +153,28 @@ impl Qwen3_5Attention {
         let keys = self.k_norm.forward(&keys)?;
 
         // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
+        #[cfg(not(target_family = "wasm"))]
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
             // M-RoPE: compute cos/sin from 3D position IDs [3, B, T]
             let (cos, sin) = mrope.forward(&queries, pos_ids)?;
             // Transpose to [B, H, T, D] for apply_multimodal_rotary_pos_emb
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
-                &q_t,
-                &k_t,
-                &cos,
-                &sin,
-                mrope.mrope_section_arr().to_vec(),
-            )?;
+            let (q_out, k_out) =
+                apply_multimodal_rotary_pos_emb(&q_t, &k_t, &cos, &sin, mrope.mrope_section())?;
             // Transpose back to [B, T, H, D]
             let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)
         } else {
             // Standard scalar offset RoPE (text-only path, existing behavior)
+            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+            let queries = self.rope.forward(&queries, Some(offset))?;
+            let keys = self.rope.forward(&keys, Some(offset))?;
+            (queries, keys)
+        };
+        #[cfg(target_family = "wasm")]
+        let (queries, keys) = {
             let offset = cache.as_ref().map_or(0, |c| c.get_offset());
             let queries = self.rope.forward(&queries, Some(offset))?;
             let keys = self.rope.forward(&keys, Some(offset))?;
@@ -243,344 +221,8 @@ impl Qwen3_5Attention {
         self.o_proj.forward(&gated_output)
     }
 
-    /// Forward pass routed through the block-paged KV adapter.
-    ///
-    /// Mirrors [`Self::forward`] (Q-gating, partial RoPE, Q/K layernorm)
-    /// but writes K/V into the paged pool instead of a flat `KVCache`
-    /// and reads attention K/V back via either an explicit
-    /// `read_kv_range` (cache-hit prefill) or a host-side
-    /// `read_kv_range` followed by SDPA (decode). Decode uses
-    /// `read_kv_range` instead of `gather_kv_for_decode` to keep BF16
-    /// reduction order bit-equal to the flat path's SDPA — matches
-    /// Qwen3 / Gemma4's paged decode strategy.
-    ///
-    /// **Caller contract** (mirrors LFM2 / Gemma4):
-    /// 1. `adapter.record_tokens(&[...suffix])` BEFORE this call so the
-    ///    adapter cursor is advanced by the chunk; `update_keys_values`
-    ///    enforces alignment.
-    /// 2. `attn_layer_idx` is the FULL-ATTENTION ORDINAL into the
-    ///    adapter pool (NOT the absolute decoder index). Pool was sized
-    ///    by `Qwen3_5Config::full_attention_layer_count()`.
-    /// 3. The paged forward unconditionally uses standard scalar-offset
-    ///    `self.rope` (no M-RoPE branching). Text-only inputs match the
-    ///    flat path's behaviour (which uses `self.rope` whenever
-    ///    `position_ids = None`); image-bearing turns are rejected
-    ///    upstream at the chat-entry sites before reaching this fn.
-    ///
-    /// Returns `[B, T, hidden_size]` (post-output-projection,
-    /// post-gate) so the layer's residual `h = x + r` matches the flat
-    /// path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_paged(
-        &self,
-        x: &MxArray,
-        adapter: &mut PagedKVCacheAdapter,
-        attn_layer_idx: u32,
-        first_logical_position: u32,
-        cached_prefix_len: u32,
-        is_prefill: bool,
-    ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
-        // Project queries (2x width for gating).
-        let q_proj_output = self.q_proj.forward(x)?;
-
-        // Per-head split of queries / gate (matches forward()).
-        let q_per_head = q_proj_output.reshape(&[
-            batch,
-            seq_len,
-            self.num_heads as i64,
-            (self.head_dim * 2) as i64,
-        ])?;
-        let queries = q_per_head.slice_axis(3, 0, self.head_dim as i64)?;
-        let gate = q_per_head.slice_axis(3, self.head_dim as i64, (self.head_dim * 2) as i64)?;
-        let gate = gate.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-
-        // K/V projections + reshape to per-head layout.
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
-        let keys = keys.reshape(&[
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values = values.reshape(&[
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-
-        // QK normalization on the last dim.
-        let queries = self.q_norm.forward(&queries)?;
-        let keys = self.k_norm.forward(&keys)?;
-
-        // Standard scalar-offset partial RoPE. Paged path is text-only;
-        // image-bearing turns are rejected at the chat-entry sites
-        // (`chat_sync_core` / `chat_stream_sync_inner` and the MoE
-        // counterparts) before reaching this forward.
-        let rope_offset = first_logical_position as i32;
-        let queries = self.rope.forward(&queries, Some(rope_offset))?;
-        let keys = self.rope.forward(&keys, Some(rope_offset))?;
-
-        // Transpose to [B, H, T, D] for SDPA.
-        let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
-        let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
-        let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
-
-        // Paged-pool layout: `[num_tokens, num_kv_heads, head_dim]`.
-        // [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D].
-        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
-            batch * seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
-        ])?;
-
-        let trace_enabled = inference_trace_enabled();
-        let write_trace_start = trace_enabled.then(Instant::now);
-        let write_path = if native_kv_write_enabled() {
-            match adapter.update_keys_values_native(
-                attn_layer_idx,
-                &keys_paged,
-                &values_paged,
-                first_logical_position,
-            ) {
-                Ok(()) => "native",
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3.5-attn paged_kv_write_fallback \
-                             layer={} first_position={} seq_len={} error={}",
-                            attn_layer_idx, first_logical_position, seq_len, err
-                        ));
-                    }
-                    adapter
-                        .update_keys_values(
-                            attn_layer_idx,
-                            &keys_paged,
-                            &values_paged,
-                            first_logical_position,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                    "legacy"
-                }
-            }
-        } else {
-            adapter
-                .update_keys_values(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .map_err(napi::Error::from_reason)?;
-            "legacy"
-        };
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-attn paged_kv_write_done \
-                 layer={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
-                attn_layer_idx,
-                first_logical_position,
-                seq_len,
-                write_path,
-                write_trace_start.map(elapsed_ms).unwrap_or(0.0)
-            ));
-        }
-
-        // Compute attention output.
-        let attn_bhtd = if is_prefill {
-            if cached_prefix_len == 0 {
-                // Fresh prefill: SDPA over in-flight Q/K/V with internal
-                // causal mask.
-                if seq_len > 1 {
-                    scaled_dot_product_attention_causal(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale as f64,
-                    )?
-                } else {
-                    scaled_dot_product_attention(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale as f64,
-                        None,
-                    )?
-                }
-            } else {
-                // Cache-hit prefill: read full [0, total_ctx) K/V back
-                // from the pool. The suffix was just written above. When
-                // explicitly enabled, try the MLX paged-attention bridge first
-                // so the suffix attends directly against the pool without
-                // host-side K/V materialization.
-                let total_ctx = cached_prefix_len + (seq_len as u32);
-                let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
-                    let paged_trace_start = trace_enabled.then(Instant::now);
-                    let queries_paged =
-                        queries.reshape(&[seq_len, self.num_heads as i64, self.head_dim as i64])?;
-                    match adapter.gather_kv_for_prefill_chunk(
-                        attn_layer_idx,
-                        &queries_paged,
-                        cached_prefix_len,
-                        self.scale,
-                    ) {
-                        Ok(attn_t_h_d) => {
-                            let target_dtype = x.dtype()?;
-                            let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
-                            let attn = attn_t_h_d.reshape(&[
-                                batch,
-                                seq_len,
-                                self.num_heads as i64,
-                                self.head_dim as i64,
-                            ])?;
-                            let attn = attn.transpose(Some(&[0, 2, 1, 3]))?;
-                            if trace_enabled {
-                                write_inference_trace(format_args!(
-                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
-                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                     path=paged_attention bridge_ms={:.1} read_kv_range_ms=0.0 \
-                                     mask_ms=0.0 sdpa_mode=none sdpa_graph_ms=0.0",
-                                    attn_layer_idx,
-                                    seq_len,
-                                    cached_prefix_len,
-                                    total_ctx,
-                                    paged_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                                ));
-                            }
-                            Some(attn)
-                        }
-                        Err(err) => {
-                            if trace_enabled {
-                                write_inference_trace(format_args!(
-                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_paged_fallback \
-                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                     error={}",
-                                    attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
-                                ));
-                            }
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                match maybe_paged_attn {
-                    Some(attn) => attn,
-                    None => {
-                        let read_trace_start = trace_enabled.then(Instant::now);
-                        let (k_full, v_full) = adapter
-                            .read_kv_range(attn_layer_idx, 0, total_ctx)
-                            .map_err(napi::Error::from_reason)?;
-                        let read_kv_range_ms = read_trace_start.map(elapsed_ms);
-                        let mask_trace_start = trace_enabled.then(Instant::now);
-                        let mask = create_causal_mask(
-                            seq_len as i32,
-                            Some(cached_prefix_len as i32),
-                            None,
-                        )?;
-                        let mask_ms = mask_trace_start.map(elapsed_ms);
-                        let sdpa_trace_start = trace_enabled.then(Instant::now);
-                        let attn = scaled_dot_product_attention(
-                            &queries_bhtd,
-                            &k_full,
-                            &v_full,
-                            self.scale as f64,
-                            Some(&mask),
-                        )?;
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
-                                 layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                 path=read_kv_range read_kv_range_ms={:.1} mask_ms={:.1} \
-                                 sdpa_mode=explicit_mask sdpa_graph_ms={:.1}",
-                                attn_layer_idx,
-                                seq_len,
-                                cached_prefix_len,
-                                total_ctx,
-                                read_kv_range_ms.unwrap_or(0.0),
-                                mask_ms.unwrap_or(0.0),
-                                sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                            ));
-                        }
-                        attn
-                    }
-                }
-            }
-        } else {
-            // Decode: prefer graph-native paged attention so native K/V
-            // writes and attention reads remain in one MLX dependency graph.
-            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
-                1,
-                self.num_heads as i64,
-                self.head_dim as i64,
-            ])?;
-            let gather_trace_start = trace_enabled.then(Instant::now);
-            let attn_3d = match adapter.gather_kv_for_decode_graph(
-                attn_layer_idx,
-                &queries_3d,
-                self.scale,
-                /* softcap */ 1.0,
-            ) {
-                Ok(attn_3d) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                             layer={} path=graph total_ctx={} elapsed_ms={:.1}",
-                            attn_layer_idx,
-                            adapter.current_token_count(),
-                            gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                        ));
-                    }
-                    attn_3d
-                }
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
-                             layer={} path=raw total_ctx={} error={}",
-                            attn_layer_idx,
-                            adapter.current_token_count(),
-                            err
-                        ));
-                    }
-                    adapter
-                        .gather_kv_for_decode(
-                            attn_layer_idx,
-                            &queries_3d,
-                            self.scale,
-                            /* softcap */ 1.0,
-                        )
-                        .map_err(napi::Error::from_reason)?
-                }
-            };
-            let target_dtype = x.dtype()?;
-            let attn_3d = attn_3d.astype(target_dtype)?;
-            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
-        };
-
-        // Transpose back: [B, H, T, D] -> [B, T, H*D].
-        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-
-        // Apply gate: output * sigmoid(gate).
-        let gate_sigmoid = Activations::sigmoid(&gate)?;
-        let gated_output = output.mul(&gate_sigmoid)?;
-
-        // Output projection.
-        self.o_proj.forward(&gated_output)
-    }
-
     /// Initialize M-RoPE for VLM mode.
+    #[cfg(not(target_family = "wasm"))]
     pub fn init_mrope(
         &mut self,
         mrope_section: Vec<i32>,

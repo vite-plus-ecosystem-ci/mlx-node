@@ -41,7 +41,16 @@
   "napi": {
     "binaryName": "mlx-core",
     "targets": [
-      "aarch64-apple-darwin"
-    ]
+      "aarch64-apple-darwin",
+      "wasm32-wasip1-threads"
+    ],
+    "wasm": {
+      "initialMemory": 16000,
+      "maximumMemory": 65536,
+      "browser": {
+        "fs": false,
+        "asyncInit": true
+      }
+    }
   }
 }

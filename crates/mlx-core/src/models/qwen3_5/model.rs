@@ -1,23 +1,25 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
+#[cfg(not(target_family = "wasm"))]
+use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
+#[cfg(not(target_family = "wasm"))]
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
-use crate::inference_trace::{
-    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
-};
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
+use crate::tokenizer::ChatMessage;
+use crate::tokenizer::Qwen3Tokenizer;
+use crate::tokenizer::ToolDefinition;
+use crate::tools;
 use crate::tools::ToolCallResult;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::chat_common;
 use super::chat_common::{
@@ -28,6 +30,7 @@ use super::chat_common::{
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
+#[cfg(not(target_family = "wasm"))]
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
@@ -66,219 +69,6 @@ pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::Rw
 /// calls from different model threads can collide on process-wide globals.
 static DENSE_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
-    (0..config.num_layers as usize)
-        .map(|i| {
-            if config.is_linear_layer(i) {
-                Qwen3_5LayerCache::new_linear()
-            } else {
-                Qwen3_5LayerCache::new_full_attention()
-            }
-        })
-        .collect()
-}
-
-const DENSE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
-
-struct DenseGdnPrefixCheckpoint {
-    prefix_len: u32,
-    block_size: u32,
-    final_block_hash: u64,
-    tokens: Vec<u32>,
-    caches: Vec<Qwen3_5LayerCache>,
-}
-
-struct DenseGdnHistoryCheckpoint {
-    tokens: Vec<u32>,
-    caches: Vec<Qwen3_5LayerCache>,
-}
-
-struct DenseGdnPrefixPreparation {
-    state: &'static str,
-    already_primed: bool,
-}
-
-#[derive(Default)]
-struct DenseGdnCheckpointStoreTrace {
-    stored: bool,
-    hash_ms: f64,
-    eval_ms: f64,
-    clone_ms: f64,
-    token_clone_ms: f64,
-    update_ms: f64,
-    total_ms: f64,
-}
-
-impl DenseGdnCheckpointStoreTrace {
-    fn finish(mut self, start: Option<std::time::Instant>) -> Self {
-        self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
-        self
-    }
-}
-
-fn dense_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled("MLX_DENSE_GDN_REPLAY_PREFIX_CHECKPOINT")
-    })
-}
-
-#[derive(Clone, Copy)]
-struct TokenPrefixMismatchTrace {
-    index: i64,
-    prompt_token: i64,
-    cached_token: i64,
-}
-
-impl Default for TokenPrefixMismatchTrace {
-    fn default() -> Self {
-        Self {
-            index: -1,
-            prompt_token: -1,
-            cached_token: -1,
-        }
-    }
-}
-
-fn token_prefix_mismatch_trace(prompt: &[u32], cached: &[u32]) -> TokenPrefixMismatchTrace {
-    let common_len = prompt.len().min(cached.len());
-    for i in 0..common_len {
-        if prompt[i] != cached[i] {
-            return TokenPrefixMismatchTrace {
-                index: i as i64,
-                prompt_token: prompt[i] as i64,
-                cached_token: cached[i] as i64,
-            };
-        }
-    }
-
-    TokenPrefixMismatchTrace {
-        index: common_len as i64,
-        prompt_token: prompt.get(common_len).map_or(-1, |token| *token as i64),
-        cached_token: cached.get(common_len).map_or(-1, |token| *token as i64),
-    }
-}
-
-fn dense_paged_linear_caches_ready(
-    config: &Qwen3_5Config,
-    caches: Option<&[Qwen3_5LayerCache]>,
-) -> bool {
-    let Some(caches) = caches else {
-        return false;
-    };
-    if caches.len() != config.num_layers as usize {
-        return false;
-    }
-    for (i, cache) in caches.iter().enumerate() {
-        if !config.is_linear_layer(i) {
-            continue;
-        }
-        let Qwen3_5LayerCache::Linear(arrays) = cache else {
-            return false;
-        };
-        if arrays.get(0).is_none() || arrays.get(1).is_none() {
-            return false;
-        }
-    }
-    true
-}
-
-fn clone_dense_linear_layer_caches(
-    config: &Qwen3_5Config,
-    caches: &[Qwen3_5LayerCache],
-) -> Option<Vec<Qwen3_5LayerCache>> {
-    if !dense_paged_linear_caches_ready(config, Some(caches)) {
-        return None;
-    }
-
-    let mut cloned = fresh_dense_layer_caches(config);
-    for i in 0..config.num_layers as usize {
-        if !config.is_linear_layer(i) {
-            continue;
-        }
-        let Qwen3_5LayerCache::Linear(arrays) = &caches[i] else {
-            return None;
-        };
-        cloned[i] = Qwen3_5LayerCache::Linear(arrays.clone());
-    }
-    Some(cloned)
-}
-
-fn compute_paged_prefix_block_hash(
-    tokens: &[u32],
-    prefix_len: u32,
-    block_size: u32,
-    extra_keys_per_block: &[Vec<u64>],
-    cache_salt: u64,
-) -> Option<u64> {
-    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
-        return None;
-    }
-
-    let prefix_len = prefix_len as usize;
-    let block_size = block_size as usize;
-    if prefix_len > tokens.len() {
-        return None;
-    }
-
-    let num_blocks = prefix_len / block_size;
-    let mut parent_hash = 0;
-    for block_idx in 0..num_blocks {
-        let extra_keys = extra_keys_per_block.get(block_idx)?;
-        let start = block_idx * block_size;
-        let end = start + block_size;
-        parent_hash = if block_idx == 0 && cache_salt != 0 {
-            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
-            salted_keys.extend_from_slice(extra_keys);
-            salted_keys.push(cache_salt);
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
-        } else {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
-        };
-    }
-
-    Some(parent_hash)
-}
-
-fn export_paged_dense_linear_caches(
-    config: &Qwen3_5Config,
-) -> Result<Option<Vec<Qwen3_5LayerCache>>> {
-    let num_layers = config.num_layers as usize;
-    let expected = num_layers
-        .checked_mul(2)
-        .ok_or_else(|| Error::from_reason("paged dense cache export size overflow"))?;
-    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); expected];
-    let exported = unsafe {
-        mlx_sys::mlx_qwen35_export_paged_linear_caches(export_ptrs.as_mut_ptr(), expected as i32)
-    };
-    if exported == 0 {
-        return Ok(None);
-    }
-    if exported != expected as i32 {
-        return Err(Error::from_reason(format!(
-            "paged dense linear cache export returned {exported} arrays; expected {expected}"
-        )));
-    }
-
-    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_paged_cache_offset() };
-    let mut new_caches = fresh_dense_layer_caches(config);
-    for i in 0..num_layers {
-        if !config.is_linear_layer(i) {
-            continue;
-        }
-        let p0 = export_ptrs[i * 2];
-        let p1 = export_ptrs[i * 2 + 1];
-        if p0.is_null() || p1.is_null() {
-            return Err(Error::from_reason(format!(
-                "paged dense linear cache export missing layer {i}"
-            )));
-        }
-        new_caches[i].import_ptrs(p0, p1, cache_offset);
-    }
-
-    Ok(Some(new_caches))
-}
-
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership of all inference
@@ -299,19 +89,6 @@ pub(crate) struct Qwen35Inner {
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
-    gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
-    gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
-    /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
-    /// full-attention layers.
-    ///
-    /// **Opt-in via `Qwen3_5Config::use_block_paged_cache`** — see the
-    /// flag's rustdoc for the full architectural rationale. When
-    /// `Some(...)`, full-attention layers route through this adapter
-    /// while linear-attention (GDN) layers stay on
-    /// `Qwen3_5LayerCache::Linear` with no cross-request prefix reuse.
-    /// The compiled C++ forward path is bypassed entirely on the paged
-    /// path.
-    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -319,6 +96,26 @@ pub(crate) struct Qwen35Inner {
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
+    /// Session-based chat continuation: prefill a pre-tokenized delta on top
+    /// of the existing KV caches, then decode. Text-only; requires an active
+    /// session (prior `ChatSessionStart` call that initialized `self.caches`).
+    ///
+    /// This bypasses the jinja chat template entirely — the caller is
+    /// responsible for producing the correctly-formatted delta tokens
+    /// (typically `\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
+    ///
+    /// Constructed internally by `chat_session_continue_sync` after building
+    /// and tokenizing the delta. Not currently wired through a NAPI method
+    /// directly — external callers use `ChatSessionContinue` instead, which
+    /// handles delta construction on the model thread. Kept as its own
+    /// variant so the lower-level pre-tokenized entry point stays exposed
+    /// for the gated integration test and future advanced use cases.
+    #[allow(dead_code)]
+    ChatTokensDelta {
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
     /// Start a new session via the text-only jinja-render path with
     /// `<|im_end|>` as the stop token. See
     /// [`Qwen35Inner::chat_session_start_sync`] for the behavioural
@@ -388,6 +185,16 @@ pub(crate) enum Qwen35Cmd {
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
+    TakeCache {
+        reply: ResponseTx<Option<crate::models::qwen3_5::prompt_cache::PromptCache>>,
+    },
+    SetCache {
+        cache: crate::models::qwen3_5::prompt_cache::PromptCache,
+        reply: ResponseTx<()>,
+    },
+    InitCaches {
+        reply: ResponseTx<()>,
+    },
     ResetCaches {
         reply: ResponseTx<()>,
     },
@@ -455,6 +262,13 @@ pub(crate) enum Qwen35Cmd {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     match cmd {
+        Qwen35Cmd::ChatTokensDelta {
+            delta_tokens,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_tokens_delta_sync(delta_tokens, config));
+        }
         Qwen35Cmd::ChatSessionStart {
             messages,
             config,
@@ -528,6 +342,15 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+        }
+        Qwen35Cmd::TakeCache { reply } => {
+            let _ = reply.send(Ok(inner.take_cache_sync()));
+        }
+        Qwen35Cmd::SetCache { cache, reply } => {
+            let _ = reply.send(inner.set_cache_sync(cache));
+        }
+        Qwen35Cmd::InitCaches { reply } => {
+            let _ = reply.send(inner.init_caches_sync());
         }
         Qwen35Cmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_caches_sync());
@@ -629,7 +452,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
 ///
 /// Packs every value the shared post-prefill pipeline needs into a single
 /// named struct so callers don't have to thread 20+ positional arguments.
-/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync_core`] and
+/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync`] and
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
@@ -687,7 +510,7 @@ pub(crate) struct ChatDecodeInputs {
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
     pub enable_thinking: Option<bool>,
-    /// End-of-sequence token id for the decode loop. For `chat_sync_core` this
+    /// End-of-sequence token id for the decode loop. For `chat_sync` this
     /// is `config.eos_token_id`; for the session delta path it's
     /// `<|im_end|>` so cache boundaries stay clean.
     pub eos_id: u32,
@@ -743,84 +566,6 @@ impl Qwen35Inner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
-        //
-        // VLM checkpoints can co-exist with paged dispatch for
-        // text-only inference: the M-RoPE / vision-feature path is
-        // only invoked when an input message carries images, and the
-        // chat-entry sites reject `has_images && paged_adapter` at
-        // runtime. Text-only forward (`Qwen3_5Attention::forward` with
-        // `position_ids = None`) and the paged forward
-        // (`Qwen3_5Attention::forward_paged`) both go through standard
-        // `self.rope`, so byte-equal parity holds on text-only inputs
-        // even on VLM weights.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
-            let attn_layer_count = config.full_attention_layer_count() as u32;
-            if attn_layer_count == 0 {
-                return Err(Error::from_reason(
-                    "Qwen3.5 block-paged adapter: config has no full_attention layers; \
-                     paged KV cache requires at least one attention layer. Check \
-                     full_attention_interval.",
-                ));
-            }
-
-            let block_size = config.paged_block_size.unwrap_or(16);
-            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
-            let head_size = config.head_dim as u32;
-            let num_kv_heads = config.num_kv_heads as u32;
-
-            let pa_config = mlx_paged_attn::PagedAttentionConfig {
-                block_size,
-                gpu_memory_mb,
-                head_size,
-                num_kv_heads,
-                // Pool covers only the full-attention layers — GDN
-                // (linear-attention) layers continue to use
-                // `Qwen3_5LayerCache::Linear`.
-                num_layers: attn_layer_count,
-                use_fp8_cache: Some(false),
-                max_seq_len: Some(config.max_position_embeddings as u32),
-                max_batch_size: Some(32),
-            };
-
-            let num_blocks = pa_config.calculate_num_blocks();
-            if num_blocks == 0 {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
-                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
-                     block_size={block_size}, num_attn_layers={attn_layer_count})"
-                )));
-            }
-
-            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                num_blocks, block_size,
-            )));
-
-            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
-                .map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct LayerKVPool for Qwen3.5 block-paged adapter: {e}"
-                    ))
-                })?;
-
-            let adapter =
-                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct Qwen3.5 PagedKVCacheAdapter: {e}"
-                    ))
-                })?;
-
-            info!(
-                "Qwen3.5 block-paged adapter enabled: num_blocks={}, block_size={}, \
-                 gpu_memory_mb={}, num_attn_layers={}, cache_dtype=BFloat16",
-                num_blocks, block_size, gpu_memory_mb, attn_layer_count
-            );
-            Some(adapter)
-        } else {
-            None
-        };
-
         Ok(Self {
             config,
             embedding,
@@ -840,16 +585,22 @@ impl Qwen35Inner {
             cached_image_key: None,
             cached_rope_deltas: None,
             model_id,
-            gdn_prefix_checkpoints: VecDeque::new(),
-            gdn_last_history_checkpoint: None,
-            paged_adapter,
             training_state: None,
         })
     }
 
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
-        self.caches = Some(fresh_dense_layer_caches(&self.config));
+        let caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(caches);
         self.clear_reuse_state();
         Ok(())
     }
@@ -871,346 +622,40 @@ impl Qwen35Inner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
-        self.gdn_prefix_checkpoints.clear();
-        self.gdn_last_history_checkpoint = None;
     }
 
-    fn find_dense_gdn_history_checkpoint(
-        &self,
-        tokens: &[u32],
-        prefix_len: u32,
-    ) -> Option<Vec<Qwen3_5LayerCache>> {
-        let prefix_tokens = tokens.get(..prefix_len as usize)?;
-        let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
-        if checkpoint.tokens.as_slice() != prefix_tokens {
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
+    pub(crate) fn take_cache_sync(
+        &mut self,
+    ) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        if self.cached_token_history.is_empty() {
             return None;
         }
-        clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
+        let caches = self.caches.take()?;
+        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            caches,
+            self.cached_token_history.clone(),
+            "qwen3_5",
+            self.config.num_layers as usize,
+            self.cached_image_key,
+            self.cached_rope_deltas,
+            self.model_id,
+        ))
     }
 
-    fn remember_dense_gdn_history_checkpoint(&mut self) -> Result<DenseGdnCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = DenseGdnCheckpointStoreTrace::default();
-        if self.cached_token_history.is_empty() {
-            self.gdn_last_history_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        }
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-        let clone_start = trace_enabled.then(std::time::Instant::now);
-        let Some(caches) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
-        else {
-            self.gdn_last_history_checkpoint = None;
-            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let tokens = self.cached_token_history.clone();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint { tokens, caches });
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-        Ok(trace.finish(total_start))
-    }
-
-    fn find_dense_gdn_prefix_checkpoint(
-        &self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Option<Vec<Qwen3_5LayerCache>> {
-        let final_block_hash = compute_paged_prefix_block_hash(
-            tokens,
-            prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        )?;
-        let prefix_tokens = tokens.get(..prefix_len as usize)?;
-
-        self.gdn_prefix_checkpoints
-            .iter()
-            .rev()
-            .find(|checkpoint| {
-                checkpoint.prefix_len == prefix_len
-                    && checkpoint.block_size == block_size
-                    && checkpoint.final_block_hash == final_block_hash
-                    && checkpoint.tokens.as_slice() == prefix_tokens
-                    && dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-            })
-            .and_then(|checkpoint| {
-                clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
-            })
-    }
-
-    fn remember_dense_gdn_prefix_checkpoint(
+    /// Restore a previously taken `PromptCache` into the model.
+    pub(crate) fn set_cache_sync(
         &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Result<DenseGdnCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = DenseGdnCheckpointStoreTrace::default();
-        let hash_start = trace_enabled.then(std::time::Instant::now);
-        let Some(final_block_hash) = compute_paged_prefix_block_hash(
-            tokens,
-            prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        ) else {
-            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(trace.finish(total_start));
-        };
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-        let clone_start = trace_enabled.then(std::time::Instant::now);
-        let Some(caches) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
-        else {
-            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_prefix_checkpoints.retain(|checkpoint| {
-            !(checkpoint.prefix_len == prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens == prefix_tokens)
-        });
-        self.gdn_prefix_checkpoints
-            .push_back(DenseGdnPrefixCheckpoint {
-                prefix_len,
-                block_size,
-                final_block_hash,
-                tokens: prefix_tokens,
-                caches,
-            });
-        while self.gdn_prefix_checkpoints.len() > DENSE_GDN_PREFIX_CHECKPOINT_LIMIT {
-            self.gdn_prefix_checkpoints.pop_front();
-        }
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-
-        Ok(trace.finish(total_start))
-    }
-
-    fn prepare_dense_gdn_prefix_state(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        continued_live_prefix: bool,
-    ) -> Result<DenseGdnPrefixPreparation> {
-        let trace_enabled = inference_trace_enabled();
-        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
-        let gdn_caches_ready =
-            dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if gdn_caches_ready && continued_live_prefix {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=live \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "live",
-                already_primed: true,
-            });
-        }
-
-        let gdn_prefix_from_history = cached_prefix_len > 0
-            && self.cached_token_history.len() == cached_prefix_len as usize
-            && tokens.starts_with(&self.cached_token_history);
-        if gdn_caches_ready && gdn_prefix_from_history {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=last_history \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "last_history",
-                already_primed: true,
-            });
-        }
-
-        if cached_prefix_len > 0 {
-            let history_lookup_start = trace_enabled.then(std::time::Instant::now);
-            let history_checkpoint =
-                self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len);
-            let history_lookup_ms = history_lookup_start.map(elapsed_ms);
-            if let Some(checkpoint) = history_checkpoint {
-                self.caches = Some(checkpoint);
-                if let Some(start) = prepare_trace_start {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done \
-                         state=last_history_checkpoint cached_prefix_tokens={} \
-                         history_lookup_ms={:.1} elapsed_ms={:.1}",
-                        cached_prefix_len,
-                        history_lookup_ms.unwrap_or(0.0),
-                        elapsed_ms(start)
-                    ));
-                }
-                return Ok(DenseGdnPrefixPreparation {
-                    state: "last_history_checkpoint",
-                    already_primed: true,
-                });
-            } else if trace_enabled {
-                let history_checkpoint_len = self
-                    .gdn_last_history_checkpoint
-                    .as_ref()
-                    .map_or(0, |checkpoint| checkpoint.tokens.len());
-                let history_mismatch =
-                    token_prefix_mismatch_trace(tokens, &self.cached_token_history);
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint_miss \
-                     cached_prefix_tokens={} history_len={} checkpoint_len={} \
-                     history_match={} history_mismatch_at={} prompt_token={} \
-                     history_token={} history_lookup_ms={:.1}",
-                    cached_prefix_len,
-                    self.cached_token_history.len(),
-                    history_checkpoint_len,
-                    gdn_prefix_from_history,
-                    history_mismatch.index,
-                    history_mismatch.prompt_token,
-                    history_mismatch.cached_token,
-                    history_lookup_ms.unwrap_or(0.0)
-                ));
-            }
-        }
-
-        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_checkpoint = self.find_dense_gdn_prefix_checkpoint(
-            tokens,
-            cached_prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        );
-        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
-        if let Some(checkpoint) = prefix_checkpoint {
-            self.caches = Some(checkpoint);
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=checkpoint \
-                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "checkpoint",
-                already_primed: true,
-            });
-        }
-
-        self.caches = Some(fresh_dense_layer_caches(&self.config));
-        if cached_prefix_len == 0 {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=replay \
-                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "replay",
-                already_primed: false,
-            });
-        }
-
-        let prefix = tokens.get(..cached_prefix_len as usize).ok_or_else(|| {
-            Error::from_reason("dense paged GDN prefix replay length exceeds prompt length")
+        mut cache: crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        let restored_caches = cache.take_caches().ok_or_else(|| {
+            Error::from_reason("PromptCache is empty (already consumed or disposed)")
         })?;
-        let embed = self.embedding.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("dense paged GDN prefix caches not initialized"))?;
-        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
-        super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
-        let replay_ms = replay_trace_start.map(elapsed_ms);
-        let store_trace = if dense_gdn_store_replayed_prefix_checkpoint_enabled() {
-            self.remember_dense_gdn_prefix_checkpoint(
-                tokens,
-                cached_prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        } else {
-            DenseGdnCheckpointStoreTrace::default()
-        };
-        if let Some(start) = prepare_trace_start {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state={} \
-                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
-                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
-                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
-                 elapsed_ms={:.1}",
-                if store_trace.stored {
-                    "replay_store"
-                } else {
-                    "replay"
-                },
-                cached_prefix_len,
-                prefix_lookup_ms.unwrap_or(0.0),
-                replay_ms.unwrap_or(0.0),
-                store_trace.stored,
-                store_trace.hash_ms,
-                store_trace.eval_ms,
-                store_trace.clone_ms,
-                store_trace.token_clone_ms,
-                store_trace.update_ms,
-                store_trace.total_ms,
-                elapsed_ms(start)
-            ));
-        }
-
-        Ok(DenseGdnPrefixPreparation {
-            state: if store_trace.stored {
-                "replay_store"
-            } else {
-                "replay"
-            },
-            already_primed: true,
-        })
+        self.caches = Some(restored_caches);
+        self.cached_token_history = cache.token_history().to_vec();
+        self.cached_image_key = cache.image_cache_key();
+        self.cached_rope_deltas = cache.rope_deltas();
+        Ok(())
     }
 
     /// Save model weights and configuration to a directory (synchronous).
@@ -1401,27 +846,8 @@ impl Qwen35Inner {
     }
 
     /// Set the vision encoder.
-    ///
-    /// Permits loading the vision encoder even when `paged_adapter` is
-    /// active so VLM checkpoints can run text-only inference through
-    /// the paged dispatch. The actual incompatibility is the
-    /// M-RoPE / vision-feature plumbing on the paged forward path,
-    /// which only fires when an input message carries images. The
-    /// chat-entry sites (`chat_sync_core`, `chat_stream_sync_inner`,
-    /// and the MoE counterparts) reject `has_images && paged_adapter`
-    /// before dispatching, so text-only paged turns proceed normally
-    /// while image turns surface a clear runtime error.
-    ///
-    /// For text-only inputs M-RoPE collapses to standard scalar-offset
-    /// RoPE — `Qwen3_5Attention::forward` uses `self.rope` whenever
-    /// `position_ids` is `None`, which is the case for every text-only
-    /// flat call. The paged forward (`Qwen3_5Attention::forward_paged`)
-    /// also goes through `self.rope` unconditionally. Both paths share
-    /// the same RoPE on text-only inputs, so byte-equal parity holds
-    /// on VLM checkpoints provided no images are passed.
-    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
+    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
         self.vision_encoder = Some(Arc::new(enc));
-        Ok(())
     }
 
     /// Set the image processor.
@@ -1577,23 +1003,6 @@ impl Qwen35Inner {
         let first_token_instant: Option<std::time::Instant> = None;
 
         let model_id = self.model_id;
-
-        // Block-paged dispatch — early-return BEFORE the compile lock so
-        // the paged path never acquires `DENSE_COMPILED_MUTEX` /
-        // `COMPILED_WEIGHTS_RWLOCK` and never calls
-        // `mlx_qwen35_compiled_init_from_prefill`. The compiled C++
-        // forward path is incompatible with per-layer paged dispatch;
-        // mixing the two on the same turn would corrupt subsequent
-        // flat-path turns' compiled state.
-        if self.paged_adapter.is_some() {
-            if has_images {
-                return Err(Error::from_reason(
-                    "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
-                     use_block_paged_cache=false (text-only turns continue to work).",
-                ));
-            }
-            return self.chat_sync_core_paged(tokens, tokenizer, eos_token_id, p, report_perf);
-        }
 
         // Check if compiled path will be used
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
@@ -1952,22 +1361,7 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Block-paged dispatch — early-return BEFORE the compile lock.
-        // The delta path treats `cached_token_history + delta` as the
-        // FULL prompt for paged purposes; the paged adapter's
-        // warm-continue path picks up the matching prefix
-        // automatically.
-        if self.paged_adapter.is_some() {
-            return self.chat_sync_core_paged(
-                full_token_history.clone(),
-                tokenizer.clone(),
-                eos_id,
-                p,
-                report_perf,
-            );
-        }
-
-        // Check compiled path availability (same contract as chat_sync_core).
+        // Check compiled path availability (same contract as chat_sync).
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _compiled_lock = if use_compiled {
             Some(
@@ -2111,7 +1505,7 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        // Match `chat_sync_core`'s sanitization so the session path is subject to
+        // Match `chat_sync`'s sanitization so the session path is subject to
         // the same role/content injection protection as the legacy path.
         // The delta is text-only — images are stripped here anyway because
         // they are never valid on the session continue path.
@@ -2169,9 +1563,9 @@ impl Qwen35Inner {
     /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
     /// → decode loop → cache export → save cache state → finalize result.
     ///
-    /// Extracted from `chat_sync_core` so it can also be driven by the text-only
+    /// Extracted from `chat_sync` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `chat_sync_core` for the existing caller — `token_history_init` is the
+    /// of `chat_sync` for the existing caller — `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
@@ -2371,7 +1765,7 @@ impl Qwen35Inner {
                     // compile init would feed stale handles to the GPU —
                     // triggering Metal page-faults / innocent-victim hangs
                     // on the first forward of the next turn.
-                    eval_layer_caches(&self.caches)?;
+                    eval_layer_caches(&self.caches);
                 }
             }
         } else {
@@ -2480,1376 +1874,6 @@ impl Qwen35Inner {
         // See the invariant doc on `verify_cache_prefix_direct`.
         result.cached_tokens = cached_tokens_for_result;
         Ok(result)
-    }
-
-    /// Block-paged variant of [`Self::chat_sync_core`].
-    ///
-    /// Mirrors the flat path's control flow (penalty stack, decode
-    /// loop, EOS / repetition cutoff, performance timing, output
-    /// post-processing) but routes full-attention layers through
-    /// `forward_paged_or_flat` against the paged KV adapter. GDN
-    /// (linear-attention) layers continue to use their existing
-    /// `Qwen3_5LayerCache::Linear(ArraysCache)` storage and are
-    /// reset+re-prefilled every turn (no cross-request prefix reuse —
-    /// vLLM's `MambaManager` stance).
-    ///
-    /// Per-turn lifecycle:
-    /// 1. Adapter lifecycle: warm-continue when the prior turn ended
-    ///    via `finalize_turn_keep_live`; cold-start (reset →
-    ///    find_cached_prefix → allocate_suffix) otherwise.
-    /// 2. Prepare GDN prefix state from live/session checkpoints when
-    ///    available; otherwise replay the cached prefix through GDN.
-    /// 3. Prefill via `paged_forward::run_paged_prefill_chunk`.
-    /// 4. Decode loop via `paged_forward::run_paged_decode_step`.
-    /// 5. End-of-turn: `finalize_turn_keep_live` keeps the partial
-    ///    trailing block live for the next turn's warm
-    ///    `continue_turn` (mirrors LFM2 / Qwen3).
-    ///
-    /// Limitations:
-    /// * VLM is rejected upstream — paged dispatch is text-only.
-    /// * Cross-turn GDN prefix reuse is limited to live/history/prefix
-    ///   checkpoints whose identity matches the paged KV prefix. Misses
-    ///   fall back to GDN replay from token 0.
-    /// * Pure-cache prompt (every prompt token already in the paged
-    ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
-    /// * The compiled C++ forward path is bypassed — paged turns run
-    ///   the pure-Rust `DecoderLayer::forward_paged_or_flat`.
-    fn chat_sync_core_paged(
-        &mut self,
-        tokens: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        eos_token_id: u32,
-        p: chat_common::ChatParams,
-        report_perf: bool,
-    ) -> Result<ChatResult> {
-        if tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-
-        let prompt_token_count = tokens.len() as u32;
-        let sampling_config = p.sampling_config;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = true;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            thinking_enabled,
-            p.thinking_token_budget,
-            think_end_id,
-        );
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-        let trace_enabled = inference_trace_enabled();
-
-        // Detect availability of the C++ compiled paged decode path.
-        // Mirrors the MoE paged path: if the weights for this model are
-        // still registered (no other model swapped `g_active_model_id`),
-        // we can run `mlx_qwen35_init_paged` + `mlx_qwen35_forward_paged`.
-        // Both the legacy flat compiled path and the new paged compiled
-        // path share `DENSE_COMPILED_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` for
-        // process-wide serialization.
-        let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _dense_lock = if use_cpp_paged {
-            Some(
-                DENSE_COMPILED_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut _weight_guard = None;
-        let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // === Adapter lifecycle: warm continuation OR cold start ===
-        let seq_id: u32 = 0;
-        // Lazy decode allocation: pass the prompt length only.
-        let total_budget = tokens.len() as u32;
-        // Phase 6: per-block extra_keys for prefix-cache lookup. Text-only
-        // dispatch (current state — image-bearing turns route to the flat
-        // path) yields all-empty per-block vecs; the resulting hashes are
-        // bit-equal to passing `&[]` to the uniform API. When VLM-paged
-        // forward integration lands, this call site swaps in real image-
-        // position pairs to enable image-aware cache isolation.
-        let block_size = {
-            let adapter = self
-                .paged_adapter
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("chat_sync_core_paged: paged_adapter is None"))?;
-            adapter.block_size()
-        };
-        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let cache_salt = 0;
-        // vLLM exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged.
-        // Ensures every paged turn has at least one suffix token to prefill,
-        // even when the live cache (or a prior request's residue) already
-        // covers the entire new prompt.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let live_ready;
-        let live_prefix_match;
-        let live_tokens_len;
-        let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        let (cached_prefix_len, continued_live_prefix) = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_sync_core_paged: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?;
-
-            live_ready = adapter.is_live_for_continue();
-            let live_tokens = adapter.request_tokens();
-            live_tokens_len = live_tokens.len();
-            live_prefix_match = tokens.starts_with(live_tokens);
-            if trace_enabled && live_ready && !live_prefix_match {
-                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
-            }
-            let can_continue =
-                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_per_block_with_max_tokens(
-                                &tokens,
-                                &lookup_extra_keys,
-                                cache_salt,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        (cached, false)
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_per_block_with_max_tokens(
-                        &tokens,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                (cached, false)
-            }
-        };
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
-                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
-                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
-                tokens.len(),
-                cached_prefix_len,
-                continued_live_prefix,
-                live_ready,
-                live_prefix_match,
-                live_tokens_len,
-                live_mismatch.index,
-                live_mismatch.prompt_token,
-                live_mismatch.cached_token
-            ));
-        }
-
-        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
-            &tokens,
-            cached_prefix_len,
-            block_size,
-            &lookup_extra_keys,
-            cache_salt,
-            continued_live_prefix,
-        )?;
-        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        self.cached_rope_deltas = None;
-
-        let suffix_len = prompt_token_count
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
-            })?;
-
-        let forward_result = self.chat_sync_core_paged_inner(
-            &tokens,
-            cached_prefix_len,
-            suffix_len,
-            &p,
-            eos_token_id,
-            &sampling_config,
-            &mut reasoning_tracker,
-            report_perf,
-            &mut first_token_instant,
-            use_cpp_paged,
-            gdn_prefix_already_primed,
-        );
-
-        let (generated_tokens, finish_reason) = match forward_result {
-            Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    // Build per-block extra_keys covering the FULL request
-                    // (prompt + decoded tokens) for finalize. Text-only
-                    // path produces all-empty vecs → bit-equal to the
-                    // uniform `&[]` finalize.
-                    let total_for_finalize = adapter.request_tokens().len();
-                    let finalize_extra_keys =
-                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
-                }
-                t
-            }
-            Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                return Err(e);
-            }
-        };
-
-        // Persist the full token history so subsequent
-        // `chat_session_continue` /
-        // `chat_tokens_delta_sync` calls find an initialized session
-        // to extend. The paged decode loop never feeds the LAST
-        // sampled token through the model, so drop it from the
-        // saved history (mirrors LFM2 / Qwen3 paged path).
-        let last_token_in_cache = false;
-        let mut full_history = tokens.clone();
-        if !generated_tokens.is_empty() {
-            let upto = if last_token_in_cache {
-                generated_tokens.len()
-            } else {
-                generated_tokens.len().saturating_sub(1)
-            };
-            full_history.extend_from_slice(&generated_tokens[..upto]);
-        }
-        self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = self.remember_dense_gdn_history_checkpoint()?;
-        if inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
-                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                gdn_history_checkpoint_store.stored,
-                self.cached_token_history.len(),
-                gdn_history_checkpoint_store.eval_ms,
-                gdn_history_checkpoint_store.clone_ms,
-                gdn_history_checkpoint_store.token_clone_ms,
-                gdn_history_checkpoint_store.update_ms,
-                gdn_history_checkpoint_store.total_ms
-            ));
-        }
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            p.include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tracker.reasoning_token_count(),
-        )?;
-        result.cached_tokens = cached_prefix_len;
-        Ok(result)
-    }
-
-    /// Inner forward + decode loop for `chat_sync_core_paged`. Split
-    /// out so the caller can wrap it with `release_request` on either
-    /// path.
-    ///
-    /// Phase 5 piece 1 adds a C++ compiled paged decode dispatcher when
-    /// `use_cpp_paged` is true. The pure-Rust paged prefill always runs
-    /// (it populates the GDN linear caches and writes K/V into the
-    /// adapter pool); after prefill, decode steps choose between
-    /// `mlx_qwen35_forward_paged` (fast) and
-    /// `paged_forward::run_paged_decode_step` (fallback) based on
-    /// adapter block size and `init_paged_dense_compiled_session`
-    /// success.
-    #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged_inner(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        suffix_len: u32,
-        p: &chat_common::ChatParams,
-        eos_token_id: u32,
-        sampling_config: &Option<crate::sampling::SamplingConfig>,
-        reasoning_tracker: &mut chat_common::ReasoningTracker,
-        report_perf: bool,
-        first_token_instant: &mut Option<std::time::Instant>,
-        use_cpp_paged: bool,
-        gdn_prefix_already_primed: bool,
-    ) -> Result<(Vec<u32>, String)> {
-        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
-        debug_assert!(
-            suffix_len > 0,
-            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        let suffix = &tokens[(cached_prefix_len as usize)..];
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-
-        // === PREFILL ===
-        let last_logits = {
-            let embed = self.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: caches not initialized")
-            })?;
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped")
-            })?;
-            super::paged_forward::run_paged_prefill_chunk(
-                tokens,
-                suffix,
-                cached_prefix_len,
-                gdn_prefix_already_primed,
-                &embed,
-                &mut self.layers,
-                caches_ref,
-                &self.final_norm,
-                &self.lm_head,
-                &embedding_weight,
-                &layer_kinds,
-                adapter,
-            )?
-        };
-
-        // First-token sample.
-        let mut token_history: Vec<u32> = tokens.to_vec();
-        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
-        let mut y = sample(&last_logits, *sampling_config)?;
-        y.eval();
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating. Prefill builds a massive MLX subgraph; once
-        // we have the last logits, those intermediates are dead but
-        // MLX's caching allocator holds them.
-        crate::array::synchronize_and_clear_cache();
-
-        if report_perf {
-            *first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // Decide between C++ compiled paged decode (fast) and pure-Rust
-        // paged decode (fallback). C++ paged needs:
-        // 1. `use_cpp_paged` (weights still registered for our model_id —
-        //    re-validated under `COMPILED_WEIGHTS_RWLOCK` in the caller).
-        // 2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE`.
-        //    The compiled C++ paged graph hard-codes block_size = 16.
-        // 3. `init_paged_dense_compiled_session` to succeed (every linear
-        //    layer must have populated conv/recurrent state from the
-        //    pure-Rust GDN forward above; every full-attn layer must
-        //    have a usable `LayerKVPool` slot, and the C++
-        //    `g_dense_paged_inited` must be set after init catches no
-        //    exceptions).
-        // The `CompiledResetGuard` ensures `mlx_qwen35_compiled_reset()`
-        // runs on any exit path so the next session starts with cleared
-        // C++ globals.
-        let mut cpp_session_ready = if use_cpp_paged {
-            let caches_ref = self.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: caches dropped post-prefill")
-            })?;
-            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped post-prefill")
-            })?;
-            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
-                eprintln!(
-                    "[MLX] Qwen3.5 Dense: skipping C++ compiled paged decode — \
-                     adapter block_size={} but compiled graph requires {}; \
-                     falling back to pure-Rust paged decode",
-                    adapter_ref.block_size(),
-                    CPP_PAGED_REQUIRED_BLOCK_SIZE
-                );
-                false
-            } else {
-                let prefill_offset = adapter_ref.current_token_count() as i32;
-                init_paged_dense_compiled_session(
-                    &self.config,
-                    caches_ref,
-                    adapter_ref,
-                    prefill_offset,
-                )
-                .is_ok()
-            }
-        } else {
-            false
-        };
-
-        // RAII guard: resets BOTH g_compiled_* and g_dense_paged_*
-        // globals (single `mlx_qwen35_compiled_reset` symbol clears
-        // both per Phase 5 piece 1) when this scope ends. Always armed
-        // when init succeeded — even if a later forward fails and we
-        // flip `cpp_session_ready=false`, the guard still runs at scope
-        // exit so stale C++ globals don't leak into the next request.
-        let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
-
-        // Tracks whether ANY compiled C++ paged step has succeeded
-        // during this turn. After a successful compiled step the C++
-        // side has advanced its per-layer GDN linear-cache globals
-        // (conv_state / recurrent_state) but those updates never get
-        // imported back into `self.caches`. Falling back to pure-Rust
-        // decode after that point would run from stale pre-step-N GDN
-        // state while `paged_adapter` and `token_history` have already
-        // advanced — silently corrupting the rest of the request. The
-        // mid-turn fallback below is therefore only safe BEFORE the
-        // first successful compiled step (the only failure mode we
-        // really need to defend against is init/configuration mismatch
-        // on the very first forward call).
-        let mut cpp_compiled_step_completed = false;
-
-        // === DECODE LOOP ===
-        let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
-        let mut finish_reason = String::from("length");
-
-        // Compile-cached `max_blocks_per_seq` shape — picking the
-        // adapter's max_seq_len divided by block_size keeps the compile
-        // key stable across all decode steps within one turn.
-        let max_blocks_per_seq: u32 = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped pre-decode")
-            })?;
-            let max_seq = self.config.max_position_embeddings as u32;
-            max_seq.div_ceil(adapter.block_size())
-        };
-
-        for step in 0..max_new_tokens {
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            reasoning_tracker.observe_token(token_id);
-
-            if token_id == eos_token_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-            if step + 1 >= max_new_tokens {
-                break;
-            }
-
-            // Decode forward.
-            //
-            // Defense-in-depth: if the C++ compiled paged forward returns
-            // null on the FIRST step, we rollback the `record_tokens`
-            // cursor advance, mark `cpp_session_ready = false`, and
-            // re-run this token through pure-Rust `run_paged_decode_step`
-            // (which re-calls `record_tokens` on the now-rolled-back
-            // cursor). After ANY compiled step has succeeded the C++ GDN
-            // linear-cache globals have advanced but we never copy them
-            // back into `self.caches`, so a Rust fallback would read
-            // stale pre-step state — propagate the error as fatal
-            // instead of silently corrupting the response.
-            let next_logits = if cpp_session_ready {
-                let embedding_weight = self.embedding.get_weight();
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
-                    )
-                })?;
-                adapter
-                    .record_tokens(&[token_id])
-                    .map_err(Error::from_reason)?;
-                let inputs = adapter
-                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
-                    .map_err(Error::from_reason)?;
-                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                    Ok(logits) => {
-                        cpp_compiled_step_completed = true;
-                        logits
-                    }
-                    Err(e) => {
-                        if chat_common::should_propagate_compiled_paged_error(
-                            cpp_compiled_step_completed,
-                        ) {
-                            eprintln!(
-                                "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed \
-                                 mid-decode (step={step}) AFTER an earlier compiled step \
-                                 succeeded. The C++ GDN linear-cache globals have advanced \
-                                 but those updates are not imported back into self.caches, \
-                                 so a pure-Rust fallback would run from stale pre-step state \
-                                 and silently corrupt the response. Propagating as fatal. \
-                                 cause: {e}"
-                            );
-                            adapter
-                                .rollback_last_tokens(1)
-                                .map_err(Error::from_reason)?;
-                            return Err(e);
-                        }
-                        eprintln!(
-                            "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed on \
-                             first decode step (step={step}); rolling back token cursor \
-                             and falling back to pure-Rust paged decode for the rest of \
-                             this request. cause: {e}"
-                        );
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                        cpp_session_ready = false;
-                        let embed = self.embedding.clone();
-                        let embedding_weight_pure = embed.get_weight();
-                        let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_sync_core_paged_inner: caches dropped during cpp fallback",
-                            )
-                        })?;
-                        let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
-                            )
-                        })?;
-                        let logits = super::paged_forward::run_paged_decode_step(
-                            token_id,
-                            &embed,
-                            &mut self.layers,
-                            caches_ref,
-                            &self.final_norm,
-                            &self.lm_head,
-                            &embedding_weight_pure,
-                            &layer_kinds,
-                            adapter_mut,
-                        )?;
-                        logits.squeeze(Some(&[1]))?
-                    }
-                }
-            } else {
-                // Pure-Rust paged decode fallback.
-                let embed = self.embedding.clone();
-                let embedding_weight = embed.get_weight();
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("chat_sync_core_paged_inner: caches dropped mid-decode")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode",
-                    )
-                })?;
-                let logits = super::paged_forward::run_paged_decode_step(
-                    token_id,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                )?;
-                logits.squeeze(Some(&[1]))?
-            };
-
-            let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
-                y = MxArray::from_int32(&[forced_id], &[1])?;
-                y.eval();
-                continue;
-            } else {
-                apply_all_penalties(next_logits, &token_history, p)?
-            };
-
-            y = sample(&next_logits, *sampling_config)?;
-            y.eval();
-
-            crate::array::maybe_clear_cache_for_paged_step(step);
-        }
-
-        if cpp_compiled_step_completed {
-            match export_paged_dense_linear_caches(&self.config) {
-                Ok(Some(new_caches)) => {
-                    self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches)?;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=true"
-                    ));
-                }
-                Ok(None) => {
-                    self.caches = None;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false reason=not_initialized"
-                    ));
-                }
-                Err(err) => {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false error={}",
-                        err
-                    ));
-                    self.caches = None;
-                }
-            }
-        }
-
-        Ok((generated_tokens, finish_reason))
-    }
-
-    /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
-    ///
-    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and
-    /// per-layer dispatch but emits each generated token through the
-    /// streaming callback as it is produced.
-    #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged(
-        &mut self,
-        tokens: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        eos_token_id: u32,
-        p: chat_common::ChatParams,
-        report_perf: bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        if tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-
-        let prompt_token_count = tokens.len() as u32;
-        let sampling_config = p.sampling_config;
-        let include_reasoning = p.include_reasoning;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = true;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            thinking_enabled,
-            p.thinking_token_budget,
-            think_end_id,
-        );
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-        let trace_enabled = inference_trace_enabled();
-
-        // Streaming decode state.
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
-
-        // C++ paged-decode availability + compile-lifecycle locks. See
-        // `chat_sync_core_paged` for the full rationale; this is the
-        // streaming twin.
-        let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-        let _dense_lock = if use_cpp_paged {
-            Some(
-                DENSE_COMPILED_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut _weight_guard = None;
-        let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // === Adapter lifecycle: warm continue OR cold start ===
-        let seq_id: u32 = 0;
-        // Lazy decode allocation: pass the prompt length only.
-        let total_budget = tokens.len() as u32;
-        // Phase 6: per-block extra_keys for prefix-cache lookup. See the
-        // matching comment in `chat_sync_core_paged`.
-        let block_size = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
-            })?;
-            adapter.block_size()
-        };
-        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let cache_salt = 0;
-        // See `chat_sync_core_paged` for the vLLM exact-prefix cap rationale.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let live_ready;
-        let live_prefix_match;
-        let live_tokens_len;
-        let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        let (cached_prefix_len, continued_live_prefix) = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?;
-
-            live_ready = adapter.is_live_for_continue();
-            let live_tokens = adapter.request_tokens();
-            live_tokens_len = live_tokens.len();
-            live_prefix_match = tokens.starts_with(live_tokens);
-            if trace_enabled && live_ready && !live_prefix_match {
-                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
-            }
-            let can_continue =
-                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_per_block_with_max_tokens(
-                                &tokens,
-                                &lookup_extra_keys,
-                                cache_salt,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        (cached, false)
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_per_block_with_max_tokens(
-                        &tokens,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                (cached, false)
-            }
-        };
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
-                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
-                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
-                tokens.len(),
-                cached_prefix_len,
-                continued_live_prefix,
-                live_ready,
-                live_prefix_match,
-                live_tokens_len,
-                live_mismatch.index,
-                live_mismatch.prompt_token,
-                live_mismatch.cached_token
-            ));
-        }
-
-        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
-            &tokens,
-            cached_prefix_len,
-            block_size,
-            &lookup_extra_keys,
-            cache_salt,
-            continued_live_prefix,
-        )?;
-        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        let gdn_prefix_state = gdn_prefix_preparation.state;
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        self.cached_rope_deltas = None;
-
-        let suffix_len = prompt_token_count
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
-                )
-            })?;
-
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense stream_paged_start prompt_tokens={} \
-                 cached_prefix_tokens={} suffix_tokens={} block_size={} \
-                 prefill_chunk_size={} prefill_eval_interval={} decode_clear_interval={} \
-                 cpp_paged_candidate={} gdn_prefix_state={}",
-                prompt_token_count,
-                cached_prefix_len,
-                suffix_len,
-                block_size,
-                crate::array::paged_prefill_chunk_size(),
-                crate::array::paged_prefill_eval_interval(),
-                crate::array::paged_decode_cache_clear_interval(),
-                use_cpp_paged,
-                gdn_prefix_state
-            ));
-        }
-
-        let result = self.chat_stream_sync_core_paged_inner(
-            &tokens,
-            cached_prefix_len,
-            suffix_len,
-            &p,
-            sampling_config,
-            eos_token_id,
-            &mut reasoning_tracker,
-            report_perf,
-            &mut first_token_instant,
-            &tokenizer,
-            &mut decode_stream,
-            &mut streamed_text_len,
-            &mut last_is_reasoning,
-            cb,
-            cancelled,
-            use_cpp_paged,
-            gdn_prefix_already_primed,
-        );
-
-        let (generated_tokens, finish_reason) = match result {
-            Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let total_for_finalize = adapter.request_tokens().len();
-                    let finalize_extra_keys =
-                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
-                }
-                t
-            }
-            Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                return Err(e);
-            }
-        };
-
-        // Persist token history for subsequent session-continue calls.
-        let last_token_in_cache = false;
-        let mut full_history = tokens.clone();
-        if !generated_tokens.is_empty() {
-            let upto = if last_token_in_cache {
-                generated_tokens.len()
-            } else {
-                generated_tokens.len().saturating_sub(1)
-            };
-            full_history.extend_from_slice(&generated_tokens[..upto]);
-        }
-        self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = self.remember_dense_gdn_history_checkpoint()?;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
-                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                gdn_history_checkpoint_store.stored,
-                self.cached_token_history.len(),
-                gdn_history_checkpoint_store.eval_ms,
-                gdn_history_checkpoint_store.clone_ms,
-                gdn_history_checkpoint_store.token_clone_ms,
-                gdn_history_checkpoint_store.update_ms,
-                gdn_history_checkpoint_store.total_ms
-            ));
-        }
-
-        // Flush residual buffered bytes (mirrors flat streaming).
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
-        }
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tokens,
-        )?;
-        result.cached_tokens = cached_prefix_len;
-
-        // Terminal chunk.
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: result.text.clone(),
-                done: true,
-                finish_reason: Some(result.finish_reason.clone()),
-                tool_calls: Some(result.tool_calls.clone()),
-                thinking: result.thinking.clone(),
-                num_tokens: Some(result.num_tokens),
-                prompt_tokens: Some(result.prompt_tokens),
-                reasoning_tokens: Some(result.reasoning_tokens),
-                raw_text: Some(result.raw_text.clone()),
-                cached_tokens: Some(cached_prefix_len),
-                performance: result.performance.clone(),
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-
-        Ok(())
-    }
-
-    /// Inner forward + streaming decode loop for
-    /// [`Self::chat_stream_sync_core_paged`]. Mirrors LFM2's
-    /// `chat_stream_sync_core_paged_inner`.
-    ///
-    /// Phase 5 piece 1 adds a C++ compiled paged decode dispatcher when
-    /// `use_cpp_paged` is true. See the sync sibling
-    /// `chat_sync_core_paged_inner` for the cpp_session_ready gate
-    /// rationale.
-    #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged_inner<'a>(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        suffix_len: u32,
-        p: &chat_common::ChatParams,
-        sampling_config: Option<crate::sampling::SamplingConfig>,
-        eos_token_id: u32,
-        reasoning_tracker: &mut chat_common::ReasoningTracker,
-        report_perf: bool,
-        first_token_instant: &mut Option<std::time::Instant>,
-        tokenizer: &'a Arc<Qwen3Tokenizer>,
-        decode_stream: &mut tokenizers::DecodeStream<
-            'a,
-            tokenizers::ModelWrapper,
-            tokenizers::NormalizerWrapper,
-            tokenizers::PreTokenizerWrapper,
-            tokenizers::PostProcessorWrapper,
-            tokenizers::DecoderWrapper,
-        >,
-        streamed_text_len: &mut usize,
-        last_is_reasoning: &mut bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
-        use_cpp_paged: bool,
-        gdn_prefix_already_primed: bool,
-    ) -> Result<(Vec<u32>, String)> {
-        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
-        debug_assert!(
-            suffix_len > 0,
-            "chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        let suffix = &tokens[(cached_prefix_len as usize)..];
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-
-        let last_logits = {
-            let embed = self.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: caches not initialized")
-            })?;
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: paged_adapter dropped")
-            })?;
-            super::paged_forward::run_paged_prefill_chunk(
-                tokens,
-                suffix,
-                cached_prefix_len,
-                gdn_prefix_already_primed,
-                &embed,
-                &mut self.layers,
-                caches_ref,
-                &self.final_norm,
-                &self.lm_head,
-                &embedding_weight,
-                &layer_kinds,
-                adapter,
-            )?
-        };
-
-        let mut token_history: Vec<u32> = tokens.to_vec();
-        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see chat_sync_core_paged_inner for rationale).
-        crate::array::synchronize_and_clear_cache();
-
-        if report_perf {
-            *first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // Decide between C++ compiled paged decode (fast) and pure-Rust
-        // paged decode (fallback). See `chat_sync_core_paged_inner` for
-        // the cpp_session_ready gate rationale.
-        let mut cpp_session_ready = if use_cpp_paged {
-            let caches_ref = self.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: caches dropped post-prefill")
-            })?;
-            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: paged_adapter dropped post-prefill",
-                )
-            })?;
-            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
-                eprintln!(
-                    "[MLX] Qwen3.5 Dense (stream): skipping C++ compiled paged decode — \
-                     adapter block_size={} but compiled graph requires {}; \
-                     falling back to pure-Rust paged decode",
-                    adapter_ref.block_size(),
-                    CPP_PAGED_REQUIRED_BLOCK_SIZE
-                );
-                false
-            } else {
-                let prefill_offset = adapter_ref.current_token_count() as i32;
-                init_paged_dense_compiled_session(
-                    &self.config,
-                    caches_ref,
-                    adapter_ref,
-                    prefill_offset,
-                )
-                .is_ok()
-            }
-        } else {
-            false
-        };
-
-        // RAII guard: even if a later forward fails and we flip
-        // `cpp_session_ready=false`, the guard still runs at scope exit
-        // so stale C++ globals don't leak into the next request.
-        let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
-
-        // Tracks whether ANY compiled C++ paged step has succeeded
-        // during this turn. After a successful compiled step the C++
-        // GDN linear-cache globals (conv_state / recurrent_state) have
-        // advanced but are never imported back into `self.caches`, so a
-        // pure-Rust fallback would read stale pre-step state. The
-        // mid-turn fallback below is therefore only safe BEFORE the
-        // first successful compiled step. See sync sibling
-        // `chat_sync_core_paged_inner` for the full rationale.
-        let mut cpp_compiled_step_completed = false;
-
-        let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
-        let mut finish_reason = String::from("length");
-
-        let max_blocks_per_seq: u32 = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: paged_adapter dropped pre-decode",
-                )
-            })?;
-            let max_seq = self.config.max_position_embeddings as u32;
-            max_seq.div_ceil(adapter.block_size())
-        };
-
-        for step in 0..max_new_tokens {
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            let is_reasoning = reasoning_tracker.observe_token(token_id);
-            *last_is_reasoning = is_reasoning;
-
-            if token_id == eos_token_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = String::from("cancelled");
-                break;
-            }
-
-            // Stream delta chunk.
-            let token_text = Qwen3Tokenizer::step_decode_stream(
-                decode_stream,
-                tokenizer.inner(),
-                token_id,
-                &generated_tokens,
-                *streamed_text_len,
-            );
-            *streamed_text_len += token_text.len();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-            if step + 1 >= max_new_tokens {
-                break;
-            }
-
-            // Decode forward. Defense-in-depth fallback: see
-            // `chat_sync_core_paged_inner` for the rollback rationale —
-            // mid-turn fallback only safe BEFORE the first successful
-            // compiled step.
-            let next_logits = if cpp_session_ready {
-                let embedding_weight = self.embedding.get_weight();
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
-                    )
-                })?;
-                adapter
-                    .record_tokens(&[token_id])
-                    .map_err(Error::from_reason)?;
-                let inputs = adapter
-                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
-                    .map_err(Error::from_reason)?;
-                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                    Ok(logits) => {
-                        cpp_compiled_step_completed = true;
-                        logits
-                    }
-                    Err(e) => {
-                        if chat_common::should_propagate_compiled_paged_error(
-                            cpp_compiled_step_completed,
-                        ) {
-                            eprintln!(
-                                "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward \
-                                 failed mid-decode (step={step}) AFTER an earlier compiled \
-                                 step succeeded. The C++ GDN linear-cache globals have \
-                                 advanced but those updates are not imported back into \
-                                 self.caches, so a pure-Rust fallback would run from stale \
-                                 pre-step state and silently corrupt the response. \
-                                 Propagating as fatal. cause: {e}"
-                            );
-                            adapter
-                                .rollback_last_tokens(1)
-                                .map_err(Error::from_reason)?;
-                            return Err(e);
-                        }
-                        eprintln!(
-                            "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward failed \
-                             on first decode step (step={step}); rolling back token cursor \
-                             and falling back to pure-Rust paged decode for the rest of \
-                             this request. cause: {e}"
-                        );
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                        cpp_session_ready = false;
-                        let embed = self.embedding.clone();
-                        let embedding_weight_pure = embed.get_weight();
-                        let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_stream_sync_core_paged_inner: caches dropped during cpp fallback",
-                            )
-                        })?;
-                        let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "chat_stream_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
-                            )
-                        })?;
-                        let logits = super::paged_forward::run_paged_decode_step(
-                            token_id,
-                            &embed,
-                            &mut self.layers,
-                            caches_ref,
-                            &self.final_norm,
-                            &self.lm_head,
-                            &embedding_weight_pure,
-                            &layer_kinds,
-                            adapter_mut,
-                        )?;
-                        logits.squeeze(Some(&[1]))?
-                    }
-                }
-            } else {
-                let embed = self.embedding.clone();
-                let embedding_weight = embed.get_weight();
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: caches dropped mid-decode",
-                    )
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
-                    )
-                })?;
-                let logits = super::paged_forward::run_paged_decode_step(
-                    token_id,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                )?;
-                logits.squeeze(Some(&[1]))?
-            };
-
-            let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
-                y = MxArray::from_int32(&[forced_id], &[1])?;
-                y.eval();
-                continue;
-            } else {
-                apply_all_penalties(next_logits, &token_history, p)?
-            };
-
-            y = sample(&next_logits, sampling_config)?;
-            y.eval();
-
-            crate::array::maybe_clear_cache_for_paged_step(step);
-        }
-
-        if cpp_compiled_step_completed {
-            match export_paged_dense_linear_caches(&self.config) {
-                Ok(Some(new_caches)) => {
-                    self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches)?;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=true"
-                    ));
-                }
-                Ok(None) => {
-                    self.caches = None;
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false reason=not_initialized"
-                    ));
-                }
-                Err(err) => {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false error={}",
-                        err
-                    ));
-                    self.caches = None;
-                }
-            }
-        }
-
-        Ok((generated_tokens, finish_reason))
     }
 
     /// Streaming chat (session-start variant): same semantics as
@@ -3978,7 +2002,7 @@ impl Qwen35Inner {
             Err(e) => {
                 // Forward the tokenizer error as an mpsc send — this path
                 // signals generic errors via an error-result send rather
-                // than an error chunk, matching the `chat_stream_sync_inner`
+                // than an error chunk, matching the `chat_stream_sync`
                 // final-catch behavior.
                 let _ = stream_tx.send(Err(e));
                 return;
@@ -4087,7 +2111,7 @@ impl Qwen35Inner {
 
         // All guards passed — enter the prefill+decode helper. Any error
         // returned from here propagates as an mpsc error, same as
-        // `chat_stream_sync_inner`.
+        // `chat_stream_sync`.
         let cb = StreamSender(stream_tx.clone());
         let result =
             self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
@@ -4148,22 +2172,6 @@ impl Qwen35Inner {
         let mut first_token_instant: Option<std::time::Instant> = None;
 
         let model_id = self.model_id;
-
-        // Block-paged dispatch — early-return BEFORE the compile lock.
-        // Delta path: drive the paged streaming core with
-        // `cached_history + delta` as the full prompt; the adapter's
-        // warm-continue path matches the cached prefix automatically.
-        if self.paged_adapter.is_some() {
-            return self.chat_stream_sync_core_paged(
-                full_token_history.clone(),
-                tokenizer_for_decode,
-                eos_id,
-                p,
-                report_perf,
-                cb,
-                cancelled,
-            );
-        }
 
         // Compiled path availability check, same pattern as chat_tokens_delta_sync.
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
@@ -4375,7 +2383,7 @@ impl Qwen35Inner {
                     // See `chat_with_caches_inner` for rationale: force-eval
                     // the exported lazy handles before `CompiledResetGuard`
                     // clears `g_compiled_caches` at end of scope.
-                    eval_layer_caches(&self.caches)?;
+                    eval_layer_caches(&self.caches);
                 }
             }
         } else {
@@ -4562,26 +2570,6 @@ impl Qwen35Inner {
             None
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
-
-        // Block-paged dispatch — early-return BEFORE the compile lock.
-        // See `chat_sync_core` for the compile-lockout rationale.
-        if self.paged_adapter.is_some() {
-            if has_images {
-                return Err(Error::from_reason(
-                    "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
-                     use_block_paged_cache=false (text-only turns continue to work).",
-                ));
-            }
-            return self.chat_stream_sync_core_paged(
-                tokens,
-                tokenizer_for_decode,
-                eos_token_id,
-                p,
-                report_perf,
-                cb,
-                cancelled,
-            );
-        }
 
         // Check compiled path
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
@@ -4935,7 +2923,7 @@ impl Qwen35Inner {
                     // See `chat_with_caches_inner` for rationale: force-eval
                     // the exported lazy handles before `CompiledResetGuard`
                     // clears `g_compiled_caches` at end of scope.
-                    eval_layer_caches(&self.caches)?;
+                    eval_layer_caches(&self.caches);
                 }
             }
         } else {
@@ -6425,16 +4413,13 @@ impl Qwen35Inner {
 /// Wrapper around `StreamTx` that provides a `.call()` method matching the
 /// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
 ///
-/// This allows the macro to work unchanged for both:
-/// - MoE model: passes a real `ThreadsafeFunction` (old path, until Phase 4)
-/// - Dense model: passes this `StreamSender` (new dedicated-thread path)
-struct StreamSender(StreamTx<ChatStreamChunk>);
-
-impl StreamSender {
-    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
-    }
-}
+/// The C++ compiled decode path uses process-wide globals (`g_compiled_caches`,
+/// `g_offset_int`, etc.). Concurrent `generate()`/`chat()` calls via
+/// `Promise.all()` would race on these globals since `spawn_blocking` dispatches
+/// to separate threads. This mutex is acquired in the async context *before*
+/// `spawn_blocking`, ensuring only one compiled lifecycle runs at a time.
+#[cfg(not(target_family = "wasm"))]
+static DENSE_COMPILED_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
 ///
@@ -6637,14 +4622,25 @@ pub struct Qwen3_5Model {
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35Cmd>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
-    /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
-    /// construction time. Currently default-OFF on Qwen3.5 (parity-pending
-    /// — see CLAUDE.md and `Qwen3_5Config::use_block_paged_cache`).
-    /// VLM checkpoints can load with the adapter on for text-only
-    /// inference; image-bearing chat turns are rejected at runtime by
-    /// the chat-entry sites. Surfaced through the
-    /// `hasBlockPagedCache()` NAPI method.
-    pub(crate) paged_active: bool,
+    pub(crate) embedding: Embedding,
+    /// Decoder layers wrapped in RwLock for interior mutability during generation.
+    pub(crate) layers: Arc<RwLock<Vec<DecoderLayer>>>,
+    /// Final layer norm wrapped in RwLock for interior mutability.
+    pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
+    /// LM head wrapped in RwLock for interior mutability.
+    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>, // None when tie_word_embeddings
+    /// KV/SSM caches wrapped in RwLock for interior mutability during generation.
+    pub(crate) caches: Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
+    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    pub(crate) fa_idx: usize,
+    pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
+    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) spatial_merge_size: Option<i32>,
+    pub(crate) vision_cache: VisionCache,
+    cached_token_history: Arc<RwLock<Vec<u32>>>,
+    cached_image_key: Arc<RwLock<Option<u64>>>,
+    cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    pub(crate) model_id: u64,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
@@ -6653,27 +4649,195 @@ pub struct Qwen3_5Model {
 
 #[napi]
 impl Qwen3_5Model {
+    /// Create a new Qwen3.5 model with the given configuration.
+    #[napi(constructor)]
+    pub fn new(config: Qwen3_5Config) -> Result<Self> {
+        let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
+
+        let layers = (0..config.num_layers as usize)
+            .map(|i| DecoderLayer::new(&config, i))
+            .collect::<Result<Vec<_>>>()?;
+
+        let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(Linear::new(
+                config.hidden_size as u32,
+                config.vocab_size as u32,
+                Some(false),
+            )?)
+        };
+
+        // Find first full attention layer index
+        let fa_idx = (0..config.num_layers as usize)
+            .find(|&i| !config.is_linear_layer(i))
+            .unwrap_or(0);
+
+        info!(
+            "Qwen3.5 model created: {} layers, fa_idx={}",
+            config.num_layers, fa_idx,
+        );
+
+        Ok(Self {
+            config,
+            embedding,
+            layers: Arc::new(RwLock::new(layers)),
+            final_norm: Arc::new(RwLock::new(final_norm)),
+            lm_head: Arc::new(RwLock::new(lm_head)),
+            caches: Arc::new(RwLock::new(None)),
+            tokenizer: None,
+            fa_idx,
+            #[cfg(not(target_family = "wasm"))]
+            vision_encoder: None,
+            #[cfg(not(target_family = "wasm"))]
+            image_processor: None,
+            spatial_merge_size: None,
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            #[cfg(not(target_family = "wasm"))]
+            generation_lock: Arc::new(TokioMutex::new(())),
+        })
+    }
+
+    /// Initialize caches for incremental generation.
+    #[napi]
+    pub fn init_caches(&self) -> Result<()> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _guard = self.generation_lock.try_lock().map_err(|_| {
+                Error::from_reason("Cannot init caches while generation is in progress")
+            })?;
+        }
+        self.init_caches_inner()
+    }
+
+    /// Init caches without checking the generation lock (for internal use
+    /// by generate_for_training_sync which already holds the lock).
+    fn init_caches_inner(&self) -> Result<()> {
+        let caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+        *caches_guard = Some(caches);
+        self.clear_reuse_state();
+        Ok(())
+    }
+
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ResetCaches { reply })
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _guard = self.generation_lock.try_lock().map_err(|_| {
+                Error::from_reason("Cannot reset caches while generation is in progress")
+            })?;
+        }
+        self.reset_caches_inner()
     }
 
-    /// Whether the block-paged KV cache adapter is active on this model
-    /// instance.
+    /// Reset caches without checking the generation lock.
+    fn reset_caches_inner(&self) -> Result<()> {
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+        if let Some(ref mut caches) = *caches_guard {
+            for cache in caches.iter_mut() {
+                cache.reset();
+            }
+        }
+        *caches_guard = None;
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Clear cached token history, image key, and rope deltas.
+    fn clear_reuse_state(&self) {
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
+        }
+    }
+
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
     ///
-    /// `true` iff `Qwen35Inner::paged_adapter` was successfully
-    /// constructed at load time (driven by
-    /// `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
-    /// because parity is pending real-weights validation). On VLM
-    /// checkpoints the adapter can still be active for text-only
-    /// inference; image-bearing chat turns are rejected at runtime by
-    /// the chat-entry sites. Surfaced through this NAPI method so
-    /// server endpoints can branch on it without round-tripping through
-    /// the model thread.
+    /// The cache is moved out of the model — calling `takeCache()` twice
+    /// returns `null` the second time. Pass the cache back via `setCache()`
+    /// before the next `chatSessionStart` / `chatSessionContinue` call for
+    /// incremental prefill.
     #[napi]
-    pub fn has_block_paged_cache(&self) -> bool {
-        self.paged_active
+    pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::TakeCache { reply })
+            .ok()?
+    }
+
+    /// Restore a previously taken `PromptCache` into the model.
+    ///
+    /// On the next `chatSessionStart` / `chatSessionContinue` call with
+    /// `reuseCache: true`, the model will prefix-match the new tokens against
+    /// the cache and only prefill the delta.
+    #[napi]
+    pub fn set_cache(
+        &self,
+        cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        // Validate before sending (these checks don't need model-thread state)
+        if cache.model_type() != "qwen3_5" {
+            return Err(Error::from_reason(format!(
+                "Cache type '{}' doesn't match model type 'qwen3_5'",
+                cache.model_type()
+            )));
+        }
+        if cache.num_layers() != self.config.num_layers as usize {
+            return Err(Error::from_reason(format!(
+                "Cache has {} layers but model has {} layers",
+                cache.num_layers(),
+                self.config.num_layers
+            )));
+        }
+        if cache.model_id() != self.model_id {
+            return Err(Error::from_reason(
+                "Cache was created by a different model instance (different checkpoint or config)",
+            ));
+        }
+        // Extract the cache data to send to model thread
+        let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            cache.take_caches().ok_or_else(|| {
+                Error::from_reason("PromptCache is empty (already consumed or disposed)")
+            })?,
+            cache.token_history().to_vec(),
+            "qwen3_5",
+            cache.num_layers(),
+            cache.image_cache_key(),
+            cache.rope_deltas(),
+            cache.model_id(),
+        );
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::SetCache {
+            cache: owned_cache,
+            reply,
+        })
     }
 
     /// Load a pretrained model from a directory.
@@ -6682,12 +4846,17 @@ impl Qwen3_5Model {
     /// - config.json
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5Model> {
         persistence::load_with_thread(&path).await
     }
 
     /// Generate text from a prompt token sequence.
+    ///
+    /// Runs generation on a worker thread via spawn_blocking to avoid
+    /// blocking the Node.js event loop.
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn generate(
         &self,
@@ -7136,6 +5305,34 @@ impl Qwen3_5Model {
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
+    /// Test-only entry point that dispatches
+    /// `ChatStreamSessionContinueTool` and returns the raw mpsc
+    /// receiver the model thread writes into.
+    #[doc(hidden)]
+    pub fn chat_stream_session_continue_tool_for_test(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((ChatStreamHandle { cancelled }, stream_rx))
+    }
+
     /// Get the number of parameters in the model.
     ///
     /// Pure config computation — no model-thread dispatch needed.
@@ -7179,7 +5376,14 @@ impl Qwen3_5Model {
 
     /// Save the model weights and configuration to a directory.
     ///
-    /// Dispatches to model thread.
+    /// This saves:
+    /// - config.json: Model configuration (with model_type for detectModelType)
+    /// - weights.safetensors: Full model weights in SafeTensors format
+    /// - weights.mlx: Parameter metadata (for reference)
+    ///
+    /// # Arguments
+    /// * `save_path` - Directory to save the model
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn save_model<'env>(
         &self,
@@ -7205,15 +5409,14 @@ const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
+pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
     if let Some(caches) = caches {
         let mut arrays: Vec<&MxArray> = Vec::new();
         for cache in caches.iter() {
             cache.collect_arrays(&mut arrays);
         }
-        MxArray::eval_arrays(&arrays)?;
+        MxArray::eval_arrays(&arrays);
     }
-    Ok(())
 }
 
 /// Chunked prefill: process prompt in chunks of `PREFILL_STEP_SIZE`, evaluating
@@ -7248,7 +5451,7 @@ fn chunked_prefill(
                 embedding_weight_t,
             )?;
         }
-        eval_layer_caches(caches)?;
+        eval_layer_caches(caches);
         crate::array::clear_cache();
         offset += PREFILL_STEP_SIZE;
     }
@@ -7344,258 +5547,691 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
     }
 }
 
-// ============================================================================
-// Phase 5 piece 1: C++ compiled paged-decode dispatcher (Dense).
-//
-// Mirrors `init_paged_moe_compiled_session` / `forward_moe_cpp_paged`
-// from `crates/mlx-core/src/models/qwen3_5_moe/model.rs` but without
-// MoE expert routing — the dense compiled paged graph in
-// `mlx_qwen35.cpp` is structurally simpler.
-// ============================================================================
-
-/// Block size hard-coded into the compiled C++ paged graph
-/// (`mlx_qwen35.cpp` — see `attn_for_compile_paged` and the
-/// `mlx_qwen35_init_paged` docstring). The Rust adapter supports
-/// configurable block sizes via `Qwen3_5Config::paged_block_size`,
-/// but the compiled graph traces against block_size=16 baked into the
-/// `paged_kv_write` / `paged_attention` kernel calls. Mismatched values
-/// would have Rust encode slot/block tables at the adapter's block size
-/// while C++ writes/reads at 16, corrupting KV state. The compile-branch
-/// selectors gate `cpp_session_ready` on this equality and fall back to
-/// the pure-Rust paged path when the adapter is configured otherwise.
-pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
-
-/// Initialize the C++ paged forward graph from the live `paged_adapter`
-/// pool/scale arrays AND the per-layer linear-attention recurrent caches
-/// already populated by the pure-Rust paged prefill.
+/// Evaluate the sampled token AND all cache arrays together in a single async_eval call.
 ///
-/// # Layer-index contract
+/// This is the key fix for performance: without evaluating the cache arrays, they remain
+/// as lazy computation nodes. Each decode step's graph then includes the entire lazy chain
+/// from all previous steps (O(N^2) graph growth), causing GPU execution time to grow
+/// linearly with the number of decode steps.
 ///
-/// The C++ FFI accepts pool/scale handle arrays of size `num_layers`
-/// (absolute decoder count). For each absolute layer index `i`:
-/// * Linear-attention layers: pool/scale slots are null pointers; the
-///   `linear_cache_arrays` pair `[i*2, i*2+1]` holds
-///   `(conv_state, recurrent_state)` from the layer's
-///   `Qwen3_5LayerCache::Linear(ArraysCache)`.
-/// * Full-attention layers: pool/scale slots come from the adapter's
-///   `LayerKVPool` at the COMPACT (full-attention) ordinal; the linear
-///   cache pair is null.
+/// By evaluating cache arrays here (alongside next_token), MLX materializes them and
+/// breaks the dependency chain (via arr.detach() internally). The next step then starts
+/// with a clean graph bounded to exactly one decode step.
 ///
-/// The compact-ordinal mapping is computed via
-/// [`crate::models::qwen3_5::decoder_layer::compute_layer_kinds`], the
-/// same helper the production Rust paged-forward dispatch uses.
-///
-/// # Caller contract
-///
-/// 1. `caches` is fully populated by a prior pure-Rust paged prefill.
-/// 2. The C++ weights for this model are still registered (caller must
-///    have verified `mlx_qwen35_get_model_id() == self.model_id` and
-///    holds the appropriate read locks).
-///
-/// `prefill_offset` is the global token cursor the compiled paged
-/// graph's `g_dense_paged_offset_int` will start incrementing from.
-///
-/// On any failure (missing linear cache, missing pool/scale handle, or
-/// the C++ FFI returning a non-zero status), the helper returns `Err`
-/// so the caller can fall back to the pure-Rust paged decode path.
-fn init_paged_dense_compiled_session(
-    config: &Qwen3_5Config,
-    caches: &[Qwen3_5LayerCache],
-    paged_adapter: &PagedKVCacheAdapter,
-    prefill_offset: i32,
-) -> Result<()> {
-    use super::decoder_layer::{Qwen3_5LayerKind, compute_layer_kinds};
+/// This matches Python mlx-lm's behavior: async_eval(y, logprobs) evaluates y (the token)
+/// whose graph transitively causes all cache state INPUTS to be detached/materialized.
+// Internal methods (not NAPI-exported)
+impl Qwen3_5Model {
+    /// Forward pass from embeddings through all layers (internal, acquires locks).
+    fn forward_from_embeddings(&self, hidden_states: &MxArray) -> Result<MxArray> {
+        let mut h = hidden_states.clone();
 
-    let num_layers_us = config.num_layers as usize;
-    if caches.len() != num_layers_us {
-        return Err(Error::from_reason(format!(
-            "init_paged_dense_compiled_session: caches.len()={} but config.num_layers={}",
-            caches.len(),
-            num_layers_us
-        )));
-    }
+        // Acquire write locks for layers and caches (forward mutates caches)
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
-    let layer_kinds = compute_layer_kinds(num_layers_us, |i| config.is_linear_layer(i));
+        // Forward through layers — attention handles causal masking internally
+        let num_layers = layers_guard.len();
+        for i in 0..num_layers {
+            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
+            h = layers_guard[i].forward(&h, None, cache, None, true)?;
+        }
 
-    let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut v_scale_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut linear_cache_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us * 2];
+        drop(layers_guard);
+        drop(caches_guard);
 
-    // Hold the wrapping `MxArray`s alive across the FFI call so the C++
-    // side has time to copy them into its own globals.
-    let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let h = final_norm_guard.forward(&h)?;
+        drop(final_norm_guard);
 
-    for (i, kind) in layer_kinds.iter().enumerate() {
-        match kind {
-            Qwen3_5LayerKind::Linear => {
-                let arrays_cache = match &caches[i] {
-                    Qwen3_5LayerCache::Linear(c) => c,
-                    Qwen3_5LayerCache::FullAttention(_) => {
-                        return Err(Error::from_reason(format!(
-                            "init_paged_dense_compiled_session: layer {i} is Linear by config \
-                             but cache slot is FullAttention",
-                        )));
-                    }
-                };
-                let conv = arrays_cache.get(0).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: layer {i} conv_state not populated; \
-                         pure-Rust paged prefill must run before C++ paged init",
-                    ))
-                })?;
-                let rec = arrays_cache.get(1).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: layer {i} recurrent_state not \
-                         populated; pure-Rust paged prefill must run before C++ paged init",
-                    ))
-                })?;
-                linear_cache_handles[i * 2] = conv.as_raw_ptr();
-                linear_cache_handles[i * 2 + 1] = rec.as_raw_ptr();
-                let _ = (conv, rec);
-            }
-            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
-                let k_arr = paged_adapter.key_pool_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: key_pool_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let v_arr = paged_adapter.value_pool_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: value_pool_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let ks_arr = paged_adapter.k_scale_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: k_scale_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let vs_arr = paged_adapter.v_scale_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_dense_compiled_session: v_scale_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                k_pool_handles[i] = k_arr.as_raw_ptr();
-                v_pool_handles[i] = v_arr.as_raw_ptr();
-                k_scale_handles[i] = ks_arr.as_raw_ptr();
-                v_scale_handles[i] = vs_arr.as_raw_ptr();
-                held_arrays.push(k_arr);
-                held_arrays.push(v_arr);
-                held_arrays.push(ks_arr);
-                held_arrays.push(vs_arr);
+        // LM head
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        match &*lm_head_guard {
+            Some(head) => head.forward(&h),
+            None => {
+                // tie_word_embeddings: use embedding weight as linear
+                let weight = self.embedding.get_weight();
+                let weight_t = weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&weight_t)
             }
         }
     }
 
-    let status = unsafe {
-        mlx_sys::mlx_qwen35_init_paged(
-            config.num_layers,
-            config.hidden_size,
-            config.num_heads,
-            config.num_kv_heads,
-            config.head_dim,
-            config.rope_theta as f32,
-            config.rope_dims(),
-            config.rms_norm_eps as f32,
-            config.full_attention_interval,
-            config.linear_num_key_heads,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-            config.linear_conv_kernel_dim,
-            if config.tie_word_embeddings { 1 } else { 0 },
-            config.max_position_embeddings,
-            1, // batch_size
-            k_pool_handles.as_mut_ptr(),
-            v_pool_handles.as_mut_ptr(),
-            k_scale_handles.as_mut_ptr(),
-            v_scale_handles.as_mut_ptr(),
-            linear_cache_handles.as_mut_ptr(),
-            prefill_offset,
-        )
-    };
+    /// Forward pass from pre-computed embeddings with M-RoPE position IDs (VLM mode).
+    ///
+    /// Used by `Qwen3_5VLModel` to inject vision features into the text stream.
+    pub fn forward_from_embeddings_with_positions(
+        &self,
+        hidden_states: &MxArray,
+        position_ids: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let mut h = hidden_states.clone();
 
-    drop(held_arrays);
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
-    // The C++ side returns 0 on success, -1 on failure. Failure paths
-    // include missing pool/scale handles for full-attention layers and
-    // any exception caught during graph build. On failure
-    // `g_dense_paged_inited` is left cleared so subsequent
-    // `mlx_qwen35_forward_paged` calls would null-out their logits;
-    // surfacing the failure here lets the dispatcher fall back to the
-    // pure-Rust paged path before any decode-step FFI is dispatched.
-    if status != 0 {
-        return Err(Error::from_reason(format!(
-            "init_paged_dense_compiled_session: mlx_qwen35_init_paged returned status={status} \
-             (expected 0); see stderr for the C++ diagnostic. Caller must fall back to the \
-             pure-Rust paged path."
-        )));
+        let num_layers = layers_guard.len();
+        for i in 0..num_layers {
+            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
+            let layer_pos = if layers_guard[i].is_linear() {
+                None
+            } else {
+                position_ids
+            };
+            h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
+        }
+
+        drop(layers_guard);
+        drop(caches_guard);
+
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let h = final_norm_guard.forward(&h)?;
+        drop(final_norm_guard);
+
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        match &*lm_head_guard {
+            Some(head) => head.forward(&h),
+            None => {
+                let weight = self.embedding.get_weight();
+                let weight_t = weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&weight_t)
+            }
+        }
     }
 
-    Ok(())
+    /// Get embeddings for input IDs (used by VLModel).
+    pub fn get_embeddings(&self, input_ids: &MxArray) -> Result<MxArray> {
+        self.embedding.forward(input_ids)
+    }
+
+    /// Set the vision encoder (wraps in Arc).
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
+        self.vision_encoder = Some(Arc::new(enc));
+    }
+
+    /// Set the image processor.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
+        self.image_processor = Some(Arc::new(proc));
+    }
+
+    /// Set the spatial merge size.
+    pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
+        self.spatial_merge_size = Some(size);
+    }
+
+    /// Initialize M-RoPE on all full attention layers (VLM mode).
+    pub fn init_mrope_layers(
+        &self,
+        mrope_section: Vec<i32>,
+        rope_theta: f64,
+        max_position_embeddings: i32,
+    ) -> Result<()> {
+        let rope_dims = self.config.rope_dims();
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        for layer in layers_guard.iter_mut() {
+            if let super::decoder_layer::AttentionType::Full(ref mut attn) = layer.attn {
+                attn.init_mrope(
+                    mrope_section.clone(),
+                    rope_theta,
+                    max_position_embeddings,
+                    rope_dims,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Single-token decode step using the C++ compiled paged forward pass.
-///
-/// Mirrors `forward_compiled` but threads through the paged-attention
-/// inputs (offset_arr, block_table, slot_mapping, num_valid_tokens,
-/// num_valid_blocks, seq_lens) so K/V is written into the adapter's
-/// paged Metal pool via `paged_kv_write` and gathered via
-/// `paged_attention`.
-///
-/// Caller contract:
-/// * `init_paged_dense_compiled_session` has been called this turn
-///   (sets `g_dense_paged_inited = true`).
-/// * `paged_adapter.record_tokens(&[token_id])` has been called to
-///   advance the cursor (and lazily allocate any new block).
-/// * `inputs` was just built via
-///   `paged_adapter.build_paged_attention_inputs(1, 1, max_blocks_per_seq)`.
-///
-/// On any FFI failure (`output_logits == null`) the helper returns an
-/// `Err` so the dispatcher falls back to pure-Rust paged decode.
-fn forward_dense_cpp_paged(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
-) -> Result<MxArray> {
-    use mlx_sys as sys;
+// ========== Training Support Methods ==========
+// These methods are Rust-internal only (not exposed via NAPI).
+// They implement the TrainableModel trait interface.
 
-    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut cache_offset_out: i32 = 0;
-    unsafe {
-        sys::mlx_qwen35_forward_paged(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            inputs.offset_arr.as_raw_ptr(),
-            inputs.block_table.as_raw_ptr(),
-            inputs.slot_mapping.as_raw_ptr(),
-            inputs.num_valid_tokens.as_raw_ptr(),
-            inputs.num_valid_blocks.as_raw_ptr(),
-            inputs.seq_lens.as_raw_ptr(),
-            &mut output_ptr,
-            &mut cache_offset_out,
+impl Qwen3_5Model {
+    /// Get model configuration.
+    pub(crate) fn get_config(&self) -> Qwen3_5Config {
+        self.config.clone()
+    }
+
+    /// Create a cheap clone for training sessions.
+    /// Arc-clones all shared components, no deep copy.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn clone_for_training(&self) -> Result<Self> {
+        Ok(Self {
+            config: self.config.clone(),
+            embedding: Embedding::from_weight(&self.embedding.get_weight())?,
+            layers: Arc::clone(&self.layers),
+            final_norm: Arc::clone(&self.final_norm),
+            lm_head: Arc::clone(&self.lm_head),
+            caches: Arc::new(RwLock::new(None)), // Fresh empty caches
+            tokenizer: self.tokenizer.clone(),
+            fa_idx: self.fa_idx,
+            vision_encoder: None, // Not needed for training
+            image_processor: None,
+            spatial_merge_size: None,
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
+        })
+    }
+
+    /// Extract all trainable parameters as a name→array map.
+    ///
+    /// Parameter naming convention matches HuggingFace format:
+    /// - `embedding.weight`
+    /// - Linear attention layers: `layers.{i}.linear_attn.{in_proj_qkvz,in_proj_ba,conv1d,norm,out_proj}.weight`
+    /// - Linear attention learnable: `layers.{i}.linear_attn.{a_log,dt_bias}`
+    /// - Full attention layers: `layers.{i}.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight`
+    /// - Full attention norms: `layers.{i}.self_attn.{q_norm,k_norm}.weight`
+    /// - All layers: `layers.{i}.mlp.{gate_proj,up_proj,down_proj}.weight`
+    /// - All layers: `layers.{i}.{input_layernorm,post_attention_layernorm}.weight`
+    /// - `final_norm.weight`
+    /// - `lm_head.weight` (if not tied)
+    pub(crate) fn get_parameters_for_training(&self) -> Result<HashMap<String, MxArray>> {
+        use super::decoder_layer::AttentionType;
+
+        let mut params = HashMap::new();
+
+        let layers_guard = self
+            .layers
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Transformer layers
+        for (i, layer) in layers_guard.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            match &layer.attn {
+                AttentionType::Linear(gdn) => {
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                        gdn.get_in_proj_qkvz_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                        gdn.get_in_proj_ba_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.conv1d.weight", prefix),
+                        gdn.get_conv1d_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.norm.weight", prefix),
+                        gdn.get_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.out_proj.weight", prefix),
+                        gdn.get_out_proj_weight(),
+                    );
+                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
+                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
+                }
+                AttentionType::Full(attn) => {
+                    params.insert(
+                        format!("{}.self_attn.q_proj.weight", prefix),
+                        attn.get_q_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_proj.weight", prefix),
+                        attn.get_k_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.v_proj.weight", prefix),
+                        attn.get_v_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.o_proj.weight", prefix),
+                        attn.get_o_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.q_norm.weight", prefix),
+                        attn.get_q_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_norm.weight", prefix),
+                        attn.get_k_norm_weight(),
+                    );
+                }
+            }
+
+            // MLP (all layers have dense MLP)
+            params.insert(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                layer.mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.up_proj.weight", prefix),
+                layer.mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.down_proj.weight", prefix),
+                layer.mlp.get_down_proj_weight(),
+            );
+
+            // Layer norms
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            final_norm_guard.get_weight(),
         );
+
+        // LM head (only if not tied)
+        if !self.config.tie_word_embeddings
+            && let Some(ref lm_head) = *lm_head_guard
+        {
+            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
+        }
+
+        Ok(params)
     }
 
-    if output_ptr.is_null() {
-        return Err(Error::from_reason(
-            "C++ Dense paged forward step returned null — check stderr for diagnostic. \
-             (Common causes: g_dense_paged_inited = false, slot_mapping shape != [1], \
-             input_ids size != 1, or weights cleared by another model load.)",
-        ));
+    /// Apply gradients to model parameters using pre-fetched params.
+    /// SGD update: param = param - lr * grad.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn apply_gradients_with_params(
+        &mut self,
+        gradients: HashMap<String, &MxArray>,
+        learning_rate: f64,
+        current_params: &HashMap<String, MxArray>,
+    ) -> Result<()> {
+        use crate::training_model::compute_sgd_updates;
+
+        // Compute updated parameters using shared SGD helper
+        let updated_params = compute_sgd_updates(&gradients, learning_rate, current_params)?;
+
+        // Acquire write locks
+        let mut layers = self.layers.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire layers write lock",
+            )
+        })?;
+        let mut final_norm = self.final_norm.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire final_norm write lock",
+            )
+        })?;
+        let mut lm_head = self.lm_head.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire lm_head write lock",
+            )
+        })?;
+
+        // Apply updates
+        for (name, updated_param) in updated_params.iter() {
+            if name == "lm_head.weight" {
+                if let Some(ref mut lm) = *lm_head {
+                    lm.set_weight(updated_param)?;
+                }
+            } else if name == "final_norm.weight" {
+                final_norm.set_weight(updated_param)?;
+            } else if name == "embedding.weight" {
+                self.embedding.set_weight(updated_param)?;
+            } else if name.starts_with("layers.") {
+                let parts: Vec<&str> = name.split('.').collect();
+                if parts.len() >= 3
+                    && let Ok(layer_idx) = parts[1].parse::<usize>()
+                    && layer_idx < layers.len()
+                {
+                    let layer = &mut layers[layer_idx];
+                    self.apply_layer_gradient(layer, name, updated_param)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    MxArray::from_handle(output_ptr, "dense_paged_forward_logits")
+    fn apply_layer_gradient(
+        &self,
+        layer: &mut super::decoder_layer::DecoderLayer,
+        name: &str,
+        updated_param: &MxArray,
+    ) -> Result<()> {
+        use super::decoder_layer::AttentionType;
+
+        if name.contains(".linear_attn.") {
+            if let AttentionType::Linear(ref mut gdn) = layer.attn {
+                if name.ends_with(".in_proj_qkvz.weight") {
+                    gdn.set_in_proj_qkvz_weight(updated_param)?;
+                } else if name.ends_with(".in_proj_ba.weight") {
+                    gdn.set_in_proj_ba_weight(updated_param)?;
+                } else if name.ends_with(".conv1d.weight") {
+                    gdn.set_conv1d_weight(updated_param)?;
+                } else if name.ends_with(".norm.weight") {
+                    gdn.set_norm_weight(updated_param)?;
+                } else if name.ends_with(".out_proj.weight") {
+                    gdn.set_out_proj_weight(updated_param)?;
+                } else if name.ends_with(".dt_bias") {
+                    gdn.set_dt_bias(updated_param);
+                } else if name.ends_with(".a_log") {
+                    gdn.set_a_log(updated_param)?;
+                }
+            }
+        } else if name.contains(".self_attn.") {
+            if let AttentionType::Full(ref mut attn) = layer.attn {
+                if name.ends_with(".q_proj.weight") {
+                    attn.set_q_proj_weight(updated_param)?;
+                } else if name.ends_with(".k_proj.weight") {
+                    attn.set_k_proj_weight(updated_param)?;
+                } else if name.ends_with(".v_proj.weight") {
+                    attn.set_v_proj_weight(updated_param)?;
+                } else if name.ends_with(".o_proj.weight") {
+                    attn.set_o_proj_weight(updated_param)?;
+                } else if name.ends_with(".q_norm.weight") {
+                    attn.set_q_norm_weight(updated_param)?;
+                } else if name.ends_with(".k_norm.weight") {
+                    attn.set_k_norm_weight(updated_param)?;
+                }
+            }
+        } else if name.contains(".mlp.") {
+            if name.ends_with(".gate_proj.weight") {
+                layer.mlp.set_gate_proj_weight(updated_param)?;
+            } else if name.ends_with(".up_proj.weight") {
+                layer.mlp.set_up_proj_weight(updated_param)?;
+            } else if name.ends_with(".down_proj.weight") {
+                layer.mlp.set_down_proj_weight(updated_param)?;
+            }
+        } else if name.ends_with(".input_layernorm.weight") {
+            layer.set_input_layernorm_weight(updated_param)?;
+        } else if name.ends_with(".post_attention_layernorm.weight") {
+            layer.set_post_attention_layernorm_weight(updated_param)?;
+        } else {
+            tracing::warn!(
+                "Unrecognized parameter name in apply_layer_gradient: {}",
+                name
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Tokenize messages using the model's chat template.
+    pub(crate) fn apply_chat_template_sync(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded - call load() first"))?;
+        tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
+    }
+
+    /// Generate a single completion with logprob tracking (for GRPO training).
+    ///
+    /// Uses the compiled C++ forward path when available (~10x faster than Rust).
+    /// Generation does NOT need differentiability — gradients are computed separately
+    /// via the functional forward path in autograd Phase 2.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn generate_for_training_sync(
+        &self,
+        input_ids: &MxArray,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        let config = config.unwrap_or_default();
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let model_id = self.model_id;
+
+        // Hold generation lock (blocking — called from spawn_blocking context).
+        let _gen_guard = self.generation_lock.blocking_lock();
+
+        // Check if compiled path is available (C++ weights belong to this model)
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+
+        // Try to acquire compiled mutex (non-blocking, safe from sync context).
+        // If locked (concurrent generate() call), fall back to Rust path.
+        let compiled_lock = if use_compiled {
+            DENSE_COMPILED_MUTEX.try_lock().ok()
+        } else {
+            None
+        };
+        let use_compiled = compiled_lock.is_some();
+
+        let _weight_guard = if use_compiled {
+            acquire_compiled_weight_guard(model_id)
+        } else {
+            None
+        };
+        let use_compiled = _weight_guard.is_some();
+
+        self.init_caches_inner()?;
+
+        // Acquire locks
+        let embedding_weight = self.embedding.get_weight();
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+
+        // === Prefill (always uses Rust forward — runs once) ===
+        let logits = forward_inner(
+            input_ids,
+            &embedding_weight,
+            &mut layers_guard,
+            &mut caches_guard,
+            &final_norm_guard,
+            &lm_head_guard,
+            None,
+        )?;
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        let input_tokens = input_ids.to_uint32()?;
+
+        let result = if use_compiled {
+            // === Compiled C++ decode path ===
+            let _compiled_guard = CompiledResetGuard;
+            let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+            let prefill_len = seq_len as i32;
+            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let num_layers = self.config.num_layers as usize;
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            if let Some(ref caches) = *caches_guard {
+                for (i, cache) in caches.iter().enumerate() {
+                    let (p0, p1) = cache.export_ptrs();
+                    cache_ptrs[i * 2] = p0;
+                    cache_ptrs[i * 2 + 1] = p1;
+                }
+            }
+            // Drop locks not needed during compiled decode
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            // Keep caches_guard alive through init_from_prefill so cache_ptrs remain valid
+            unsafe {
+                mlx_sys::mlx_qwen35_compiled_init_from_prefill(
+                    self.config.num_layers,
+                    self.config.hidden_size,
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.rope_theta as f32,
+                    self.config.rope_dims(),
+                    self.config.rms_norm_eps as f32,
+                    self.config.full_attention_interval,
+                    self.config.linear_num_key_heads,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                    self.config.linear_conv_kernel_dim,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1, // batch_size
+                    cache_ptrs.as_mut_ptr(),
+                    prefill_len,
+                );
+            }
+            // C++ has copied arrays into g_compiled_caches — safe to release
+            drop(caches_guard);
+
+            // Decode using compiled forward with synchronous cache eval.
+            // Caches are eval'd BEFORE each forward call to ensure the previous step's
+            // caches are materialized, breaking lazy dependency chains that would otherwise
+            // cause O(N²) graph growth and 100+GB memory.
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                // Sync-eval compiled caches from the previous step before building new graph.
+                // Uses synchronous eval (not async_eval) to avoid interaction issues with
+                // the training loop's own synchronous eval calls.
+                unsafe { mlx_sys::mlx_qwen35_sync_eval_compiled_caches() };
+                let logits = forward_compiled(ids, &embedding_weight)?;
+                // forward_compiled returns [1, vocab] but training loop expects [1, 1, vocab]
+                let logits = logits.reshape(&[1, 1, -1])?;
+                Ok(logits)
+            };
+
+            crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?
+            // _compiled_guard dropped here → mlx_qwen35_compiled_reset()
+        } else {
+            // === Rust fallback decode path ===
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                forward_inner(
+                    ids,
+                    &embedding_weight,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
+                    None,
+                )
+            };
+
+            let result = crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?;
+
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            drop(caches_guard);
+
+            result
+        };
+
+        drop(compiled_lock);
+        // Use inner variant — we already hold the generation lock
+        self.reset_caches_inner()?;
+
+        Ok(result)
+    }
+
+    /// Generate a batch of completions for GRPO training.
+    pub(crate) fn generate_batch_for_training_sync(
+        &self,
+        prompt_arrays: &[MxArray],
+        group_size: usize,
+        config: Option<GenerationConfig>,
+    ) -> Result<BatchGenerationResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        crate::models::training_generate::generate_batch_for_training_loop(
+            prompt_arrays,
+            group_size,
+            config,
+            tokenizer,
+            |prompt, cfg| self.generate_for_training_sync(prompt, cfg),
+        )
+    }
+
+    /// Decode token IDs to text.
+    pub(crate) fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let token_ids = tokens.to_uint32()?;
+        tokenizer.decode_sync(&token_ids, true)
+    }
 }
 
 // ============================================================================
@@ -8715,796 +7351,5 @@ mod prefix_cache_reuse_integration_tests {
         //   assert_eq!(r2.cached_tokens, 0);
         //   // And the second call must have done a full prefill, not
         //   // attempted to decode from stale caches.
-    }
-}
-
-#[cfg(test)]
-mod paged_construction_tests {
-    //! Smoke tests for the block-paged adapter construction on Qwen3.5
-    //! dense. The forward dispatch lives in `chat_sync_core_paged`
-    //! / `chat_stream_sync_core_paged`; these tests cover the
-    //! Inner-construction surface in isolation.
-    //!
-    //! Tests that allocate a `LayerKVPool` require Metal. Construction-only
-    //! cases are `#[ignore]`-marked behind `MLX_TEST_PAGED=1`; forward-path
-    //! checks are also ignored because no-Metal hosts can abort inside MLX
-    //! before Rust receives an `Err`.
-
-    use super::*;
-    use crate::array::DType;
-    use crate::models::qwen3_5::config::Qwen3_5Config;
-    use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
-
-    fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
-        Qwen3_5Config {
-            vocab_size: 1024,
-            hidden_size: 64,
-            num_layers: 8,
-            num_heads: 4,
-            num_kv_heads: 2,
-            intermediate_size: 128,
-            rms_norm_eps: 1e-6,
-            head_dim: 16,
-            tie_word_embeddings: true,
-            attention_bias: false,
-            max_position_embeddings: 1024,
-            pad_token_id: 0,
-            eos_token_id: 0,
-            bos_token_id: 0,
-            linear_num_value_heads: 4,
-            linear_num_key_heads: 2,
-            linear_key_head_dim: 16,
-            linear_value_head_dim: 16,
-            linear_conv_kernel_dim: 4,
-            full_attention_interval: 4,
-            partial_rotary_factor: 0.25,
-            rope_theta: 100_000.0,
-            paged_cache_memory_mb: Some(64),
-            paged_block_size: Some(16),
-            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
-        }
-    }
-
-    fn tiny_paged_forward_cfg() -> Qwen3_5Config {
-        let mut cfg = tiny_cfg(true);
-        // Paged attention's Metal kernels require head_dim=32+; keep the
-        // production-forward tests on a separate shape so construction tests
-        // preserve their smaller historical config.
-        cfg.hidden_size = 128;
-        cfg.intermediate_size = 256;
-        cfg.head_dim = 32;
-        cfg.linear_key_head_dim = 32;
-        cfg.linear_value_head_dim = 32;
-        cfg.paged_cache_memory_mb = Some(256);
-        cfg
-    }
-
-    fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
-        let cfg = tiny_paged_forward_cfg();
-        match Qwen35Inner::new(cfg.clone()) {
-            Ok(inner) => Some((inner, cfg)),
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
-                    eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
-                    None
-                } else {
-                    panic!("unexpected Qwen35Inner::new failure in {test_name}: {msg}");
-                }
-            }
-        }
-    }
-
-    fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
-        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
-
-        let w = inner.embedding.get_weight();
-        inner.embedding.set_weight(&cast(&w)).expect("set embed");
-
-        let w = inner.final_norm.get_weight();
-        inner
-            .final_norm
-            .set_weight(&cast(&w))
-            .expect("set final_norm");
-
-        if let Some(head) = inner.lm_head.as_mut() {
-            let w = head.get_weight();
-            head.set_weight(&cast(&w)).expect("set lm_head");
-        }
-
-        for layer in inner.layers.iter_mut() {
-            let w = layer.get_input_layernorm_weight();
-            layer
-                .set_input_layernorm_weight(&cast(&w))
-                .expect("set input_layernorm");
-            let w = layer.get_post_attention_layernorm_weight();
-            layer
-                .set_post_attention_layernorm_weight(&cast(&w))
-                .expect("set post_attention_layernorm");
-
-            match &mut layer.attn {
-                AttentionType::Linear(gdn) => {
-                    let w = gdn.get_dt_bias();
-                    gdn.set_dt_bias(&cast(&w));
-                    let w = gdn.get_a_log();
-                    gdn.set_a_log(&cast(&w)).expect("set a_log");
-                    let w = gdn.get_in_proj_qkvz_weight();
-                    gdn.set_in_proj_qkvz_weight(&cast(&w))
-                        .expect("set in_proj_qkvz");
-                    let w = gdn.get_in_proj_ba_weight();
-                    gdn.set_in_proj_ba_weight(&cast(&w))
-                        .expect("set in_proj_ba");
-                    let w = gdn.get_conv1d_weight();
-                    gdn.set_conv1d_weight(&cast(&w)).expect("set conv1d");
-                    let w = gdn.get_norm_weight();
-                    gdn.set_norm_weight(&cast(&w)).expect("set gdn norm");
-                    let w = gdn.get_out_proj_weight();
-                    gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
-                }
-                AttentionType::Full(attn) => {
-                    let w = attn.get_q_proj_weight();
-                    attn.set_q_proj_weight(&cast(&w)).expect("set q_proj");
-                    let w = attn.get_k_proj_weight();
-                    attn.set_k_proj_weight(&cast(&w)).expect("set k_proj");
-                    let w = attn.get_v_proj_weight();
-                    attn.set_v_proj_weight(&cast(&w)).expect("set v_proj");
-                    let w = attn.get_o_proj_weight();
-                    attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
-                    let w = attn.get_q_norm_weight();
-                    attn.set_q_norm_weight(&cast(&w)).expect("set q_norm");
-                    let w = attn.get_k_norm_weight();
-                    attn.set_k_norm_weight(&cast(&w)).expect("set k_norm");
-                }
-            }
-
-            let w = layer.mlp.get_gate_proj_weight();
-            layer
-                .mlp
-                .set_gate_proj_weight(&cast(&w))
-                .expect("set gate_proj");
-            let w = layer.mlp.get_up_proj_weight();
-            layer
-                .mlp
-                .set_up_proj_weight(&cast(&w))
-                .expect("set up_proj");
-            let w = layer.mlp.get_down_proj_weight();
-            layer
-                .mlp
-                .set_down_proj_weight(&cast(&w))
-                .expect("set down_proj");
-        }
-    }
-
-    fn reset_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
-        inner.caches = Some(
-            (0..inner.config.num_layers as usize)
-                .map(|i| {
-                    if inner.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        if adapter.block_table().is_some() {
-            adapter.release_request().expect("release_request");
-        }
-        adapter.reset_for_new_request(0).expect("reset request");
-        let prefix = adapter
-            .find_cached_prefix(prompt, &[], 0, false)
-            .expect("find_cached_prefix");
-        assert_eq!(
-            prefix.cached_token_count, 0,
-            "dense chunking tests must start from a cold adapter prefix"
-        );
-        adapter
-            .allocate_suffix_blocks(prompt.len() as u32)
-            .expect("allocate suffix blocks");
-    }
-
-    fn run_dense_paged_prefill_with_size(
-        inner: &mut Qwen35Inner,
-        full_tokens: &[u32],
-        suffix_tokens: &[u32],
-        cached_prefix_len: u32,
-        chunk_size: i32,
-    ) -> Result<MxArray> {
-        let layer_kinds =
-            decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
-                inner.config.is_linear_layer(i)
-            });
-        let embed = inner.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-
-        super::super::paged_forward::run_paged_prefill_chunk_with_size(
-            full_tokens,
-            suffix_tokens,
-            cached_prefix_len,
-            false,
-            &embed,
-            &mut inner.layers,
-            caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            &embedding_weight,
-            &layer_kinds,
-            adapter,
-            chunk_size,
-        )
-    }
-
-    fn logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
-        let f32_arr = logits.astype(DType::Float32).expect("astype f32");
-        f32_arr.eval();
-        let n = f32_arr.shape_at(0).expect("shape_at(0)") as usize;
-        (0..n)
-            .map(|i| f32_arr.item_at_float32(i).expect("item_at_float32"))
-            .collect()
-    }
-
-    fn assert_finite_vocab_logits(logits: &MxArray, vocab_size: i32, context: &str) {
-        assert_eq!(logits.ndim().expect("ndim"), 1, "{context}: logits ndim");
-        assert_eq!(
-            logits.shape_at(0).expect("shape_at(0)"),
-            vocab_size as i64,
-            "{context}: logits shape"
-        );
-        let values = logits_to_f32_vec(logits);
-        for (i, v) in values.iter().enumerate() {
-            assert!(v.is_finite(), "{context}: logits[{i}] is not finite: {v}");
-        }
-    }
-
-    /// `use_block_paged_cache` defaults to `None` and round-trips
-    /// through serde.
-    #[test]
-    fn test_use_block_paged_cache_serde_default_none() {
-        let json = serde_json::json!({
-            "vocab_size": 1024,
-            "hidden_size": 64,
-            "num_layers": 8,
-            "num_heads": 4,
-            "num_kv_heads": 2,
-            "intermediate_size": 128,
-            "rms_norm_eps": 1e-6,
-            "head_dim": 16,
-            "tie_word_embeddings": true,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 0,
-            "eos_token_id": 0,
-            "bos_token_id": 0,
-        });
-        let cfg: Qwen3_5Config = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            cfg.use_block_paged_cache, None,
-            "use_block_paged_cache must default to None on JSON without the key"
-        );
-        assert_eq!(cfg.paged_block_size, None);
-        assert_eq!(cfg.paged_cache_memory_mb, None);
-    }
-
-    #[test]
-    fn test_use_block_paged_cache_serde_true_round_trip() {
-        let json = serde_json::json!({
-            "vocab_size": 1024,
-            "hidden_size": 64,
-            "num_layers": 8,
-            "num_heads": 4,
-            "num_kv_heads": 2,
-            "intermediate_size": 128,
-            "rms_norm_eps": 1e-6,
-            "head_dim": 16,
-            "tie_word_embeddings": true,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 0,
-            "eos_token_id": 0,
-            "bos_token_id": 0,
-            "use_block_paged_cache": true,
-            "paged_block_size": 16,
-            "paged_cache_memory_mb": 256,
-        });
-        let cfg: Qwen3_5Config = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.use_block_paged_cache, Some(true));
-        assert_eq!(cfg.paged_block_size, Some(16));
-        assert_eq!(cfg.paged_cache_memory_mb, Some(256));
-    }
-
-    #[test]
-    fn test_full_attention_layer_count() {
-        let cfg = tiny_cfg(false);
-        // 8 layers, full_attention_interval=4 → layers 3 and 7 are
-        // full-attention (2 layers).
-        assert_eq!(cfg.full_attention_layer_count(), 2);
-    }
-
-    /// When `use_block_paged_cache` is `None`, `paged_adapter` is None.
-    #[test]
-    fn test_inner_no_paged_adapter_when_flag_is_none() {
-        let cfg = tiny_cfg(false);
-        let inner =
-            Qwen35Inner::new(cfg).expect("Qwen35Inner::new must succeed without paged adapter");
-        assert!(
-            inner.paged_adapter.is_none(),
-            "paged_adapter must be None when use_block_paged_cache is None"
-        );
-    }
-
-    #[test]
-    fn test_fresh_dense_layer_caches_are_not_gdn_reuse_ready() {
-        let cfg = tiny_cfg(true);
-        let caches = fresh_dense_layer_caches(&cfg);
-        assert_eq!(caches.len(), cfg.num_layers as usize);
-        assert!(
-            !dense_paged_linear_caches_ready(&cfg, Some(&caches)),
-            "fresh linear caches have empty conv/recurrent slots, so a live continuation must replay GDN"
-        );
-        assert!(matches!(caches[0], Qwen3_5LayerCache::Linear(_)));
-        assert!(matches!(caches[3], Qwen3_5LayerCache::FullAttention(_)));
-    }
-
-    #[test]
-    fn test_paged_dense_linear_cache_export_uninitialized_returns_none() {
-        unsafe {
-            mlx_sys::mlx_qwen35_compiled_reset();
-        }
-        let cfg = tiny_cfg(true);
-        let exported = export_paged_dense_linear_caches(&cfg)
-            .expect("uninitialized paged dense export should not fail");
-        assert!(exported.is_none());
-    }
-
-    #[test]
-    fn test_dense_paged_prefix_block_hash_matches_allocator_chain() {
-        let tokens: Vec<u32> = (1..=12).collect();
-        let per_block = vec![vec![11], vec![], vec![33, 44]];
-
-        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &per_block[0]);
-        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
-        let h2 = mlx_paged_attn::hash_tokens(&tokens[8..12], h1, &per_block[2]);
-
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 12, 4, &per_block, 0),
-            Some(h2)
-        );
-    }
-
-    #[test]
-    fn test_dense_paged_prefix_block_hash_applies_salt_to_first_block_only() {
-        let tokens: Vec<u32> = (1..=8).collect();
-        let per_block = vec![vec![11], vec![22]];
-        let salt = 99;
-
-        let mut first_block_keys = per_block[0].clone();
-        first_block_keys.push(salt);
-        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &first_block_keys);
-        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
-
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, salt),
-            Some(h1)
-        );
-    }
-
-    #[test]
-    fn test_dense_paged_prefix_block_hash_rejects_non_full_or_unkeyed_prefix() {
-        let tokens: Vec<u32> = (1..=8).collect();
-        let per_block = vec![vec![]];
-
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 6, 4, &per_block, 0),
-            None
-        );
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, 0),
-            None
-        );
-    }
-
-    /// Allocates a `LayerKVPool`. Requires Metal; gate on
-    /// `MLX_TEST_PAGED=1`.
-    #[test]
-    #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
-    fn test_inner_constructs_paged_adapter_when_flag_is_true() {
-        if std::env::var_os("MLX_TEST_PAGED").is_none() {
-            return;
-        }
-        let cfg = tiny_cfg(true);
-        let inner = Qwen35Inner::new(cfg).expect(
-            "Qwen35Inner::new with use_block_paged_cache=true must succeed on Metal-capable host",
-        );
-        assert!(
-            inner.paged_adapter.is_some(),
-            "paged_adapter must be Some when use_block_paged_cache = Some(true)"
-        );
-    }
-
-    /// VLM checkpoints are accepted under paged dispatch: the vision
-    /// encoder loads even with `paged_adapter` on. Text-only chat
-    /// entry points reject image-bearing turns at runtime; this test
-    /// verifies only the load-time wiring.
-    #[test]
-    #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
-    fn test_vlm_loads_when_paged_enabled() {
-        if std::env::var_os("MLX_TEST_PAGED").is_none() {
-            return;
-        }
-        use crate::models::qwen3_5::vision::Qwen3_5VisionConfig;
-        use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
-
-        let cfg = tiny_cfg(true);
-        let mut inner = Qwen35Inner::new(cfg).unwrap();
-        let vision_cfg = Qwen3_5VisionConfig {
-            hidden_size: 64,
-            intermediate_size: 256,
-            num_heads: 4,
-            num_layers: 2,
-            patch_size: 16,
-            spatial_merge_size: 2,
-            image_size: 256,
-            out_hidden_size: 64,
-        };
-        let vision_enc =
-            Qwen3_5VisionEncoder::new(vision_cfg).expect("vision encoder construction");
-        let result = inner.set_vision_encoder(vision_enc);
-        assert!(
-            result.is_ok(),
-            "set_vision_encoder must succeed when paged_adapter is Some so VLM \
-             checkpoints can run text-only paged inference; got {result:?}"
-        );
-        assert!(
-            inner.vision_encoder.is_some(),
-            "vision_encoder field must be populated after a successful set"
-        );
-    }
-
-    /// Phase 5 piece 1: hard-fails fast when caller passes a `caches`
-    /// slice whose length disagrees with `config.num_layers`. The
-    /// check runs BEFORE any FFI dispatch so we don't perturb the C++
-    /// paged globals — making this the only branch of
-    /// `init_paged_dense_compiled_session` we can exercise from a
-    /// non-Metal sandbox.
-    ///
-    /// (The other failure branches all require populated `MxArray`
-    /// handles, which need a real Metal allocation. They're covered
-    /// indirectly by parity testing on real-weights checkpoints.)
-    #[test]
-    fn test_init_paged_dense_compiled_session_rejects_cache_length_mismatch() {
-        let cfg = tiny_cfg(true);
-        // `cfg` has num_layers=8; pass an empty cache slice to trigger
-        // the length check before any FFI / Metal call.
-        let empty_caches: Vec<Qwen3_5LayerCache> = Vec::new();
-        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
-            mlx_paged_attn::BlockAllocator::new(2, 16),
-        ));
-        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 16,
-            gpu_memory_mb: 8,
-            head_size: cfg.head_dim as u32,
-            num_kv_heads: cfg.num_kv_heads as u32,
-            num_layers: cfg.full_attention_layer_count() as u32,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(64),
-            max_batch_size: Some(1),
-        };
-        let pool = match mlx_paged_attn::LayerKVPool::new(
-            pa_cfg,
-            2,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        ) {
-            Ok(p) => std::sync::Arc::new(p),
-            Err(e) => {
-                eprintln!(
-                    "skipping test_init_paged_dense_compiled_session_rejects_cache_length_mismatch: {e}"
-                );
-                return;
-            }
-        };
-        let adapter = PagedKVCacheAdapter::new(alloc, pool, 16)
-            .expect("paged adapter construction must succeed once pool is built");
-        let res = init_paged_dense_compiled_session(&cfg, &empty_caches, &adapter, 0);
-        let msg = res
-            .expect_err("expected Err on cache length mismatch")
-            .to_string();
-        assert!(
-            msg.contains("caches.len()"),
-            "error must reference caches length contract; got: {msg}"
-        );
-    }
-
-    /// Phase 5 piece 1: the C++ compiled paged graph hard-codes
-    /// block_size=16. The dispatcher MUST gate `cpp_session_ready` on
-    /// `adapter.block_size() == 16` so a config with
-    /// `paged_block_size: Some(8)` falls back to the pure-Rust paged
-    /// path instead of corrupting KV state. Validates the constant.
-    #[test]
-    fn test_cpp_paged_required_block_size_is_sixteen() {
-        assert_eq!(
-            CPP_PAGED_REQUIRED_BLOCK_SIZE, 16,
-            "C++ compiled paged graph in mlx_qwen35.cpp hard-codes block_size=16; \
-             changing this constant requires re-tracing the compiled graph"
-        );
-    }
-
-    /// Phase 5 piece 1: build an adapter with `block_size != 16` and
-    /// verify that the dispatcher gate
-    /// (`adapter.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE`) would
-    /// correctly reject it. The gate runs BEFORE
-    /// `init_paged_dense_compiled_session` is called, so the FFI is
-    /// never touched on the fallback path.
-    #[test]
-    fn test_block_size_eight_adapter_falls_back_to_pure_rust() {
-        let cfg = tiny_cfg(true);
-        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
-            mlx_paged_attn::BlockAllocator::new(2, 8),
-        ));
-        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 8,
-            gpu_memory_mb: 8,
-            head_size: cfg.head_dim as u32,
-            num_kv_heads: cfg.num_kv_heads as u32,
-            num_layers: cfg.full_attention_layer_count() as u32,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(64),
-            max_batch_size: Some(1),
-        };
-        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
-            pa_cfg,
-            2,
-            cfg.full_attention_layer_count() as u32,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        ) {
-            Ok(p) => std::sync::Arc::new(p),
-            Err(e) => {
-                eprintln!("skipping test_block_size_eight_adapter_falls_back_to_pure_rust: {e}");
-                return;
-            }
-        };
-        let adapter = PagedKVCacheAdapter::new(alloc, pool, 8)
-            .expect("PagedKVCacheAdapter::new must accept block_size=8 (validated by adapter)");
-        assert_eq!(
-            adapter.block_size(),
-            8,
-            "adapter must report the block_size it was constructed with"
-        );
-        // Simulate the dispatcher's gate. We do NOT call
-        // `init_paged_dense_compiled_session` here — that's exactly
-        // what the gate prevents.
-        assert_ne!(
-            adapter.block_size(),
-            CPP_PAGED_REQUIRED_BLOCK_SIZE,
-            "block_size=8 adapter must not match the compiled graph's hard-coded 16; \
-             the dispatcher gate at chat_sync_core_paged_inner / chat_stream_sync_core_paged_inner \
-             relies on this inequality to fall back to the pure-Rust paged path"
-        );
-    }
-
-    /// Dense Qwen3.5 paged-prefill chunking state test. This drives the
-    /// production chunk-size worker once and asserts the adapter cursor,
-    /// request token log, and block table cover the whole prompt after all
-    /// chunks have been recorded.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_chunks_advance_adapter_state() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_chunks_advance_adapter_state")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt: Vec<u32> = (0u32..64).map(|i| (i * 5 + 7) % 257).collect();
-        reset_paged_request(&mut inner, &prompt);
-
-        let logits = match run_dense_paged_prefill_with_size(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
-        ) {
-            Ok(logits) => logits,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!(
-                        "skipping test_dense_paged_prefill_chunks_advance_adapter_state: {msg}"
-                    );
-                    return;
-                }
-                panic!("unexpected dense paged chunk failure: {msg}");
-            }
-        };
-
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-        assert_eq!(
-            adapter.current_token_count() as usize,
-            prompt.len(),
-            "adapter cursor after chunked prefill"
-        );
-        assert_eq!(
-            adapter.request_tokens(),
-            prompt.as_slice(),
-            "request token log after chunked prefill"
-        );
-        let block_table = adapter.block_table().expect("block_table");
-        let expected_min_blocks = prompt.len().div_ceil(adapter.block_size() as usize);
-        assert!(
-            block_table.num_blocks() >= expected_min_blocks,
-            "block table has {} blocks, expected at least {expected_min_blocks}",
-            block_table.num_blocks()
-        );
-        assert_finite_vocab_logits(&logits, cfg.vocab_size, "final dense paged chunk prefill");
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
-    }
-
-    /// Uneven-tail coverage for dense Qwen3.5 paged prefill: a 33-token
-    /// prompt with chunk_size=16 must record two full chunks plus a
-    /// one-token tail and return valid logits for the tail chunk.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_chunks_handle_uneven_tail() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_chunks_handle_uneven_tail")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 11 + 3) % 257).collect();
-        reset_paged_request(&mut inner, &prompt);
-
-        let final_logits = run_dense_paged_prefill_with_size(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
-        )
-        .expect("dense paged uneven-tail chunked prefill");
-
-        assert_eq!(
-            prompt.len(),
-            33,
-            "test setup must exercise a one-token tail"
-        );
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-        assert_eq!(
-            adapter.current_token_count(),
-            33,
-            "adapter cursor must include the uneven tail"
-        );
-        assert_eq!(
-            adapter.request_tokens(),
-            prompt.as_slice(),
-            "request token log must include the uneven tail"
-        );
-        assert_finite_vocab_logits(
-            &final_logits,
-            cfg.vocab_size,
-            "uneven-tail dense paged chunk prefill",
-        );
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
-    }
-
-    /// Compatibility guard for the current/default dense Qwen3.5 paged
-    /// prefill behavior: a full suffix passed in one call remains a valid
-    /// single-shot prefill and is stable across a fresh adapter reset.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_single_shot_default_still_works() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_single_shot_default_still_works")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt: Vec<u32> = vec![5, 11, 21, 33, 47, 60, 71, 83];
-
-        reset_paged_request(&mut inner, &prompt);
-        let logits_a = run_dense_paged_prefill_with_size(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
-        )
-        .expect("single-shot A");
-        assert_finite_vocab_logits(&logits_a, cfg.vocab_size, "single-shot A");
-        {
-            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-            assert_eq!(
-                adapter.current_token_count() as usize,
-                prompt.len(),
-                "single-shot cursor"
-            );
-            assert_eq!(adapter.request_tokens(), prompt.as_slice());
-        }
-
-        reset_paged_request(&mut inner, &prompt);
-        let logits_b = run_dense_paged_prefill_with_size(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
-        )
-        .expect("single-shot B");
-        let a = logits_to_f32_vec(&logits_a);
-        let b = logits_to_f32_vec(&logits_b);
-        assert_eq!(a.len(), cfg.vocab_size as usize);
-        assert_eq!(b.len(), cfg.vocab_size as usize);
-        for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
-            let abs_diff = (left - right).abs();
-            assert!(
-                abs_diff <= 1e-6,
-                "single-shot dense paged prefill changed after fresh reset at index {i}: \
-                 first={left}, second={right}, abs_diff={abs_diff}"
-            );
-        }
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
-    }
-
-    /// Phase 5 piece 1: the C++ FFI returns `int32_t` (0 success / -1
-    /// failure). The Rust `init_paged_dense_compiled_session`
-    /// propagates non-zero status as `Err` so the dispatcher's
-    /// `cpp_session_ready` becomes false on init failure and falls
-    /// back to the pure-Rust paged decode. This test forces the C++
-    /// side's null-handle rejection branch by passing null pool
-    /// handles for the full-attention layers, and asserts the FFI
-    /// returns -1.
-    #[test]
-    fn test_mlx_qwen35_init_paged_returns_negative_on_null_handles() {
-        let cfg = tiny_cfg(true);
-        let num_layers = cfg.num_layers as usize;
-        // All-null pool/scale handles. The C++ side iterates layers
-        // [0..num_layers); for each non-linear (full-attention) layer
-        // the null-handle check fires and the function returns -1.
-        // Layer 0 with full_attention_interval=4 is linear, so the
-        // first full-attn layer is at index 3, where the rejection
-        // fires.
-        let mut k_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut v_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut k_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut v_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
-        let mut linear_caches: Vec<*mut mlx_sys::mlx_array> =
-            vec![std::ptr::null_mut(); num_layers * 2];
-
-        let status = unsafe {
-            mlx_sys::mlx_qwen35_init_paged(
-                cfg.num_layers,
-                cfg.hidden_size,
-                cfg.num_heads,
-                cfg.num_kv_heads,
-                cfg.head_dim,
-                cfg.rope_theta as f32,
-                cfg.rope_dims(),
-                cfg.rms_norm_eps as f32,
-                cfg.full_attention_interval,
-                cfg.linear_num_key_heads,
-                cfg.linear_num_value_heads,
-                cfg.linear_key_head_dim,
-                cfg.linear_value_head_dim,
-                cfg.linear_conv_kernel_dim,
-                if cfg.tie_word_embeddings { 1 } else { 0 },
-                cfg.max_position_embeddings,
-                1,
-                k_pool.as_mut_ptr(),
-                v_pool.as_mut_ptr(),
-                k_scale.as_mut_ptr(),
-                v_scale.as_mut_ptr(),
-                linear_caches.as_mut_ptr(),
-                0,
-            )
-        };
-        assert_eq!(
-            status, -1,
-            "mlx_qwen35_init_paged MUST return -1 when full-attention pool/scale handles \
-             are null. Returning 0 would let the dispatcher enter the compiled paged decode \
-             against uninitialized globals."
-        );
-        // Reset C++ globals to a clean state so the test doesn't
-        // contaminate any later tests in the same process.
-        unsafe {
-            mlx_sys::mlx_qwen35_compiled_reset();
-        }
     }
 }

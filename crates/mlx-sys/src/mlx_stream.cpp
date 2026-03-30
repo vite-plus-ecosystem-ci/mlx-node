@@ -65,7 +65,7 @@ void mlx_stream_synchronize(mlx_stream stream) {
 }
 
 // ================================================================================
-// Metal Operations (Memory Management)
+// GPU Operations (Memory Management)
 // ================================================================================
 //
 // Fallible-FFI contract:
@@ -89,20 +89,29 @@ void mlx_stream_synchronize(mlx_stream stream) {
 
 // Check if Metal backend is available
 bool mlx_metal_is_available() {
+#ifdef MLX_USE_METAL
   try {
     return mlx::core::metal::is_available();
   } catch (...) {
     return false;
   }
+#else
+  return false;
+#endif
 }
 
-// Get Metal device information as JSON string
-// Returns a JSON string with device properties like max_recommended_working_set_size
+// Get GPU device information as JSON string
 const char* mlx_metal_device_info() {
-  // Static buffer to hold the JSON string
   static std::string info_json;
 
-  if (!mlx::core::metal::is_available()) {
+  bool gpu_available = false;
+#ifdef MLX_USE_METAL
+  gpu_available = mlx::core::metal::is_available();
+#elif defined(MLX_USE_WEBGPU)
+  gpu_available = mlx::core::gpu::is_available();
+#endif
+
+  if (!gpu_available) {
     info_json = "{\"available\": false}";
     return info_json.c_str();
   }
@@ -110,15 +119,12 @@ const char* mlx_metal_device_info() {
   try {
     const auto& device_info = mlx::core::gpu::device_info();
 
-    // Build JSON string manually
     std::ostringstream json;
     json << "{";
     json << "\"available\": true";
 
-    // Get max_recommended_working_set_size (this is the key we need for wired_limit)
     auto it = device_info.find("max_recommended_working_set_size");
     if (it != device_info.end()) {
-      // The value is a variant<string, size_t>, extract size_t
       if (const auto* val = std::get_if<size_t>(&it->second)) {
         json << ", \"max_recommended_working_set_size\": " << *val;
       }

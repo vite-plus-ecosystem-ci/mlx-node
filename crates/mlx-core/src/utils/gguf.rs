@@ -1258,6 +1258,7 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,

@@ -22,22 +22,46 @@ pub mod param_manager;
 pub mod profiling;
 pub mod response_store;
 pub mod sampling;
-pub mod sft;
 pub mod stream;
 pub mod tensor;
 pub mod tokenizer;
 pub mod tools;
-pub mod tracing;
-pub mod training_model;
-pub mod training_state;
 pub mod transformer;
 pub mod utils;
 pub mod vision;
 
+// Modules excluded from WASM browser builds (training, profiling, DB)
+#[cfg(not(target_family = "wasm"))]
+pub mod autograd;
+#[cfg(not(target_family = "wasm"))]
+pub mod convert;
+#[cfg(not(target_family = "wasm"))]
+pub mod dataset;
+#[cfg(not(target_family = "wasm"))]
+pub mod decode_profiler;
+#[cfg(not(target_family = "wasm"))]
+pub mod gradients;
+#[cfg(not(target_family = "wasm"))]
+pub mod grpo;
+#[cfg(not(target_family = "wasm"))]
+pub mod optimizers;
+#[cfg(not(target_family = "wasm"))]
+pub mod output_store;
+#[cfg(not(target_family = "wasm"))]
+pub mod param_manager;
+#[cfg(not(target_family = "wasm"))]
+pub mod profiling;
+#[cfg(not(target_family = "wasm"))]
+pub mod sft;
+#[cfg(not(target_family = "wasm"))]
+pub mod tracing;
+#[cfg(not(target_family = "wasm"))]
+pub mod training_model;
+
 use std::sync::LazyLock;
 use stream::{DeviceType, Stream};
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "mimalloc-safe"))]
 #[global_allocator]
 static GLOBAL: mimalloc_safe::MiMalloc = mimalloc_safe::MiMalloc;
 
