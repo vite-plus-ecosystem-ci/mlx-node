@@ -175,14 +175,13 @@ impl Qwen3Tokenizer {
     /// const tokenizer = Qwen3Tokenizer.fromPretrained();
     /// const tokens = tokenizer.encode("Hello, world!");
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn from_pretrained(
         env: &Env,
         tokenizer_path: String,
     ) -> Result<PromiseRaw<'_, Qwen3Tokenizer>> {
         env.spawn_future(async move {
-            crate::compat::run_blocking(move || {
+            napi::bindgen_prelude::spawn_blocking(move || {
                 let tokenizer = Tokenizer::from_file(&tokenizer_path)
                     .map_err(|e| Error::from_reason(format!("Failed to load tokenizer: {}", e)))?;
 
@@ -436,7 +435,6 @@ impl Qwen3Tokenizer {
     /// const tokens = tokenizer.encode("Hello, world!");
     /// console.log(tokens); // Int32Array [9906, 11, 1879, 0]
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn encode<'env>(
         &self,
@@ -447,7 +445,7 @@ impl Qwen3Tokenizer {
         let tokenizer = self.tokenizer.clone();
         env.spawn_future_with_callback(
             async move {
-                crate::compat::run_blocking(move || {
+                napi::bindgen_prelude::spawn_blocking(move || {
                     Self::encode_internal(&tokenizer, text, add_special_tokens)
                 })
                 .await
@@ -484,7 +482,6 @@ impl Qwen3Tokenizer {
     ///
     /// # Returns
     /// Array of Int32Arrays, one for each text
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn encode_batch<'env>(
         &self,
@@ -498,7 +495,7 @@ impl Qwen3Tokenizer {
 
         env.spawn_future_with_callback(
             async move {
-                crate::compat::run_blocking(move || {
+                napi::bindgen_prelude::spawn_blocking(move || {
                     tokenizer.encode_batch(texts, add_special).map_err(|e| {
                         Error::new(Status::InvalidArg, format!("Batch encoding failed: {}", e))
                     })
@@ -534,7 +531,6 @@ impl Qwen3Tokenizer {
     /// const text = tokenizer.decode(new Int32Array([9906, 11, 1879, 0]));
     /// console.log(text); // "Hello, world!"
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn decode<'env>(
         &self,
@@ -546,7 +542,7 @@ impl Qwen3Tokenizer {
         let tokenizer = self.tokenizer.clone();
 
         env.spawn_future(async move {
-            crate::compat::run_blocking(move || {
+            napi::bindgen_prelude::spawn_blocking(move || {
                 tokenizer
                     .decode(&token_ids, skip_special)
                     .map_err(|e| Error::from_reason(format!("Decoding failed: {}", e)))
@@ -569,7 +565,6 @@ impl Qwen3Tokenizer {
     ///
     /// # Returns
     /// Array of decoded text strings
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn decode_batch<'env>(
         &self,
@@ -581,7 +576,7 @@ impl Qwen3Tokenizer {
         let tokenizer = self.tokenizer.clone();
 
         env.spawn_future(async move {
-            crate::compat::run_blocking(move || {
+            napi::bindgen_prelude::spawn_blocking(move || {
                 let token_ids_vec: Vec<&[u32]> =
                     token_ids_batch.iter().map(|arr| arr.as_ref()).collect();
                 tokenizer
@@ -628,7 +623,6 @@ impl Qwen3Tokenizer {
     /// }];
     /// const tokens = tokenizer.applyChatTemplate(messages, true, tools);
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn apply_chat_template<'env>(
         &self,
@@ -652,7 +646,7 @@ impl Qwen3Tokenizer {
 
         env.spawn_future_with_callback(
             async move {
-                crate::compat::run_blocking(move || {
+                napi::bindgen_prelude::spawn_blocking(move || {
                     // Sanitize messages before formatting (prevents injection in all paths)
                     let sanitized: Vec<ChatMessage> = Self::sanitize_messages(&messages);
 

@@ -645,7 +645,7 @@ impl GRPOTrainingEngine {
             .await?;
 
         // Run the entire training step in spawn_blocking
-        let metrics = crate::compat::run_blocking(move || {
+        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
             // === Phase 1: Generate completions ===
             let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
             let mut completion_tokens_all: Vec<MxArray> =
@@ -780,7 +780,7 @@ impl GRPOTrainingEngine {
             report_performance: None,
         };
 
-        let result = crate::compat::run_blocking(move || {
+        let result = napi::bindgen_prelude::spawn_blocking(move || {
             let num_completions = num_prompts * group_size;
             let max_tokens = gen_config.max_new_tokens.unwrap_or(256) as usize;
 
@@ -976,7 +976,7 @@ impl GRPOTrainingEngine {
         let start_generation = self.ensure_valid_snapshot_generation()?;
 
         // Run the training step in spawn_blocking
-        let metrics = crate::compat::run_blocking(move || {
+        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
             // === Phase 1: Tokenize prompts and reconstruct completion arrays ===
             let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
 
@@ -1069,7 +1069,7 @@ impl GRPOTrainingEngine {
             "Phase 1: Generating {} completions ({} prompts × {} groups)",
             expected_completions, num_prompts, group_size
         );
-        let gen_result = crate::compat::run_blocking(move || {
+        let gen_result = napi::bindgen_prelude::spawn_blocking(move || {
             let mut completion_texts: Vec<String> = Vec::with_capacity(expected_completions);
             let mut prompt_texts: Vec<String> = Vec::with_capacity(num_prompts);
             let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
@@ -1350,7 +1350,7 @@ impl GRPOTrainingEngine {
             vocab_chunk_size: self.config.vocab_chunk_size.map(|n| n as i64),
         };
 
-        let metrics = crate::compat::run_blocking(move || {
+        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
             let loss_config = GRPOLossConfig {
                 epsilon_low: config.clip_epsilon.unwrap_or(0.2),
                 epsilon_high: None,

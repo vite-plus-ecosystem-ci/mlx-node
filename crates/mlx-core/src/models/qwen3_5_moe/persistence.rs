@@ -791,7 +791,7 @@ fn apply_weights_moe_inner(
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let model_path = model_path.to_string();
 
-    crate::compat::run_blocking(move || {
+    napi::bindgen_prelude::spawn_blocking(move || {
         let path = Path::new(&model_path);
 
             if !path.exists() {

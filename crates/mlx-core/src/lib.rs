@@ -39,6 +39,8 @@ pub mod convert;
 pub mod dataset;
 #[cfg(not(target_family = "wasm"))]
 pub mod decode_profiler;
+#[cfg(target_family = "wasm")]
+pub use compat::decode_profiler;
 pub mod gradients;
 pub mod models;
 pub mod nn;
@@ -58,6 +60,8 @@ pub mod vision;
 // Modules disabled on WASM (depend on native-only features)
 #[cfg(not(target_family = "wasm"))]
 pub mod profiling;
+#[cfg(target_family = "wasm")]
+pub use compat::profiling;
 #[cfg(not(target_family = "wasm"))]
 pub mod training_model;
 #[cfg(not(target_family = "wasm"))]
