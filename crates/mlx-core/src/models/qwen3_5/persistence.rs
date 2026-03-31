@@ -107,7 +107,7 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
 /// 8. 4-bit affine re-quantization (for FP8 source checkpoints)
-fn sanitize_weights(
+pub(crate) fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5Config,
 ) -> Result<HashMap<String, MxArray>> {
@@ -219,9 +219,9 @@ fn sanitize_weights(
     Ok(result)
 }
 
-/// Apply weights directly to a Qwen35Inner (no locks needed).
-fn apply_weights_inner(
-    inner: &mut Qwen35Inner,
+/// Apply weights to a Qwen3.5 dense model.
+pub(crate) fn apply_weights(
+    model: &mut Qwen3_5Model,
     params: &HashMap<String, MxArray>,
     config: &Qwen3_5Config,
     quant_bits: i32,
@@ -604,7 +604,6 @@ fn validate_mandatory_weights(
 }
 
 /// Load a pretrained Qwen3.5 dense model from a directory.
-#[cfg(not(target_family = "wasm"))]
 pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
 
@@ -923,7 +922,7 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
 }
 
 /// Parse Qwen3.5 dense config from JSON.
-fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
+pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let text_cfg = raw.get("text_config");
 
     let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);

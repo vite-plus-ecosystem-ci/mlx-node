@@ -153,20 +153,6 @@ export declare class Gemma4Model {
   constructor(config: Gemma4Config);
   /** Returns true if weights have been loaded via `load()`. */
   get isInitialized(): boolean;
-  /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Gemma4Inner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Gemma4Config::use_block_paged_cache`, default-ON since the
-   * `gemma4_paged_vs_flat_parity` integration test verified greedy
-   * byte-equal at BF16 against real Gemma-4-E2B-IT weights — see
-   * CLAUDE.md). Stubs constructed via `new(config)` always return
-   * `false`. Surfaced through this NAPI method so server endpoints
-   * can branch on it without a model-thread roundtrip.
-   */
-  hasBlockPagedCache(): boolean;
   modelId(): number;
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
@@ -524,23 +510,6 @@ export declare class Lfm2Model {
    */
   resetCaches(): void;
   /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Lfm2Inner::paged_adapter` was successfully constructed
-   * at load time (driven by `Lfm2Config::use_block_paged_cache`,
-   * defaulting to `true` after paged-vs-flat parity verification).
-   * LFM2 is hybrid (10 conv + 6 full-attention layers); only the
-   * full-attention layers route through the adapter, conv layers stay
-   * on flat `Lfm2LayerCache::Conv` regardless. When `true`, the native
-   * cache reuses SYS blocks across `chatSessionStart` calls via
-   * content-addressing, so the JS-side warm slot in
-   * `SessionRegistry.getOrCreateWarmAny` is redundant and the
-   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
-   * request.
-   */
-  hasBlockPagedCache(): boolean;
-  /**
    * Start a new chat session.
    *
    * Runs the full jinja chat template once, decodes until
@@ -862,146 +831,23 @@ export declare class MxArray {
   broadcastTo(shape: BigInt64Array): MxArray;
 }
 
-/** NAPI-exported reward registry wrapper */
-export declare class NativeRewardRegistry {
-  /** Create a new reward registry */
-  constructor();
-  /** Register a built-in reward function */
-  register(config: BuiltinRewardConfig): void;
-  /** Score a single completion */
-  score(prompt: string, completion: string): number;
-  /** Score a batch of completions */
-  scoreBatch(prompts: Array<string>, completions: Array<string>): Array<number>;
-  /** Check if registry is empty */
-  get isEmpty(): boolean;
-  /** Get registered reward names */
-  get names(): Array<string>;
-  /** Set whether to normalize scores */
-  setNormalize(normalize: boolean): void;
-}
-
 /**
- * OutputStore - Persistence layer for training outputs
+ * Opaque handle to KV cache state from a chat-session turn.
  *
- * Stores all model outputs during GRPO training for debugging and research.
- * Supports local SQLite files.
+ * Pass this back via `model.setCache(cache)` before the next
+ * chat-session call to enable incremental prefill — only new tokens
+ * since the last turn are processed, avoiding redundant computation.
+ *
+ * Created internally by the model during chat-session turns.
+ * Extract via `model.takeCache()`, restore via `model.setCache(cache)`.
  */
-export declare class OutputStore {
-  /** Create a new output store with local SQLite file */
-  static local(path: string): Promise<OutputStore>;
-  /** Create from config object */
-  static fromConfig(config: OutputStoreConfig): Promise<OutputStore>;
-  /** Start a new training run */
-  startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>;
-  /** Start a new training run with a name */
-  startRunWithName(
-    name: string | undefined | null,
-    modelName: string,
-    modelPath: string | undefined | null,
-    config: string,
-  ): Promise<string>;
-  /** End the current training run */
-  endRun(status: string): Promise<void>;
-  /** Get current run ID */
-  currentRunId(): Promise<string | null>;
-  /** Find a run by name */
-  findRunByName(name: string): Promise<TrainingRunRecord | null>;
-  /** Resume an existing run (sets status to running and makes it current) */
-  resumeRun(runId: string): Promise<void>;
-  /** Delete all steps after a given step number (for resume cleanup) */
-  deleteStepsAfter(runId: string, afterStep: number): Promise<number>;
-  /**
-   * Delete all records after a given step (for checkpoint resume)
-   *
-   * Cascades through: training_steps → generations → tool_calls, and logs.
-   * Use this when resuming from checkpoint to ensure clean database state.
-   */
-  deleteAllAfterStep(runId: string, afterStep: number): Promise<CleanupStats>;
-  /**
-   * Get recent step metrics for TUI sparkline restoration
-   *
-   * Returns metrics ordered by step (oldest first) for easy insertion into VecDeque.
-   */
-  getRecentStepMetrics(runId: string, limit: number): Promise<Array<StepMetricSummary>>;
-  /**
-   * Get aggregate statistics for a training run
-   *
-   * Returns pre-computed aggregates for restoring TUI state on resume.
-   */
-  getRunAggregates(runId: string): Promise<RunAggregates>;
-  /**
-   * Get recent generations for sample panel restoration
-   *
-   * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
-   */
-  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>;
-  /** Get store configuration */
-  get config(): OutputStoreConfig;
-  /** Record from RewardOutput JSON (direct integration with training engine) */
-  recordStepFromOutputs(
-    step: number,
-    metrics: EngineStepMetrics,
-    outputsJson: string,
-    rewards: Array<number>,
-    groupSize: number,
-  ): Promise<number>;
-  /**
-   * Record a complete training step with all generations and tool calls
-   *
-   * Lower-level API for direct control over step recording.
-   */
-  recordStep(
-    step: StepRecord,
-    generations: Array<GenerationRecord>,
-    toolCalls: Array<Array<ToolCallRecord>>,
-  ): Promise<number>;
-  /** Flush any pending writes */
-  flush(): Promise<void>;
-  /** List all training runs */
-  listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>;
-  /** Get a specific run */
-  getRun(runId: string): Promise<TrainingRunRecord | null>;
-  /** Get step summaries for a run */
-  getStepSummaries(
-    runId: string,
-    startStep?: number | undefined | null,
-    endStep?: number | undefined | null,
-  ): Promise<Array<StepSummary>>;
-  /** Get all generations for a step */
-  getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>;
-  /** Get top/bottom generations by reward */
-  getGenerationsByReward(
-    runId: string,
-    topN?: number | undefined | null,
-    bottomN?: number | undefined | null,
-    stepRange?: Array<number> | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get generations with specific finish reason */
-  getGenerationsByFinishReason(
-    runId: string,
-    finishReason: string,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get generations containing tool calls */
-  getGenerationsWithToolCalls(
-    runId: string,
-    toolName?: string | undefined | null,
-    status?: string | undefined | null,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Search generations by text content */
-  searchGenerations(
-    runId: string,
-    query: string,
-    searchIn?: string | undefined | null,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get reward distribution statistics */
-  getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>;
-  /** Export to JSONL file */
-  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>;
-  /** Execute raw SQL query (for advanced users) */
-  queryRaw(sql: string): Promise<string>;
+export declare class PromptCache {
+  /** Number of tokens stored in this cache. */
+  get tokenCount(): number;
+  /** Whether this cache has been consumed (caches moved out). */
+  get isEmpty(): boolean;
+  /** Release GPU memory held by this cache. */
+  dispose(): void;
 }
 
 /**
@@ -1018,13 +864,8 @@ export declare class QianfanOCRModel {
    * Create a new QianfanOCRModel from config (uninitialized, no weights).
    *
    * This constructor path does not spawn a model thread — the returned
-   * instance is only useful for `is_initialized` queries until
-   * [`QianfanOCRModel::load`] is called to actually run inference. The
-   * `config` argument is accepted to preserve the `new
-   * QianfanOCRModel(config)` JS surface; the value is discarded because
-   * nothing on the uninitialized path consults it (any future config
-   * getter would forward to the inner thread state populated by
-   * `load()`).
+   * instance is only useful for config inspection. Call
+   * [`QianfanOCRModel::load`] to actually run inference.
    */
   constructor(config: QianfanOcrConfig);
   /** Returns true if weights have been loaded via `load()`. */
@@ -1135,23 +976,27 @@ export declare class QianfanOCRModel {
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35Model {
+  /** Initialize caches for incremental generation. */
+  initCaches(): void;
   /** Reset all caches. */
   resetCaches(): void;
   /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
+   * Take the KV cache from the model, returning a `PromptCache` handle.
    *
-   * `true` iff `Qwen35Inner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
-   * inference; image-bearing chat turns are rejected at runtime by
-   * the chat-entry sites. Surfaced through this NAPI method so
-   * server endpoints can branch on it without round-tripping through
-   * the model thread.
+   * The cache is moved out of the model — calling `takeCache()` twice
+   * returns `null` the second time. Pass the cache back via `setCache()`
+   * before the next `chatSessionStart` / `chatSessionContinue` call for
+   * incremental prefill.
    */
-  hasBlockPagedCache(): boolean;
+  takeCache(): PromptCache | null;
+  /**
+   * Restore a previously taken `PromptCache` into the model.
+   *
+   * On the next `chatSessionStart` / `chatSessionContinue` call with
+   * `reuseCache: true`, the model will prefix-match the new tokens against
+   * the cache and only prefill the delta.
+   */
+  setCache(cache: PromptCache): void;
   /**
    * Load a pretrained model from a directory.
    *
@@ -1161,7 +1006,30 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static load(path: string): Promise<Qwen35Model>;
-  /** Generate text from a prompt token sequence. */
+  /**
+   * Load a model from in-memory buffers (works in both Node.js and browser).
+   *
+   * # Arguments
+   * * `config_json` - Contents of config.json as a string
+   * * `weight_buffers` - SafeTensors file contents as Buffers
+   * * `tokenizer_json` - Contents of tokenizer.json as a string
+   * Load a model from in-memory buffers (works in both Node.js and browser).
+   */
+  static loadFromMemory(configJson: string, weightBuffers: Array<Buffer>, tokenizerJson: string): Qwen35Model;
+  /**
+   * Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
+   *
+   * The JS side parses SafeTensors headers, creates GPU buffers directly from the
+   * fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
+   * WASM linear memory.
+   */
+  static loadFromGpuBuffers(configJson: string, gpuTensors: Array<any>, tokenizerJson: string): Qwen35Model;
+  /**
+   * Generate text from a prompt token sequence.
+   *
+   * Runs generation on a worker thread via spawn_blocking to avoid
+   * blocking the Node.js event loop.
+   */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
    * Start a new chat session.
@@ -1299,23 +1167,14 @@ export type Qwen3_5Model = Qwen35Model;
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35MoeModel {
+  /** Initialize caches for incremental generation. */
+  initCaches(): void;
   /** Reset all caches. */
   resetCaches(): void;
-  /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
-   * inference; image-bearing chat turns are rejected at runtime by
-   * the chat-entry sites. Surfaced through this NAPI method so
-   * server endpoints can branch on it without round-tripping through
-   * the model thread.
-   */
-  hasBlockPagedCache(): boolean;
+  /** Take the KV cache from the model, returning a `PromptCache` handle. */
+  takeCache(): PromptCache | null;
+  /** Restore a previously taken `PromptCache` into the model. */
+  setCache(cache: PromptCache): void;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -1455,23 +1314,233 @@ export type Qwen3_5MoeModel = Qwen35MoeModel;
  */
 export declare class Qwen3Model {
   /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Qwen3Inner::paged_adapter` was successfully constructed
-   * at load time (driven by `Qwen3Config::use_block_paged_cache`,
-   * defaulting to `true` for Qwen3 since paged-vs-flat parity has been
-   * verified). When `true`, the native cache reuses SYS blocks across
-   * `chatSessionStart` calls via content-addressing in
-   * `BlockAllocator`'s prefix-hash table — the JS-side warm slot in
-   * `SessionRegistry.getOrCreateWarmAny` becomes redundant and the
-   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
-   * request. See `packages/server/src/endpoints/messages.ts` for the
-   * runtime-routing decision.
+   * Reset the KV cache used for cache reuse across chat-session turns.
+   * Call this when starting a new conversation to ensure a full prefill.
    */
-  hasBlockPagedCache(): boolean;
+  resetCache(): void;
+  /**
+   * Initialize KV caches for incremental generation
+   *
+   * Creates one KV cache per transformer layer. Call this before starting generation.
+   */
+  initKvCaches(): void;
+  /**
+   * Reset all KV caches
+   *
+   * Clears cached key-value states. Call this between different generation sequences.
+   */
+  resetKvCaches(): void;
+  /**
+   * Get paged attention memory statistics (if enabled)
+   *
+   * Returns memory usage statistics for the paged KV cache.
+   */
+  pagedCacheStats(): PagedCacheStats | null;
+  /**
+   * Get scheduler statistics (if paged attention is enabled)
+   *
+   * Returns the number of waiting, running, and completed sequences.
+   */
+  schedulerStats(): SchedulerStatsNapi | null;
+  /**
+   * Forward pass with paged attention for memory-efficient inference.
+   *
+   * This method uses block-based KV cache management via Metal kernels for:
+   * - Variable-length sequences with efficient memory usage
+   * - Continuous batching with dynamic batch composition
+   * - Long context support beyond GPU memory limits
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs, shape: [num_seqs, 1] for decode
+   * * `slot_mapping` - Slot indices for cache updates, shape: [num_seqs]
+   * * `seq_ids` - Sequence IDs in the batch (for looking up block tables/context lens)
+   * * `positions` - Token positions for RoPE, shape: [num_seqs] (per-sequence positions)
+   *
+   * # Returns
+   * * Logits, shape: [num_seqs, 1, vocab_size] for decode
+   */
+  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray;
+  /**
+   * Prefill a sequence using standard attention and write K/V to paged cache.
+   *
+   * This method should be called before `step_paged_generation()` for each
+   * new prompt. It runs the full forward pass using standard attention
+   * (which is faster for long sequences), then writes the K/V cache to
+   * the paged cache for subsequent decode steps.
+   *
+   * # Arguments
+   * * `prompt_tokens` - Token IDs for the prompt (as u32 array)
+   * * `seq_id` - Sequence ID (obtained from scheduler)
+   *
+   * # Returns
+   * * Logits for the last token, shape: [1, vocab_size]
+   */
+  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray;
+  /**
+   * Add a request to the paged attention scheduler.
+   *
+   * The scheduler queues requests and allocates blocks for KV cache.
+   * Use `step_paged_generation()` to process the scheduled batch.
+   *
+   * Note: The actual sequence ID is assigned during scheduling, not when the
+   * request is added. Use the `request_id` to track your requests through
+   * the generation process.
+   *
+   * # Arguments
+   * * `request_id` - Unique identifier for the request (returned in outputs)
+   * * `prompt_tokens` - Token IDs for the prompt
+   * * `max_new_tokens` - Maximum new tokens to generate
+   * * `priority` - Optional priority (higher = scheduled first)
+   *
+   * # Returns
+   * * Number of pending requests in the queue
+   */
+  addPagedRequest(
+    requestId: string,
+    promptTokens: Array<number>,
+    maxNewTokens: number,
+    priority?: number | undefined | null,
+  ): number;
+  /**
+   * Schedule and execute one step of paged generation.
+   *
+   * This method:
+   * 1. Schedules the next batch of sequences
+   * 2. Runs forward pass with paged attention
+   * 3. Samples next tokens
+   * 4. Returns the generated tokens for each sequence
+   *
+   * # Arguments
+   * * `config` - Generation configuration (temperature, top_k, etc.)
+   *
+   * # Returns
+   * * `PagedGenerationStep` with token outputs for each sequence
+   */
+  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null;
+  /**
+   * Get completed sequences from the scheduler.
+   *
+   * Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
+   */
+  getCompletedSequences(): Array<PagedCompletedSequence>;
+  /** Check if the scheduler has pending work. */
+  hasPagedWork(): boolean;
   /** Get model configuration */
   getConfig(): Qwen3Config;
+  /**
+   * Generate tokens using speculative decoding with a draft model.
+   *
+   * Speculative decoding uses a smaller draft model to generate tokens speculatively,
+   * then verifies them with the target model in a single forward pass. This can achieve
+   * 2-3x speedup when the draft model has high acceptance rate.
+   *
+   * # Algorithm
+   * 1. Draft model generates N tokens speculatively (cheap forward passes)
+   * 2. Target model (self) verifies all N tokens in one forward pass
+   * 3. Accept/reject using rejection sampling
+   * 4. On rejection, resample from adjusted distribution
+   * 5. Rewind caches and continue
+   *
+   * # Arguments
+   * * `draft_model` - Smaller model for speculative generation (should share tokenizer)
+   * * `input_ids` - Input token IDs [1, seq_len]
+   * * `config` - Generation configuration (includes num_draft_tokens)
+   *
+   * # Returns
+   * GenerationResult with tokens, logprobs, and speculative stats in finish_reason
+   *
+   * # Example (TypeScript)
+   * ```typescript
+   * const targetModel = await loadModel('qwen3-7b');
+   * const draftModel = await loadModel('qwen3-0.5b');
+   *
+   * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
+   *   numDraftTokens: 5,
+   *   maxNewTokens: 100,
+   *   temperature: 0.7,
+   * });
+   * ```
+   */
+  generateSpeculativeSync(
+    draftModel: Qwen3Model,
+    inputIds: MxArray,
+    config?: GenerationConfig | undefined | null,
+  ): GenerationResult;
+  /** Count total number of parameters in the model */
+  numParameters(): number;
+  /**
+   * Get all model parameters as a dictionary mapping names to arrays
+   *
+   * This matches the TypeScript API for compatibility
+   */
+  getParameters(): Record<string, MxArray>;
+  /** Load parameters from a dictionary */
+  loadParameters(params: Record<string, MxArray>): void;
+  /**
+   * Compute forward pass and loss (for evaluation)
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
+   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
+   *
+   * # Returns
+   * * Scalar loss value
+   */
+  computeLoss(inputIds: MxArray, labels: MxArray): MxArray;
+  /**
+   * Compute loss and gradients using a hybrid approach
+   *
+   * This implementation computes gradients for the output layers and uses
+   * numerical approximations for other parameters. This is sufficient to
+   * demonstrate that training works while we build out full MLX autograd integration.
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
+   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
+   *
+   * # Returns
+   * * A tuple of (loss, gradients_dict) where gradients_dict maps parameter names to gradient arrays
+   *
+   * # Phase 6A Status
+   * Current implementation computes:
+   * - ✅ Exact gradients for LM head (output layer)
+   * - ⚠吅 Numerical approximations for other layers
+   *
+   * Future: Full MLX autograd will compute exact gradients for all 250+ parameters
+   */
+  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
+  /**
+   * Accumulate gradients into existing gradient dictionary
+   *
+   * This is a helper method for gradient accumulation. It adds new_gradients
+   * to accumulated_gradients element-wise.
+   *
+   * # Arguments
+   * * `accumulated_gradients` - Existing accumulated gradients (will be modified in-place conceptually, but returns new dict)
+   * * `new_gradients` - New gradients to add
+   *
+   * # Returns
+   * * Updated gradient dictionary with accumulated values
+   */
+  static accumulateGradients(
+    accumulatedGradients: Record<string, MxArray>,
+    newGradients: Record<string, MxArray>,
+  ): Record<string, MxArray>;
+  /**
+   * Apply gradients to model parameters
+   *
+   * # Arguments
+   * * `gradients` - Dictionary mapping parameter names to gradient arrays
+   * * `learning_rate` - Learning rate for gradient descent
+   *
+   * This performs a simple SGD update: param = param - lr * grad
+   * Only updates parameters that have gradients; others remain unchanged.
+   *
+   * IMPORTANT: This function preserves the original dtype of parameters.
+   * The learning rate scalar is cast to match param dtype to prevent
+   * promotion to float32 during arithmetic operations.
+   */
+  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void;
   /**
    * Text-to-text generation with integrated tokenization
    *
@@ -1620,6 +1689,20 @@ export declare class Qwen3Model {
     config?: GenerationConfig | undefined | null,
   ): Promise<BatchGenerationResult>;
   /**
+   * Decode token IDs to text using the internal tokenizer
+   *
+   * Helper method for decoding generated tokens. The model must have been loaded
+   * via load() to have a tokenizer available.
+   *
+   * # Arguments
+   * * `token_ids` - Token IDs to decode as Uint32Array
+   * * `skip_special_tokens` - Whether to skip special tokens (default: true)
+   *
+   * # Returns
+   * * Decoded text string
+   */
+  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>;
+  /**
    * Apply chat template and encode to token IDs
    *
    * Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
@@ -1640,51 +1723,6 @@ export declare class Qwen3Model {
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
-  /**
-   * Load a pretrained model from disk
-   *
-   * This loads a model from a directory containing:
-   * - config.json: Model configuration
-   * - weights.mlx (optional): MLX format weights with data arrays
-   * - weights.safetensors (optional): SafeTensors format (not yet supported)
-   *
-   * # Arguments
-   * * `model_path` - Path to the model directory
-   *
-   * # Returns
-   * * A fully initialized Qwen3Model with loaded weights
-   */
-  static load(modelPath: string): Promise<Qwen3Model>;
-  /**
-   * Save model configuration and weights to disk
-   *
-   * This saves:
-   * - config.json: Model configuration
-   * - weights.safetensors: Full model weights in SafeTensors format
-   * - weights.mlx: Parameter metadata (for reference)
-   *
-   * Dispatches to the dedicated model thread — all MxArray reads must
-   * happen on the thread that owns them to avoid the MLX cross-thread
-   * `CommandEncoder` crash.
-   *
-   * # Arguments
-   * * `save_path` - Directory to save the model
-   */
-  saveModel(savePath: string): Promise<undefined>;
-  /**
-   * Validate that a set of parameters has all required weights with correct shapes
-   *
-   * This is useful for validating parameters before loading them into a model,
-   * or for checking that saved weights are valid before training.
-   *
-   * # Arguments
-   * * `params` - HashMap of parameter names to MxArray values
-   *
-   * # Returns
-   * * Ok(()) if all validations pass
-   * * Err with descriptive message if validation fails
-   */
-  validateParameters(params: Record<string, MxArray>): void;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -2112,6 +2150,10 @@ export declare class VLModel {
    * for loading a model from disk.
    */
   constructor(config: ModelConfig);
+  /** Set the tokenizer */
+  setTokenizer(tokenizer: Qwen3Tokenizer): void;
+  /** Check if tokenizer is available */
+  get hasTokenizer(): boolean;
   /**
    * Chat with the VLM model
    *
@@ -2153,6 +2195,80 @@ export declare class VLModel {
    */
   ocr(imageData: Buffer, prompt?: string | undefined | null): Promise<string>;
   /**
+   * Get input embeddings with vision features merged
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [batch, seq_len]
+   * * `pixel_values` - Optional image patches [batch, seq, channels, patch_h, patch_w]
+   * * `image_grid_thw` - Optional grid dimensions [num_images, 3]
+   *
+   * # Returns
+   * * Input embeddings with vision features inserted at image token positions
+   */
+  getInputEmbeddings(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+  ): MxArray;
+  /**
+   * Forward pass
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [batch, seq_len]
+   * * `pixel_values` - Optional image patches
+   * * `image_grid_thw` - Optional grid dimensions
+   * * `mask` - Optional attention mask
+   *
+   * # Returns
+   * * Logits [batch, seq_len, vocab_size]
+   */
+  forward(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    mask?: MxArray | undefined | null,
+  ): MxArray;
+  /**
+   * Generate text tokens given input tokens and optional image
+   *
+   * Uses KV caching for efficient generation.
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs [1, seq_len]
+   * * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
+   * * `image_grid_thw` - Optional grid dimensions [1, 3]
+   * * `config` - Generation configuration
+   *
+   * # Returns
+   * * GenerationResult with tokens, logprobs, and finish reason
+   */
+  generate(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    config?: GenerationConfig | undefined | null,
+  ): Promise<GenerationResult>;
+  /**
+   * Batch OCR: extract text from multiple images simultaneously
+   *
+   * Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+   *
+   * # Arguments
+   * * `images` - Encoded image buffers
+   * * `config` - Optional chat configuration (shared across all items)
+   *
+   * # Returns
+   * * Vec of extracted text strings, one per image
+   *
+   * # Example
+   * ```typescript
+   * import { readFileSync } from 'fs';
+   * const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+   * const texts = await model.ocrBatch(images);
+   * ```
+   */
+  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Promise<Array<string>>;
+  /**
    * Batch chat: process multiple items simultaneously
    *
    * Sequential prefill + batched decode. Each item can have different images/prompts.
@@ -2190,6 +2306,25 @@ export declare class VLModel {
    * ```
    */
   static load(modelPath: string): Promise<VLModel>;
+  /**
+   * Load model configuration from disk without loading weights
+   *
+   * This is useful for inspecting model configuration before loading the full model.
+   *
+   * # Arguments
+   * * `model_path` - Path to the model directory containing config.json
+   *
+   * # Returns
+   * * ModelConfig with vision and text configuration
+   *
+   * # Example
+   * ```typescript
+   * import { VLModel } from '@mlx-node/vlm';
+   * const config = await VLModel.loadConfig('./models/paddleocr-vl');
+   * console.log(config.visionConfig.hiddenSize);
+   * ```
+   */
+  static loadConfig(modelPath: string): Promise<ModelConfig>;
 }
 
 /**
@@ -2205,40 +2340,6 @@ export declare function buildRewardOutputs(
   finishReasons: Array<string>,
   groupSize: number,
 ): Array<RewardOutput>;
-
-/** Configuration for built-in rewards */
-export interface BuiltinRewardConfig {
-  /** Type of reward function */
-  rewardType: BuiltinRewardType;
-  /** Weight for this reward (default 1.0) */
-  weight?: number;
-  /** Allowed tool names (for ToolUse) */
-  allowedTools?: Array<string>;
-  /** Required tags (for XmlFormat) */
-  requiredTags?: Array<string>;
-  /** Minimum length (for Length) */
-  minLength?: number;
-  /** Maximum length (for Length) */
-  maxLength?: number;
-  /** Use character count vs word count (for Length) */
-  useChars?: boolean;
-  /** Required JSON fields (for JsonSchema) */
-  requiredFields?: Array<string>;
-  /** Whether tool call is required (for ToolUse) */
-  required?: boolean;
-}
-
-/** Built-in reward function types */
-export declare const enum BuiltinRewardType {
-  /** Tool use validation */
-  ToolUse = 'ToolUse',
-  /** XML format validation */
-  XmlFormat = 'XmlFormat',
-  /** Length-based scoring */
-  Length = 'Length',
-  /** JSON format validation (brace matching + field name check, not full JSON parsing) */
-  JsonSchema = 'JsonSchema',
-}
 
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
@@ -2348,13 +2449,13 @@ export interface ChatResult {
 /** Chat message role (lowercase values matching standard convention) */
 export declare const enum ChatRole {
   /** User message */
-  User = 'user',
+  User = 'User',
   /** Assistant response */
-  Assistant = 'assistant',
+  Assistant = 'Assistant',
   /** System prompt */
-  System = 'system',
+  System = 'System',
   /** Tool response */
-  Tool = 'tool',
+  Tool = 'Tool',
 }
 
 /** A single chunk emitted during streaming chat generation. */
@@ -2401,18 +2502,6 @@ export interface ClassifyRotateResult {
   label: string;
   /** Corrected image as PNG bytes (or original bytes if angle=0) */
   image: Uint8Array;
-}
-
-/** Statistics about cleanup operations (NAPI wrapper) */
-export interface CleanupStats {
-  /** Number of training steps deleted */
-  stepsDeleted: number;
-  /** Number of generations deleted */
-  generationsDeleted: number;
-  /** Number of tool calls deleted */
-  toolCallsDeleted: number;
-  /** Number of logs deleted */
-  logsDeleted: number;
 }
 
 /**
@@ -2478,8 +2567,6 @@ export interface ConversionResult {
 
 export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
 
-export declare function convertGgufToSafetensors(options: GgufConversionOptions): Promise<GgufConversionResult>;
-
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
  *
@@ -2510,8 +2597,6 @@ export declare function convertGgufToSafetensors(options: GgufConversionOptions)
  * ```
  */
 export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>;
-
-export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void;
 
 /** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
 export declare function createPaddleocrVlConfig(): ModelConfig;
@@ -2564,24 +2649,6 @@ export interface DocumentElement {
   paragraph?: Paragraph;
 }
 
-/**
- * Convert a ParsedDocument to an XLSX buffer.
- *
- * Each Table element becomes a separate worksheet with bold headers.
- * Paragraph elements are collected into a "Text" worksheet.
- *
- * # Example
- * ```typescript
- * import { parseVlmOutput, documentToXlsx } from '@mlx-node/core';
- * import { writeFileSync } from 'fs';
- *
- * const doc = parseVlmOutput(vlmResult.text);
- * const buffer = documentToXlsx(doc);
- * writeFileSync('output.xlsx', buffer);
- * ```
- */
-export declare function documentToXlsx(doc: ParsedDocument): Buffer;
-
 export declare const enum DType {
   Float32 = 0,
   Int32 = 1,
@@ -2595,50 +2662,6 @@ export declare const enum DType {
 export declare const enum ElementType {
   Table = 'Table',
   Paragraph = 'Paragraph',
-}
-
-/** Metrics from a training epoch */
-export interface EngineEpochMetrics {
-  /** Epoch number */
-  epoch: number;
-  /** Average loss for the epoch */
-  avgLoss: number;
-  /** Average reward for the epoch */
-  avgReward: number;
-  /** Total steps in the epoch */
-  totalSteps: number;
-  /** Total tokens processed */
-  totalTokens: number;
-  /** Time for the epoch (seconds) */
-  epochTimeSecs: number;
-}
-
-/** Metrics from a single training step */
-export interface EngineStepMetrics {
-  /** Current step number */
-  step: number;
-  /** GRPO loss value */
-  loss: number;
-  /** Mean reward across completions */
-  meanReward: number;
-  /** Standard deviation of rewards */
-  stdReward: number;
-  /** Mean advantage value */
-  meanAdvantage: number;
-  /** Standard deviation of advantages */
-  stdAdvantage: number;
-  /** Total tokens generated this step */
-  totalTokens: number;
-  /** Whether gradients were applied */
-  gradientsApplied: boolean;
-  /** Time for generation (ms) */
-  generationTimeMs: number;
-  /** Time for training (ms) */
-  trainingTimeMs: number;
-  /** Peak memory usage this step (MB) */
-  peakMemoryMb: number;
-  /** Active memory at end of step (MB) */
-  activeMemoryMb: number;
 }
 
 export interface ForeignConversionOptions {
@@ -2737,37 +2760,6 @@ export interface Gemma4Config {
   boiTokenId?: number;
   eoiTokenId?: number;
   visionSoftTokensPerImage?: number;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: auto-sized to cover `max_position_embeddings` for the
-   * physical full-attention layers.
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
-   *
-   * When `Some(true)` or unset (the default), `Gemma4Inner` builds
-   * model-independent KV-cache specs, groups them, and allocates a
-   * `BlockAllocator` + `LayerKVPool` pair for physical full-attention
-   * layers. Sliding-window layers still use `RotatingKVCache` until
-   * true paged sliding-window groups are wired. KV-shared layers are
-   * aliases: they reuse their anchor's cache slot and do not allocate
-   * separate physical storage.
-   *
-   * Default: `true` (paged adapter on; opt-out via
-   * `use_block_paged_cache: false` in `config.json` to fall back to
-   * the legacy all-flat `Gemma4LayerCache` path). Parity is verified
-   * by `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
-   * real Gemma-4-E2B weights.
-   */
-  useBlockPagedCache?: boolean | undefined;
 }
 
 /**
@@ -2867,60 +2859,33 @@ export interface GenerationConfig {
    * Set to 0 to disable chunking and process the entire prompt at once.
    */
   prefillStepSize?: number;
+  /**
+   * KV cache quantization bits (default: 16 = no quantization)
+   * - 16: Full precision (bfloat16/float16), no quantization
+   * - 8: 8-bit quantization, ~2x memory savings, minimal quality loss
+   * - 4: 4-bit quantization, ~4x memory savings, some quality degradation
+   *
+   * Quantized KV cache is useful for long sequences where memory becomes a bottleneck.
+   * Note: Adds dequantization overhead per forward pass.
+   */
+  kvCacheBits?: number;
+  /**
+   * KV cache quantization group size (default: 64)
+   * Number of elements per quantization group. Smaller groups = better accuracy
+   * but more overhead from storing scales/biases.
+   * Only used when kv_cache_bits is 4 or 8.
+   */
+  kvCacheGroupSize?: number;
+  /**
+   * Number of draft tokens to generate speculatively (default: 5)
+   * Only used when a draft model is provided for speculative decoding.
+   * Higher values can increase throughput but may reduce acceptance rate.
+   */
+  numDraftTokens?: number;
 }
 
-export interface GenerationProfile {
-  /** Label identifying the decode loop variant. */
-  label: string;
-  /** Model type (e.g. "qwen3_5", "qwen3_5_moe", "qwen3"). */
-  modelType: string;
-  /** Number of tokens generated. */
-  numTokens: number;
-  /** Number of prompt tokens. */
-  promptTokens: number;
-  /** Prefill wall-clock time (ms). */
-  prefillMs: number;
-  /** Decode wall-clock time (ms). */
-  decodeMs: number;
-  /** Total wall-clock time (prefill + decode) (ms). */
-  totalMs: number;
-  /** Tokens per second (decode only). */
-  tokensPerSecond: number;
-  /** Time to first token (ms) — from decode loop start to first token extracted. */
-  timeToFirstTokenMs: number;
-  /** Per-phase breakdown. */
-  phases: Array<PhaseProfile>;
-  /** Memory snapshot before generation. */
-  memoryBefore?: MemorySnapshot;
-  /** Memory snapshot after generation. */
-  memoryAfter?: MemorySnapshot;
-}
-
-/** A generation record (NAPI wrapper) */
-export interface GenerationRecord {
-  batchIndex: number;
-  groupIndex: number;
-  prompt: string;
-  expectedAnswer?: string;
-  completionText: string;
-  completionRaw: string;
-  thinking?: string;
-  numTokens: number;
-  finishReason: string;
-  reward: number;
-}
-
-/** A generation with its associated tool calls (NAPI wrapper) */
-export interface GenerationWithToolCalls {
-  generation: GenerationRecord;
-  toolCalls: Array<ToolCallRecord>;
-}
-
-/** Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`]. */
-export declare function getMemorySnapshot(): GpuMemorySnapshot;
-
-/** Retrieve all collected profiling data as a `ProfilingSession`. */
-export declare function getProfilingData(): ProfilingSession;
+/** Get expected weight keys for PaddleOCR-VL model */
+export declare function getExpectedWeightKeys(): Array<string>;
 
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
@@ -2970,240 +2935,6 @@ export interface GgufConversionResult {
   sourceFormat: string;
 }
 
-export interface GpuInfo {
-  /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
-  architectureGen: number;
-}
-
-/**
- * Snapshot of MLX's GPU memory counters at this instant. All values
- * are in bytes. On Apple Silicon, GPU and CPU share unified memory,
- * so these are NOT a separate "VRAM" pool — they reflect MLX's own
- * tracking of `StorageModePrivate` Metal buffers (model weights,
- * `LayerKVPool`, transient intermediate tensors) attributed to the
- * MLX runtime in this process.
- *
- * Useful for live observability during long-running sessions:
- *
- * ```js
- * const { getMemorySnapshot } = require('@mlx-node/core');
- * setInterval(() => {
- *   const m = getMemorySnapshot();
- *   console.log(`active=${(m.activeBytes/1e9).toFixed(2)}GB peak=${(m.peakBytes/1e9).toFixed(2)}GB cache=${(m.cacheBytes/1e9).toFixed(2)}GB`);
- * }, 1000);
- * ```
- */
-export interface GpuMemorySnapshot {
-  /** Current actively-used GPU buffer bytes (excludes cache pool). */
-  activeBytes: number;
-  /** Peak GPU buffer bytes since the last `resetPeakMemory()` call. */
-  peakBytes: number;
-  /** Bytes held in MLX's caching allocator (released by `clearCache`). */
-  cacheBytes: number;
-}
-
-/** Configuration for the GRPO training engine */
-export interface GrpoEngineConfig {
-  /** Learning rate (default: 1e-6) */
-  learningRate?: number;
-  /** Gradient accumulation steps (default: 1) */
-  gradientAccumulationSteps?: number;
-  /** Maximum gradient norm for clipping (default: 1.0) */
-  gradientClipNorm?: number;
-  /**
-   * Maximum gradient value for element-wise clipping (default: 1.0)
-   * This clamps individual gradient elements to [-value, value]
-   */
-  gradientClipValue?: number;
-  /** Number of completions per prompt (default: 4) */
-  groupSize?: number;
-  /** PPO clipping epsilon (default: 0.2) */
-  clipEpsilon?: number;
-  /** KL divergence coefficient (default: 0.0) */
-  klCoef?: number;
-  /** Loss type: "grpo", "dapo", "dr_grpo", "bnpo" (default: "grpo") */
-  lossType?: string;
-  /**
-   * Maximum completion length for both generation and training (default: 256)
-   * Matches Python TRL's max_completion_length config.
-   */
-  maxCompletionLength?: number;
-  /** Sampling temperature (default: 0.8) */
-  temperature?: number;
-  /** Top-p (nucleus) sampling (default: 0.95) */
-  topP?: number;
-  /** Top-k sampling (optional) */
-  topK?: number;
-  /** Repetition penalty (default: 1.1) */
-  repetitionPenalty?: number;
-  /**
-   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
-   * token that appeared at least once in context.
-   */
-  presencePenalty?: number;
-  /**
-   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
-   * logits of each token in context.
-   */
-  frequencyPenalty?: number;
-  /**
-   * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
-   * When exceeded, training will stop with an error to prevent model corruption.
-   */
-  maxNanGradients?: number;
-  /**
-   * Consecutive NaN gradients that trigger emergency checkpoint (default: 5)
-   * When reached, the needs_emergency_save flag is set for the TypeScript layer.
-   */
-  emergencySaveThreshold?: number;
-  /**
-   * Enable detailed NaN/Inf detection with per-element counts (default: false)
-   * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
-   * boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
-   * per-element analysis - useful for debugging but has significant performance overhead
-   * for large models (e.g., 2.4GB for Qwen3-0.6B).
-   */
-  verboseNanDetection?: boolean;
-  /**
-   * Enable thinking mode for Qwen3 models (default: true)
-   * When false, adds empty <think></think> tags to disable model thinking.
-   * This is useful for tool-use training where you want direct outputs.
-   */
-  enableThinking?: boolean;
-  /**
-   * Tool definitions for function calling
-   * When provided, tools are included in the chat template so the model
-   * can generate tool calls. This is essential for tool-use training.
-   */
-  tools?: Array<ToolDefinition>;
-  /**
-   * Batch chunk size for LM head computation (memory optimization).
-   * When set, the LM head (hidden_states -> logits) is computed in chunks
-   * of this size to reduce peak memory usage.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
-   * This reduces peak memory from ~1.2GB to ~300MB for Qwen3 (vocab=151936).
-   */
-  lmHeadChunkSize?: number;
-  /**
-   * Batch chunk size for transformer forward pass (memory optimization).
-   * When set, the transformer layers process the batch in chunks of this size,
-   * reducing peak memory from O(batch × heads × seq²) for attention.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
-   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
-   */
-  forwardChunkSize?: number;
-  /**
-   * Chunk size for vocabulary dimension in cross-entropy computation.
-   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
-   * the computation is split into chunks of this size to reduce peak memory usage.
-   * Default: 65536 (2^16)
-   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
-   * Set to a larger value to reduce chunking overhead or smaller for tighter memory constraints.
-   */
-  vocabChunkSize?: number;
-  /**
-   * Enable true parallel batch generation (default: false).
-   * When true, all N*G sequences are processed in parallel using batched FFI
-   * with per-sequence RoPE offsets. This provides 2-4x speedup for GRPO training.
-   * When false, uses the sequential generation (process one prompt at a time,
-   * then expand KV cache for G completions).
-   */
-  useParallelBatchGeneration?: boolean;
-  /**
-   * Enable gradient checkpointing (default: true).
-   * When true, each transformer layer's activations are discarded during the forward
-   * pass and recomputed during backward, reducing peak memory from O(num_layers) to O(1)
-   * for intermediate states. For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
-   * The trade-off is ~30% more compute (one extra forward pass per layer during backward).
-   */
-  gradientCheckpointing?: boolean;
-  /** Optimizer type: "sgd" or "adamw" (default: "adamw") */
-  optimizerType?: string;
-  /** AdamW beta1 (default: 0.9) */
-  adamwBeta1?: number;
-  /** AdamW beta2 (default: 0.999) */
-  adamwBeta2?: number;
-  /** AdamW epsilon (default: 1e-8) */
-  adamwEps?: number;
-  /** Weight decay for AdamW (default: 0.01) */
-  weightDecay?: number;
-}
-
-/** Configuration for GRPO loss computation */
-export interface GrpoLossConfig {
-  /** Lower clipping bound (default: 0.2, means clip to [1-0.2, 1+epsilon_high]) */
-  epsilonLow: number;
-  /** Upper clipping bound (default: same as epsilon_low) */
-  epsilonHigh?: number;
-  /** KL divergence penalty coefficient (default: 0.0, no penalty) */
-  beta: number;
-  /** Loss aggregation type: "grpo", "bnpo", "dr_grpo", or "dapo" */
-  lossType: string;
-  /** Importance sampling level: "token" or "sequence" */
-  importanceSamplingLevel: string;
-  /**
-   * Maximum completion length (legacy, no longer used by dr_grpo)
-   * Kept for backwards compatibility but ignored in current implementation.
-   */
-  maxCompletionLength?: number;
-  /** Total number of items in batch across all processes (needed for dapo) */
-  numItemsInBatch?: number;
-  /** Current gradient accumulation step (for loss scaling) */
-  gradientAccumulationSteps: number;
-  /**
-   * Batch chunk size for LM head computation (memory optimization).
-   * When set, the LM head (hidden_states -> logits) is computed in chunks
-   * of this size to reduce peak memory usage.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
-   */
-  lmHeadChunkSize?: number;
-  /**
-   * Batch chunk size for transformer forward pass (memory optimization).
-   * When set, the transformer layers process the batch in chunks of this size,
-   * reducing peak memory from O(batch × heads × seq²) for attention.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
-   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
-   */
-  forwardChunkSize?: number;
-  /**
-   * Chunk size for vocabulary dimension in cross-entropy computation.
-   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
-   * the computation is split into chunks of this size to reduce peak memory usage.
-   * Default: 65536 (2^16)
-   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
-   */
-  vocabChunkSize?: number;
-}
-
-/**
- * Configuration for Harrier embedding model (Qwen3 backbone).
- *
- * Only includes backbone dimensions needed for encoding.
- * No generation fields (token IDs, paged attention, etc.).
- */
-export interface HarrierConfig {
-  hiddenSize: number;
-  numLayers: number;
-  numHeads: number;
-  numKeyValueHeads: number;
-  intermediateSize: number;
-  rmsNormEps: number;
-  ropeTheta: number;
-  maxPositionEmbeddings: number;
-  headDim: number;
-  /**
-   * Qwen3 always uses QK normalization. Omit to use the default (true).
-   * Explicitly passing false is allowed but produces a model incompatible
-   * with published Harrier weights.
-   */
-  useQkNorm?: boolean;
-  vocabSize: number;
-}
-
 /** InternViT vision encoder configuration */
 export interface InternVisionConfig {
   hiddenSize: number;
@@ -3218,9 +2949,6 @@ export interface InternVisionConfig {
   /** Drop path rate (inference only, always 0) */
   dropPathRate: number;
 }
-
-/** Check whether profiling is currently enabled. */
-export declare function isProfilingEnabled(): boolean;
 
 /** A single detected layout element. */
 export interface LayoutElement {
@@ -3263,39 +2991,6 @@ export interface Lfm2Config {
   eosTokenId: number;
   bosTokenId: number;
   padTokenId: number;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
-   *
-   * Default: `true` since 2026-04-28 (parity-verified via
-   * `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` against real
-   * LFM2.5-1.2B weights: byte-equal greedy decode + prefix-reuse
-   * byte-equal at BF16). Wired through
-   * `Lfm2DecoderLayer::forward_paged_or_flat`.
-   *
-   * Per-layer routing: LFM2's hybrid architecture means only
-   * `full_attention` layers go through the paged adapter; conv layers
-   * stay on the existing flat `Lfm2LayerCache::Conv(ArraysCache)`
-   * storage regardless of this flag. The `LayerKVPool` is sized to
-   * the count of `full_attention` layers and indexed by
-   * attention-ordinal (via `config.full_attn_idxs()`), not by absolute
-   * layer index.
-   *
-   * Opt out with `use_block_paged_cache: Some(false)` to revert to the
-   * fully flat `Lfm2LayerCache` path on all layers.
-   */
-  useBlockPagedCache?: boolean | undefined;
 }
 
 export interface MemorySnapshot {
@@ -3366,10 +3061,54 @@ export enum OutputFormat {
   Json = 'Json',
 }
 
-/** Configuration for creating an OutputStore connection */
-export interface OutputStoreConfig {
-  /** Local SQLite file path (e.g., "training_outputs.db") */
-  localPath: string;
+/** Paged attention memory statistics (NAPI-compatible) */
+export interface PagedCacheStats {
+  /** Total number of blocks in the pool */
+  totalBlocks: number;
+  /** Number of free blocks */
+  freeBlocks: number;
+  /** Number of allocated blocks */
+  allocatedBlocks: number;
+  /** Total memory in MB */
+  totalMemoryMb: number;
+  /** Used memory in MB */
+  usedMemoryMb: number;
+  /** Utilization percentage */
+  utilizationPercent: number;
+}
+
+/** A completed sequence from paged generation */
+export interface PagedCompletedSequence {
+  /** Original request ID */
+  requestId: string;
+  /** All generated tokens (excluding prompt) */
+  tokens: Array<number>;
+  /** Reason for completion ("stop", "length", "repetition", "tool_calls") */
+  finishReason: string;
+}
+
+/** Result of a paged generation step */
+export interface PagedGenerationStep {
+  /** Token outputs for each sequence in the batch */
+  outputs: Array<PagedTokenOutput>;
+  /** Number of sequences that were in prefill phase */
+  numPrefill: number;
+  /** Number of sequences that were in decode phase */
+  numDecode: number;
+}
+
+/** Output from a single token generation step in paged attention */
+export interface PagedTokenOutput {
+  /** Sequence ID in the scheduler */
+  seqId: number;
+  /** Request ID for this sequence */
+  requestId: string;
+  /** Generated token ID */
+  token: number;
+  /** Log probability of the token (f64 for NAPI compatibility) */
+  logprob: number;
+  /** Whether this sequence has finished */
+  isFinished: boolean;
 }
 
 /** A text paragraph */
@@ -3435,23 +3174,9 @@ export interface ParseToolCallsResult {
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
-/**
- * Lightweight performance metrics returned by chat/chatStream when
- * `reportPerformance: true` is set in the config.
- */
 export interface PerformanceMetrics {
-  /**
-   * Time to first token (ms) — wall-clock from generation start to
-   * first token extracted. Includes tokenization, prefill (lazy graph
-   * construction + first GPU eval), and first sample.
-   */
   ttftMs: number;
-  /** Prefill throughput: prompt_tokens / (ttft_ms / 1000). */
   prefillTokensPerSecond: number;
-  /**
-   * Decode throughput: (generated_tokens - 1) / decode_time.
-   * Excludes the first token (counted as prefill).
-   */
   decodeTokensPerSecond: number;
 }
 
@@ -3541,49 +3266,6 @@ export interface Qwen35Config {
   fullAttentionInterval: number;
   partialRotaryFactor: number;
   ropeTheta: number;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
-   * full-attention layers.
-   *
-   * **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
-   * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
-   * model's full-attention layer count and constructs a
-   * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
-   * full-attention layers through this adapter while linear-attention
-   * (GatedDeltaNet / GDN) layers continue to use the existing
-   * `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
-   * cross-request prefix reuse — vLLM's `MambaManager`-style "no
-   * prefix reuse for recurrent layers" stance.
-   *
-   * **Compile lockout**: when this flag is `Some(true)` the dispatch
-   * path skips the `mlx_qwen35_compiled_*` lifecycle entirely (no
-   * mutex acquisition, no `compiled_init_from_prefill`, no compiled
-   * decode). The compiled C++ forward path is incompatible with the
-   * per-layer paged dispatch; flipping this flag at runtime trades
-   * the compiled fast path for cross-request prefix reuse.
-   *
-   * **VLM is rejected**: when both `vision_encoder.is_some()` and
-   * this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
-   * a descriptive error. Paged dispatch through M-RoPE / vision
-   * features is deferred.
-   *
-   * Default: `None` / `false` (use the existing flat path with the
-   * compiled C++ forward when available). Default-flip pending real-
-   * weights parity verification.
-   */
-  useBlockPagedCache?: boolean | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -3638,35 +3320,6 @@ export interface Qwen35MoeConfig {
   moeIntermediateSize?: number | undefined;
   normTopkProb: boolean;
   mlpOnlyLayers?: number[] | undefined;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the block-paged KV cache adapter for full-attention layers.
-   *
-   * **OPT-IN — experimental.** Same semantics as the dense
-   * `Qwen3_5Config::use_block_paged_cache` field. Routes full-
-   * attention layers through `PagedKVCacheAdapter`; GDN linear-
-   * attention layers stay on `Qwen3_5LayerCache::Linear`. When
-   * enabled, the compiled MoE C++ forward path
-   * (`mlx_qwen35_moe_compiled_*`) is skipped — the paged adapter is
-   * incompatible with the in-graph compile cache.
-   *
-   * VLM (vision encoder present) is rejected with an error in
-   * `Qwen35MoeInner::new`.
-   *
-   * Default: `None` / `false`.
-   */
-  useBlockPagedCache?: boolean | undefined;
 }
 
 /** Generation configuration for Qwen3.5 MoE */
@@ -3704,27 +3357,28 @@ export interface Qwen3Config {
   eosTokenId: number;
   bosTokenId: number;
   /**
+   * Enable paged attention for memory-efficient inference.
+   * Default: false (use standard KVCache)
+   */
+  usePagedAttention?: boolean | undefined;
+  /**
    * GPU memory budget for paged KV cache in megabytes.
+   * Only used when use_paged_attention is true.
    * Default: 2048 (2GB)
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
+   * Only used when use_paged_attention is true.
    * Default: 16
    */
   pagedBlockSize?: number | undefined;
   /**
-   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`).
-   *
-   * When `Some(true)` (the default for Qwen3), `Qwen3Inner` allocates a
-   * `BlockAllocator` + `LayerKVPool` pair and constructs a
-   * `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
-   * block-paged storage with refcounted prefix caching). When
-   * `Some(false)`, the legacy flat `Vec<KVCache>` path is used instead.
-   *
-   * Default: true.
+   * Use FP8 cache for 2x memory reduction (experimental).
+   * Only used when use_paged_attention is true.
+   * Default: false
    */
-  useBlockPagedCache?: boolean | undefined;
+  useFp8Cache?: boolean | undefined;
 }
 
 /** Qwen3 language model configuration */
@@ -3752,27 +3406,6 @@ export interface RecResult {
 }
 
 /**
- * Reset MLX's peak-memory counter to the current active level.
- * Useful for measuring per-request peak memory in a long-running
- * process — call before a request, sample
- * `getMemorySnapshot().peakBytes` after.
- */
-export declare function resetPeakMemory(): void;
-
-/** Clear all collected profiling data and reset session timer. */
-export declare function resetProfilingData(): void;
-
-/** Result of resume position computation */
-export interface ResumePosition {
-  /** Epoch to start from (0-indexed) */
-  startEpoch: number;
-  /** Batch index within epoch to start from */
-  startBatchIdx: number;
-  /** Whether we're at an epoch boundary */
-  isEpochBoundary: boolean;
-}
-
-/**
  * Reward function input for a single completion.
  * Provides all context needed to compute a reward score.
  */
@@ -3781,42 +3414,6 @@ export interface RewardOutput {
   prompt: string;
   /** Structured completion data aligned with ChatResult */
   completion: CompletionInfo;
-}
-
-/** Reward distribution statistics (NAPI wrapper) */
-export interface RewardStats {
-  count: number;
-  mean: number;
-  std: number;
-  min: number;
-  max: number;
-  median: number;
-  p25: number;
-  p75: number;
-}
-
-/** Aggregate statistics for a training run for resume state (NAPI wrapper) */
-export interface RunAggregates {
-  /** Best (highest) reward seen */
-  bestReward: number;
-  /** Average reward */
-  avgReward: number;
-  /** Total reward count */
-  rewardCount: number;
-  /** Best (lowest) loss seen */
-  bestLoss: number;
-  /** Average loss */
-  avgLoss: number;
-  /** Total loss count */
-  lossCount: number;
-  /** Total tokens generated */
-  totalTokens: number;
-  /** Current step number */
-  currentStep: number;
-  /** Average generation time (milliseconds) */
-  avgGenerationTimeMs: number;
-  /** Average training time (milliseconds) */
-  avgTrainingTimeMs: number;
 }
 
 /**
@@ -3834,19 +3431,21 @@ export interface SamplingConfig {
   minP?: number;
 }
 
-/**
- * Parse VLM output and save directly as XLSX file.
- *
- * Convenience function that parses VLM output and writes it to an XLSX file.
- *
- * # Example
- * ```typescript
- * import { saveToXlsx } from '@mlx-node/core';
- *
- * saveToXlsx(vlmResult.text, 'output.xlsx');
- * ```
- */
-export declare function saveToXlsx(text: string, filePath: string): void;
+/** Scheduler statistics (NAPI-compatible) */
+export interface SchedulerStatsNapi {
+  /** Number of requests waiting to be scheduled */
+  numWaiting: number;
+  /** Number of sequences currently running */
+  numRunning: number;
+  /** Number of completed sequences */
+  numCompleted: number;
+  /** Number of sequences in prefill phase */
+  numPrefill: number;
+  /** Number of sequences in decode phase */
+  numDecode: number;
+  /** Total tokens across all running sequences */
+  totalRunningTokens: number;
+}
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;
@@ -4040,16 +3639,6 @@ export interface ToolCall {
   arguments: string;
 }
 
-/** A tool call record (NAPI wrapper) */
-export interface ToolCallRecord {
-  callIndex: number;
-  status: string;
-  toolName?: string;
-  arguments?: string;
-  rawContent: string;
-  errorMessage?: string;
-}
-
 /** Structured tool call with parsed arguments */
 export interface ToolCallResult {
   /** Unique identifier for this tool call (format: call_<uuid>) */
@@ -4088,46 +3677,6 @@ export interface ToolDefinition {
   type: string;
   /** Function definition */
   function: FunctionDefinition;
-}
-
-/** A training run record (NAPI wrapper) */
-export interface TrainingRunRecord {
-  id: string;
-  name?: string;
-  modelName: string;
-  modelPath?: string;
-  config: string;
-  startedAt: number;
-  endedAt?: number;
-  totalSteps: number;
-  status: string;
-}
-
-/** Result from train_step_auto including metrics, completions, and rewards */
-export interface TrainStepResult {
-  /** Training metrics */
-  metrics: EngineStepMetrics;
-  /** Generated completion texts (for TUI logging) */
-  completions: Array<string>;
-  /** Computed reward values (for TUI logging) */
-  rewards: Array<number>;
-}
-
-/** Result from train_step_auto_with_recording including optional full RewardOutput data */
-export interface TrainStepResultWithOutputs {
-  /** Training metrics */
-  metrics: EngineStepMetrics;
-  /** Generated completion texts (for TUI logging) */
-  completions: Array<string>;
-  /** Computed reward values (for TUI logging) */
-  rewards: Array<number>;
-  /**
-   * Full RewardOutput data as JSON (only populated when record_outputs is true)
-   * This enables zero-copy persistence of training outputs
-   */
-  outputsJson?: string;
-  /** Actual token counts for each completion (for accurate TUI display) */
-  completionLengths: Array<number>;
 }
 
 /** Result from document unwarping. */

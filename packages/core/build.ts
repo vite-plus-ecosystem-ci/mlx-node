@@ -1,5 +1,5 @@
 import { readFile, writeFile, copyFile, readdir, stat } from 'node:fs/promises';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { NapiCli, createBuildCommand } from '@napi-rs/cli';
@@ -35,131 +35,102 @@ for (const output of outputs) {
   }
 }
 
-await copyNativeAddon(outputs);
 // Copy mlx.metallib for colocated Metal shader loading
-// MLX looks for metallib next to the binary, so we copy it here.
-// Also copy paged_attn.metallib (Phase 2 of the paged-attention
-// compile integration), which mlx_paged_dispatch.cpp loads via a
-// `dladdr`-based colocated lookup at runtime.
-//
-// Both metallibs are copied to TWO destinations:
-//   1. `packages/core/`       — sits next to the local
-//      `mlx-core.darwin-arm64.node` for in-repo `yarn build:native`
-//      developer flow.
-//   2. `packages/core/npm/darwin-arm64/` — the platform-specific
-//      optional package that gets published to npm. The user-facing
-//      install path resolves the .node addon from this package, so
-//      the metallibs MUST ship here too — otherwise the
-//      `dladdr`-based runtime lookup in `mlx_paged_dispatch.cpp`
-//      lands in the published package directory and finds no
-//      `paged_attn.metallib`, throwing on first use.
-//
-// Both metallibs are required-on-darwin: `mlx.metallib` for stock
-// MLX kernels, `paged_attn.metallib` for the paged-attention
-// dispatch path used by `Qwen3Model` (where `use_paged_attention`
-// is on by default for the legacy `PagedKVCache` route and by
-// `use_block_paged_cache` on by default for the new vLLM-style path).
-// We FAIL the build if either is missing so a packaging regression
-// surfaces immediately rather than as a runtime throw at first use
-// in a published install.
-await copyMetallibs();
-
-async function copyNativeAddon(outputs: Awaited<typeof task>) {
-  const nodeOutput = outputs.find((output) => output.kind === 'node');
-  if (!nodeOutput) {
-    throw new Error('[build.ts smoke check] native addon output missing from napi build');
-  }
-  const expectedName = 'mlx-core.darwin-arm64.node';
-  const actualName = basename(nodeOutput.path);
-  if (actualName !== expectedName) {
-    throw new Error(
-      `[build.ts smoke check] expected native addon output ${expectedName}, got ${actualName} at ${nodeOutput.path}`,
-    );
-  }
-
-  const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');
-  const dst = join(npmDarwinDir, expectedName);
-  await copyFile(nodeOutput.path, dst);
-  console.log(`Copied ${expectedName} -> ${dst}`);
+// MLX looks for metallib next to the binary, so we copy it here
+// Skip for WASM targets (no Metal shaders)
+const target = process.argv.find(a => a.includes('wasm32'));
+if (!target) {
+  await copyMetallib();
+} else {
+  // Patch generated WASM browser/worker files with extra imports needed by
+  // MLX (C++ exception stubs, WebGPU bridge no-ops, GPU init).
+  // These are WASM imports not provided by emnapi/WASI.
+  await patchWasmEntries();
 }
 
-async function copyMetallibs() {
-  const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');
-  const destDirs = [__dirname, npmDarwinDir];
+// Extra WASM imports needed by MLX that emnapi/WASI don't provide.
+// Injected into both the browser entry and worker entry files.
+const MLX_EXTRA_IMPORTS = `
+      // C++ exception stubs (libc++abi leaves these as imports)
+      __cxa_allocate_exception: () => 0,
+      __cxa_throw: () => { throw new Error('C++ exception thrown in WASM'); },
+      __cxa_init_primary_exception: (ptr) => ptr,
+      // MLX GPU init — no-op (GPU initialized lazily via WebGPU bridge)
+      _ZN3mlx4core3gpu4initEv: () => {},
+      // WebGPU stubs (real bridge injected by consumer via overwriteImports)
+      wgpuCreateInstance: () => 0, wgpuInstanceRequestAdapter: () => {},
+      wgpuInstanceRelease: () => {}, wgpuAdapterRequestDevice: () => {},
+      wgpuAdapterRelease: () => {}, wgpuDeviceSetUncapturedErrorCallback: () => {},
+      wgpuDeviceSetDeviceLostCallback: () => {}, wgpuDeviceGetQueue: () => 0,
+      mlx_webgpu_poll: () => {}, wgpuDeviceCreateComputePipeline: () => 0,
+      wgpuComputePipelineGetBindGroupLayout: () => 0,
+      wgpuDeviceCreateShaderModule: () => 0, wgpuQueueOnSubmittedWorkDone: () => {},
+      wgpuAdapterGetProperties: () => {}, wgpuDeviceGetLimits: () => 0,
+      wgpuCommandEncoderRelease: () => {}, wgpuComputePassEncoderEnd: () => {},
+      wgpuComputePassEncoderRelease: () => {},
+      wgpuDeviceCreateCommandEncoder: () => 0,
+      wgpuCommandEncoderBeginComputePass: () => 0,
+      wgpuComputePassEncoderSetPipeline: () => {},
+      wgpuComputePassEncoderSetBindGroup: () => {},
+      wgpuComputePassEncoderDispatchWorkgroups: () => {},
+      wgpuCommandEncoderFinish: () => 0, wgpuQueueSubmit: () => {},
+      wgpuCommandBufferRelease: () => {}, wgpuDeviceCreateBuffer: () => 0,
+      wgpuBufferDestroy: () => {}, wgpuBufferRelease: () => {},
+      wgpuCommandEncoderCopyBufferToBuffer: () => {},
+      wgpuBufferMapAsync: () => {}, wgpuBufferGetConstMappedRange: () => 0,
+      wgpuBufferUnmap: () => {}, wgpuBufferGetSize: () => 0,
+      wgpuBindGroupRelease: () => {}, wgpuDeviceCreateBindGroup: () => 0,
+      wgpuBufferGetMappedRange: () => 0,`;
 
-  const targetDir = join(__dirname, '../../target');
-  // Find mlx.metallib in the build directory.
-  // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
-  const archDirs = await readdir(targetDir);
-  for (const arch of archDirs) {
-    const releaseDir = join(targetDir, arch, 'release', 'build');
-    let buildDirs: string[];
+async function patchWasmEntries() {
+  for (const file of ['mlx-core.wasi-browser.js', 'wasi-worker-browser.mjs']) {
+    const filePath = join(__dirname, file);
     try {
-      buildDirs = await readdir(releaseDir);
-    } catch {
-      // release/build dir doesn't exist for this arch
-      continue;
-    }
-    for (const dir of buildDirs) {
-      if (!dir.startsWith('mlx-sys-')) continue;
-      const libDir = join(releaseDir, dir, 'out', 'lib');
-      const mlxPath = join(libDir, 'mlx.metallib');
-      try {
-        await stat(mlxPath);
-      } catch {
-        // metallib not at this path, continue searching
-        continue;
-      }
-      // mlx.metallib is required: copy to all destinations or fail.
-      for (const dest of destDirs) {
-        const dst = join(dest, 'mlx.metallib');
-        await copyFile(mlxPath, dst);
-        console.log(`Copied mlx.metallib -> ${dst}`);
-      }
-      // paged_attn.metallib is also required for darwin (Phase 2).
-      // It lives next to mlx.metallib in the same lib dir.
-      const pagedPath = join(libDir, 'paged_attn.metallib');
-      try {
-        await stat(pagedPath);
-      } catch {
-        throw new Error(
-          `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
-            `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
-            `at runtime; without it, the addon throws on first paged-attention use. ` +
-            `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
+      let code = await readFile(filePath, 'utf-8');
+      // Inject extra imports after the "memory: ..." line in overwriteImports
+      if (!code.includes('__cxa_allocate_exception')) {
+        code = code.replace(
+          /memory:\s*(?:__sharedMemory|wasmMemory),?\n/,
+          (match) => match + MLX_EXTRA_IMPORTS + '\n',
         );
+        await writeFile(filePath, code);
+        console.log(`Patched ${file} with MLX extra imports`);
       }
-      for (const dest of destDirs) {
-        const dst = join(dest, 'paged_attn.metallib');
-        await copyFile(pagedPath, dst);
-        console.log(`Copied paged_attn.metallib -> ${dst}`);
-      }
-      // Final sanity-check: every destination must have BOTH files.
-      // This catches a copy that silently overwrote or partially
-      // failed; cheaper to fail the build than to publish a broken
-      // optional package.
-      await assertMetallibPresence(destDirs);
-      return;
+    } catch {
+      // File might not exist for non-WASM builds
     }
   }
-  throw new Error('mlx.metallib not found under any target/<arch>/release/build/mlx-sys-*/out/lib/');
 }
 
-async function assertMetallibPresence(destDirs: string[]) {
-  const required = ['mlx.metallib', 'paged_attn.metallib'];
-  for (const dest of destDirs) {
-    for (const name of required) {
-      const p = join(dest, name);
+async function copyMetallib() {
+  const targetDir = join(__dirname, '../../target');
+  try {
+    // Find mlx.metallib in the build directory
+    // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
+    const archDirs = await readdir(targetDir);
+    for (const arch of archDirs) {
+      const releaseDir = join(targetDir, arch, 'release', 'build');
       try {
-        await stat(p);
+        const buildDirs = await readdir(releaseDir);
+        for (const dir of buildDirs) {
+          if (dir.startsWith('mlx-sys-')) {
+            const metallibPath = join(releaseDir, dir, 'out', 'lib', 'mlx.metallib');
+            try {
+              await stat(metallibPath);
+              await copyFile(metallibPath, './mlx.metallib');
+              console.log('Copied mlx.metallib');
+              return;
+            } catch {
+              // metallib not at this path, continue searching
+            }
+          }
+        }
       } catch {
-        throw new Error(
-          `[build.ts smoke check] expected ${name} at ${p} but it is missing. ` +
-            `If this fires, the published npm package will not contain this metallib ` +
-            `and the runtime dladdr lookup will throw on first use.`,
-        );
+        // release/build dir doesn't exist for this arch
       }
     }
-    console.log(`Smoke check: ${dest} has all ${required.length} required metallibs.`);
+    throw new Error('Note: mlx.metallib not found');
+  } catch {
+    throw new Error('Note: mlx.metallib not found');
   }
 }
