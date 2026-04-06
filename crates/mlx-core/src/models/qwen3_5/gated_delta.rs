@@ -3,6 +3,8 @@ use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
+use super::debug::log_tensor_stats;
+
 /// Minimum sequence length to use the chunked prefill kernel.
 /// On M1–M4, the chunked kernel's O(BT^2) overhead outweighs memory bandwidth savings
 /// (no tensor cores to accelerate the quadratic matmuls). On M5+ (gen >= 17), the
@@ -23,8 +25,8 @@ fn gpu_architecture_gen() -> i32 {
 
 /// Compute decay gate: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
-/// Uses a fused C++ implementation that builds the full expression in a single
-/// FFI call, allowing MLX's graph optimizer to see the complete expression.
+/// On native: uses a fused C++ implementation via FFI.
+/// On WASM: uses pure Rust/MLX ops to avoid compiled kernel issues.
 ///
 /// Shapes:
 ///   A_log: [Hv]
@@ -32,11 +34,26 @@ fn gpu_architecture_gen() -> i32 {
 ///   dt_bias: [Hv]
 ///
 /// Returns: [B, T, Hv]
+#[cfg(not(target_family = "wasm"))]
 fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
     let handle = unsafe {
         sys::mlx_fused_compute_g(a_log.as_raw_ptr(), a.as_raw_ptr(), dt_bias.as_raw_ptr())
     };
     MxArray::from_handle(handle, "fused_compute_g")
+}
+
+#[cfg(target_family = "wasm")]
+fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
+    // g = exp(-exp(A_log) * softplus(a + dt_bias))
+    // softplus(x) = where(x > 20, x, log(1 + exp(x)))
+    let big_a = a_log.exp()?;                           // exp(A_log): [Hv]
+    let x = a.add(dt_bias)?;                            // a + dt_bias: [B, T, Hv]
+    let threshold = MxArray::from_float32(
+        &[20.0f32], &[1])?;                             // scalar 20.0
+    let sp = x.exp()?.add_scalar(1.0)?.log()?;          // log(1 + exp(x))
+    let sp = x.greater(&threshold)?.where_(&x, &sp)?;   // where(x > 20, x, sp)
+    let result = big_a.mul(&sp)?.negative()?.exp()?;     // exp(-(A * sp))
+    Ok(result)
 }
 
 /// Fused gating: computes both beta and g in a single Metal kernel dispatch.
@@ -261,7 +278,21 @@ fn gated_delta_ops(
     state: &MxArray,
     mask: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray)> {
+    gated_delta_ops_inner(q, k, v, g, beta, state, mask, None)
+}
+
+fn gated_delta_ops_inner(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    mask: Option<&MxArray>,
+    layer_idx: Option<usize>,
+) -> Result<(MxArray, MxArray)> {
     let seq_len = q.shape_at(1)?;
+    let debug_prefix = layer_idx.map(|layer| format!("layer.{layer:02}.gdn.recurrence"));
 
     // Extract dimensions once to avoid per-step FFI calls in gated_delta_step
     let batch = q.shape_at(0)?;
@@ -296,6 +327,19 @@ fn gated_delta_ops(
             v_dim,
         )?;
 
+        if t == 0 {
+            if let Some(prefix) = debug_prefix.as_ref() {
+                log_tensor_stats(&format!("{prefix}.step0.q"), &q_t);
+                log_tensor_stats(&format!("{prefix}.step0.k"), &k_t);
+                log_tensor_stats(&format!("{prefix}.step0.v"), &v_t);
+                log_tensor_stats(&format!("{prefix}.step0.g"), &g_t);
+                log_tensor_stats(&format!("{prefix}.step0.beta"), &beta_t);
+                log_tensor_stats(&format!("{prefix}.step0.state_in"), &current_state);
+                log_tensor_stats(&format!("{prefix}.step0.y"), &y_t);
+                log_tensor_stats(&format!("{prefix}.step0.state_out"), &new_state);
+            }
+        }
+
         outputs.push(y_t);
         current_state = new_state;
     }
@@ -303,6 +347,11 @@ fn gated_delta_ops(
     // Concatenate along time dimension: [B, T, Hv, Dv]
     let output_refs: Vec<&MxArray> = outputs.iter().collect();
     let output = MxArray::concatenate_many(output_refs, Some(1))?;
+
+    if let Some(prefix) = debug_prefix.as_ref() {
+        log_tensor_stats(&format!("{prefix}.output"), &output);
+        log_tensor_stats(&format!("{prefix}.final_state"), &current_state);
+    }
 
     Ok((output, current_state))
 }
@@ -336,11 +385,28 @@ pub fn gated_delta_update(
     mask: Option<&MxArray>,
     use_kernel: bool,
 ) -> Result<(MxArray, MxArray)> {
+    gated_delta_update_inner(q, k, v, a, b, a_log, dt_bias, state, mask, use_kernel, None)
+}
+
+pub(crate) fn gated_delta_update_inner(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state: Option<&MxArray>,
+    mask: Option<&MxArray>,
+    use_kernel: bool,
+    layer_idx: Option<usize>,
+) -> Result<(MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
     let num_k_heads = q.shape_at(2)?;
     let num_v_heads = v.shape_at(2)?;
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
+    let debug_prefix = layer_idx.map(|layer| format!("layer.{layer:02}.gdn.recurrence"));
 
     // When use_kernel=false, use only ops-based paths for full differentiability (autograd).
     // compute_g builds a standard MLX expression graph via C++ (differentiable),
@@ -349,6 +415,10 @@ pub fn gated_delta_update(
         let beta = Activations::sigmoid(b)?;
         // compute_g returns exp(g_log) directly — use it as the decay gate without log/exp round-trip
         let g = compute_g(a_log, a, dt_bias)?;
+        if let Some(prefix) = debug_prefix.as_ref() {
+            log_tensor_stats(&format!("{prefix}.beta"), &beta);
+            log_tensor_stats(&format!("{prefix}.g"), &g);
+        }
 
         // GQA head expansion
         let (q, k) = if num_v_heads != num_k_heads {
@@ -375,13 +445,21 @@ pub fn gated_delta_update(
             Some(s) => s.clone(),
             None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
         };
+        if let Some(prefix) = debug_prefix.as_ref() {
+            log_tensor_stats(&format!("{prefix}.q_expanded"), &q);
+            log_tensor_stats(&format!("{prefix}.k_expanded"), &k);
+            log_tensor_stats(&format!("{prefix}.v"), v);
+            log_tensor_stats(&format!("{prefix}.state_init"), &initial_state);
+        }
 
-        return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
+        return gated_delta_ops_inner(&q, &k, v, &g, &beta, &initial_state, mask, layer_idx);
     }
 
     // Compute beta = sigmoid(b) and g_log = -exp(A_log) * softplus(a + dt_bias)
-    // Try fused Metal kernel first (single dispatch), fall back to separate ops.
-    // g_log is the log-space gate; per-step kernel needs exp(g_log), chunked needs g_log directly.
+    // On WASM/WebGPU: skip fused Metal kernel — it creates lazy graphs using
+    // CustomKernel primitives that have no WebGPU impl. The graph creation succeeds
+    // but eval fails, bypassing the ops-based fallback.
+    #[cfg(not(target_family = "wasm"))]
     let (beta, g_log) = match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
         Ok((beta_flat, g_flat)) => {
             let seq_len_tmp = b.shape_at(1)?;
@@ -391,11 +469,25 @@ pub fn gated_delta_update(
         }
         Err(_) => {
             let beta = Activations::sigmoid(b)?;
-            // compute_g returns exp(g_log), so take log to get g_log
             let g = compute_g(a_log, a, dt_bias)?;
             let g_log = g.log()?;
             (beta, g_log)
         }
+    };
+    // On WASM: compute g_log = -exp(A_log) * softplus(a + dt_bias) DIRECTLY
+    // without the exp→log round-trip that loses precision.
+    // The ops-based path at line 556 will call exp(g_log) to get the decay gate.
+    #[cfg(target_family = "wasm")]
+    let (beta, g_log) = {
+        let beta = Activations::sigmoid(b)?;
+        // Compute g_log = -A * softplus(x) directly (no intermediate exp)
+        let big_a = a_log.exp()?;                           // exp(A_log): [Hv]
+        let x = a.add(dt_bias)?;                            // a + dt_bias: [B, T, Hv]
+        let threshold = MxArray::from_float32(&[20.0f32], &[1])?;
+        let sp = x.exp()?.add_scalar(1.0)?.log()?;          // log(1 + exp(x))
+        let sp = x.greater(&threshold)?.where_(&x, &sp)?;   // stable softplus
+        let g_log = big_a.mul(&sp)?.negative()?;            // g_log = -(A * sp)
+        (beta, g_log)
     };
 
     // GQA head expansion: repeat q,k from Hk to Hv heads
@@ -425,10 +517,19 @@ pub fn gated_delta_update(
         Some(s) => s.clone(),
         None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
     };
+    if let Some(prefix) = debug_prefix.as_ref() {
+        log_tensor_stats(&format!("{prefix}.q_expanded"), &q);
+        log_tensor_stats(&format!("{prefix}.k_expanded"), &k);
+        log_tensor_stats(&format!("{prefix}.v"), v);
+        log_tensor_stats(&format!("{prefix}.state_init"), &initial_state);
+    }
 
     let seq_len = q.shape_at(1)?;
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
+    // Skip custom kernels on WASM/WebGPU — they use CustomKernel which has no WebGPU impl.
+    // The lazy graph creation succeeds but eval fails, bypassing the ops-based fallback.
+    #[cfg(not(target_family = "wasm"))]
     if k_dim % 32 == 0 {
         // Chunked kernel for long sequences on M5+ (Neural Accelerator-accelerated prefill).
         // On M1–M4, per-step kernel is faster (no tensor cores for O(BT^2) matmuls).
@@ -454,5 +555,8 @@ pub fn gated_delta_update(
 
     // Ops-based sequential loop fallback (also needs exp(g_log))
     let g = g_log.exp()?;
-    gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask)
+    if let Some(prefix) = debug_prefix.as_ref() {
+        log_tensor_stats(&format!("{prefix}.g_exp"), &g);
+    }
+    gated_delta_ops_inner(&q, &k, v, &g, &beta, &initial_state, mask, layer_idx)
 }

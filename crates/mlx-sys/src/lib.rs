@@ -59,6 +59,7 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
     pub fn mlx_array_astype(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_copy(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_shallow_clone(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_array_logsumexp(
         handle: *mut mlx_array,
@@ -1769,6 +1770,44 @@ unsafe extern "C-unwind" {
         ),
         ctx: *mut std::os::raw::c_void,
     ) -> i32;
+
+    /// Exercise the WASM heap allocator with a few small malloc/free/new/delete
+    /// operations. Useful for localizing heap corruption during browser builds.
+    pub fn mlx_heap_probe() -> bool;
+
+    // Compile tests — exercise mlx::core::compile on WebGPU
+    pub fn mlx_test_compile_basic() -> bool;
+    pub fn mlx_test_compile_matmul() -> bool;
+    pub fn mlx_test_compile_repeated() -> bool;
+
+    // GPU buffer array test — exercises mlx_array_from_gpu_buffer code path
+    pub fn mlx_test_gpu_buffer_arrays() -> bool;
+
+    // Diagnostic
+    pub fn mlx_qwen35_get_weight_count() -> i32;
+    pub fn mlx_qwen35_check_weight(name: *const std::os::raw::c_char) -> i32;
+    pub fn mlx_qwen35_read_weight(name: *const std::os::raw::c_char, out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_single_layer_forward(out: *mut f32, max_count: i32) -> bool;
+    pub fn mlx_test_gdn_step_by_step(checkpoint: i32, out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_recurrence_small(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_attention_layer_forward(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_causal(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_gqa(out: *mut f32, max_count: i32) -> i32;
+    // Phase 1+2 inference step tests
+    pub fn mlx_test_rope_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_qk_norm_rope(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_additive_mask(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_decode_gqa(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_full_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_rms_norm_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_swiglu_mlp_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_decode_step_with_cache(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_first_4_layers_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_full_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_multi_step_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_categorical_sampling_bf16(out: *mut f32, max_count: i32) -> i32;
 }
 
 // Gradient computation types

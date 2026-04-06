@@ -315,6 +315,8 @@ inline std::mutex& qwen35_kernel_mutex() {
   return instance;
 }
 
+#if !defined(WEBGPU_BACKEND_WASI_IMPORT)
+
 inline std::unique_ptr<mlx::core::fast::CustomKernelFunction>& qwen35_gd_kernel() {
   static std::unique_ptr<mlx::core::fast::CustomKernelFunction> instance;
   return instance;
@@ -365,6 +367,63 @@ inline std::pair<array, array> gated_delta_kernel_call(
 
   return std::pair<array, array>(std::move(results[0]), std::move(results[1]));
 }
+
+#else // WEBGPU_BACKEND_WASI_IMPORT — ops-based fallback (no Metal kernel)
+
+// Sequential gated delta recurrence using MLX ops.
+// For each timestep t:
+//   state = state * g_t + k_t^T * (beta_t * (v_t - state @ k_t))
+//   y_t = state @ q_t
+// During decode seq_len=1 so this is a single iteration.
+inline std::pair<array, array> gated_delta_kernel_call(
+    const array& q, const array& k, const array& v,
+    const array& g, const array& beta_arr,
+    const array& state_in) {
+  int B  = q.shape(0);
+  int T  = q.shape(1);
+  int Hv = v.shape(2);
+  int Dv = v.shape(3);
+  int Dk = q.shape(3);
+
+  // state: [B, Hv, Dv, Dk]
+  array cur_state = state_in;
+  std::vector<array> y_steps;
+  y_steps.reserve(T);
+
+  for (int t = 0; t < T; t++) {
+    // Slice timestep t: [B, 1, H, D] -> squeeze -> [B, H, D]
+    auto q_t    = reshape(slice(q,        {0, t, 0, 0}, {B, t+1, q.shape(2), Dk}),  {B, q.shape(2), Dk});
+    auto k_t    = reshape(slice(k,        {0, t, 0, 0}, {B, t+1, k.shape(2), Dk}),  {B, k.shape(2), Dk});
+    auto v_t    = reshape(slice(v,        {0, t, 0, 0}, {B, t+1, Hv, Dv}),          {B, Hv, Dv});
+    auto g_t    = reshape(slice(g,        {0, t, 0},    {B, t+1, Hv}),              {B, Hv});
+    auto beta_t = reshape(slice(beta_arr, {0, t, 0},    {B, t+1, Hv}),              {B, Hv});
+
+    // Decay: state *= g_t [B, Hv, 1, 1]
+    cur_state = cur_state * reshape(g_t, {B, Hv, 1, 1});
+
+    // kv_mem = sum(state * k_t[B, Hv, 1, Dk], axis=-1) -> [B, Hv, Dv]
+    auto kv_mem = sum(cur_state * reshape(k_t, {B, Hv, 1, Dk}), /*axis=*/-1);
+
+    // delta = (v_t - kv_mem) * beta_t[B, Hv, 1] -> [B, Hv, Dv]
+    auto delta = (v_t - kv_mem) * reshape(beta_t, {B, Hv, 1});
+
+    // state += k_t[B, Hv, 1, Dk] * delta[B, Hv, Dv, 1] -> outer product update
+    cur_state = cur_state + reshape(k_t, {B, Hv, 1, Dk}) * reshape(delta, {B, Hv, Dv, 1});
+
+    // y_t = sum(state * q_t[B, Hv, 1, Dk], axis=-1) -> [B, Hv, Dv]
+    auto y_t = sum(cur_state * reshape(q_t, {B, Hv, 1, Dk}), /*axis=*/-1);
+
+    // Expand to [B, 1, Hv, Dv] for concatenation along time axis
+    y_steps.push_back(reshape(y_t, {B, 1, Hv, Dv}));
+  }
+
+  // Concatenate along time: [B, T, Hv, Dv]
+  array y_out = (T == 1) ? y_steps[0] : concatenate(y_steps, 1);
+
+  return std::pair<array, array>(std::move(y_out), std::move(cur_state));
+}
+
+#endif // WEBGPU_BACKEND_WASI_IMPORT
 
 // =====================================================================
 // Pure GDN forward (shared between dense compiled and MoE non-compiled)

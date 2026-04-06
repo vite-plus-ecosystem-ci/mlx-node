@@ -3,6 +3,7 @@ pub mod attention;
 pub(crate) mod chat_common;
 pub mod config;
 pub mod decoder_layer;
+pub(crate) mod debug;
 pub mod gated_delta;
 pub mod gated_delta_net;
 pub mod layer_cache;

@@ -161,6 +161,15 @@ mlx_array* mlx_array_copy(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+// Shallow clone: creates a new heap-allocated array object that shares the same
+// ArrayDesc (via shared_ptr copy). This increments the C++ refcount, which is
+// critical for Rust MxArray::clone() — without this, multiple Rust handles
+// share one C++ pointer and the C++ refcount doesn't reflect all live references.
+mlx_array* mlx_array_shallow_clone(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  return reinterpret_cast<mlx_array*>(new array(*arr));
+}
+
 mlx_array* mlx_array_log_softmax(mlx_array* handle, int32_t axis) {
   auto arr = reinterpret_cast<array*>(handle);
   std::vector<int> axes{axis};
