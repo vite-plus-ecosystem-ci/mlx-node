@@ -212,3 +212,6 @@ __pycache__/
 /mlx-vlm
 *.metallib
 .vite-agent
+
+# MLX source is a local symlink, not tracked in git
+crates/mlx-sys/mlx
