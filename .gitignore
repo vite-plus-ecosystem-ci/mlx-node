@@ -211,6 +211,8 @@ __pycache__/
 /unsloth
 /mlx-vlm
 *.metallib
+*.wasm
+__screenshots__/
 .vite-agent
 
 # MLX source is a local symlink, not tracked in git
