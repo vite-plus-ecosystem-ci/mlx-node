@@ -793,7 +793,7 @@ macro_rules! decode_loop {
         report_perf: $report:expr,
         generation_stream: $stream:expr
         $(, streaming: {
-            callback: $cb:expr,
+            callback: $sink:expr,
             cancelled: $cancelled:expr,
             decode_stream: $ds:expr,
             tokenizer: $tok:expr,
