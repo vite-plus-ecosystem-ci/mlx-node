@@ -218,12 +218,31 @@ impl VisionAttention {
 
         // Build attention mask from cu_seqlens
         let input_dtype = x.dtype()?;
-        let attention_mask = Self::build_attention_mask(cu_seqlens, seq_len, input_dtype)?;
 
-        // Use fused scaled dot-product attention (Metal kernel)
+        // Use fused scaled dot-product attention.
+        // On the browser WebGPU path, a single image has cu_seqlens=[0, seq_len],
+        // so the mask is all zeros. Avoiding that no-op mask keeps WebGPU on
+        // the unmasked SDPA kernel without changing native behavior.
+        #[cfg(target_family = "wasm")]
+        let attention_mask = if cu_seqlens.size()? <= 2 {
+            None
+        } else {
+            Some(Self::build_attention_mask(
+                cu_seqlens,
+                seq_len,
+                input_dtype,
+            )?)
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let attention_mask = Some(Self::build_attention_mask(
+            cu_seqlens,
+            seq_len,
+            input_dtype,
+        )?);
+
         // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
         let output =
-            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, Some(&attention_mask))?;
+            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, attention_mask.as_ref())?;
 
         // Transpose back: [1, num_heads, seq_len, head_dim] -> [1, seq_len, num_heads, head_dim]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
