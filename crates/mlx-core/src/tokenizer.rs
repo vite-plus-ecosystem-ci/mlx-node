@@ -350,7 +350,10 @@ impl Qwen3Tokenizer {
         // Qwen3.5 uses different IDs than Qwen2.5 (e.g. <|im_end|> = 248046,
         // not 151645). Hardcoded fallbacks produce wrong stop tokens in chat.
         let vocab = tokenizer.get_vocab(true);
-        let pad_token_id = vocab.get("<|endoftext|>").copied().unwrap_or(ENDOFTEXT_TOKEN_ID);
+        let pad_token_id = vocab
+            .get("<|endoftext|>")
+            .copied()
+            .unwrap_or(ENDOFTEXT_TOKEN_ID);
         let eos_token_id = vocab.get("<|im_end|>").copied().unwrap_or(IM_END_TOKEN_ID);
         let bos_token_id = vocab
             .get("<|startoftext|>")
@@ -1362,12 +1365,23 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
 
     if has_images && msg.role == "user" {
         let mut parts: Vec<serde_json::Value> = Vec::new();
+        #[cfg(target_family = "wasm")]
+        {
+            // Browser Qwen3.5-VL follows mlx-vlm's LIST_WITH_IMAGE_FIRST
+            // message layout; keep native byte-for-byte behavior unchanged.
+            for _ in msg.images.as_ref().unwrap() {
+                parts.push(serde_json::json!({ "type": "image" }));
+            }
+        }
         if !msg.content.is_empty() {
             parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
         }
-        // SAFETY: `is_some_and` above ensured this is Some and non-empty.
-        for _ in msg.images.as_ref().unwrap() {
-            parts.push(serde_json::json!({ "type": "image" }));
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // SAFETY: `is_some_and` above ensured this is Some and non-empty.
+            for _ in msg.images.as_ref().unwrap() {
+                parts.push(serde_json::json!({ "type": "image" }));
+            }
         }
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
