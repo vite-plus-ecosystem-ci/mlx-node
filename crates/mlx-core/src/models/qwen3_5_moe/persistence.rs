@@ -9,11 +9,17 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+#[cfg(target_family = "wasm")]
+use crate::models::paddleocr_vl::processing::ImageProcessorConfig;
+#[cfg(target_family = "wasm")]
+pub use crate::models::qwen3_5::persistence::GpuTensorInfo;
 use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
+#[cfg(target_family = "wasm")]
+use crate::models::qwen3_5::processing::qwen35_vl_processor_config;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1164,6 +1170,290 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
+}
+
+#[cfg(target_family = "wasm")]
+fn dtype_from_code(code: i32) -> Result<DType> {
+    match code {
+        0 => Ok(DType::Float32),
+        1 => Ok(DType::Int32),
+        2 => Ok(DType::Float16),
+        3 => Ok(DType::BFloat16),
+        4 => Ok(DType::Uint32),
+        5 => Ok(DType::Uint8),
+        other => Err(Error::from_reason(format!(
+            "Unsupported GPU tensor dtype code: {}",
+            other
+        ))),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn vision_tensor_key(name: &str) -> Option<String> {
+    name.strip_prefix("vision_tower.")
+        .or_else(|| name.strip_prefix("visual."))
+        .or_else(|| name.strip_prefix("model.visual."))
+        .map(str::to_string)
+}
+
+#[cfg(target_family = "wasm")]
+fn split_text_vision_params(
+    raw_params: HashMap<String, MxArray>,
+) -> (HashMap<String, MxArray>, Option<HashMap<String, MxArray>>) {
+    let mut vision_params = HashMap::new();
+    let mut text_params = HashMap::new();
+
+    for (name, array) in raw_params {
+        if let Some(vkey) = vision_tensor_key(&name) {
+            vision_params.insert(vkey, array);
+        } else {
+            text_params.insert(name, array);
+        }
+    }
+
+    if vision_params.is_empty() {
+        (text_params, None)
+    } else {
+        (text_params, Some(vision_params))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn read_i32(value: &Value, key: &str) -> Option<i32> {
+    value.get(key)?.as_i64().map(|v| v as i32)
+}
+
+#[cfg(target_family = "wasm")]
+fn read_f64_array(value: &Value, key: &str) -> Option<Vec<f64>> {
+    let array = value.get(key)?.as_array()?;
+    let values: Vec<f64> = array.iter().filter_map(Value::as_f64).collect();
+    (values.len() == array.len()).then_some(values)
+}
+
+#[cfg(target_family = "wasm")]
+fn parse_browser_image_processor_config(
+    processor_config_json: Option<&str>,
+    vision_config: &crate::models::qwen3_5::vision::Qwen3_5VisionConfig,
+) -> ImageProcessorConfig {
+    let mut config = qwen35_vl_processor_config();
+    config.patch_size = vision_config.patch_size;
+    config.merge_size = vision_config.spatial_merge_size;
+
+    let Some(config_json) = processor_config_json else {
+        return config;
+    };
+    let Ok(raw) = serde_json::from_str::<Value>(config_json) else {
+        warn!("Failed to parse preprocessor_config.json; using Qwen3.5-VL defaults");
+        return config;
+    };
+
+    if let Some(value) = read_i32(&raw, "patch_size") {
+        config.patch_size = value;
+    }
+    if let Some(value) = read_i32(&raw, "temporal_patch_size") {
+        config.temporal_patch_size = value;
+    }
+    if let Some(value) = read_i32(&raw, "merge_size") {
+        config.merge_size = value;
+    }
+    if let Some(value) = read_f64_array(&raw, "image_mean") {
+        config.image_mean = value;
+    }
+    if let Some(value) = read_f64_array(&raw, "image_std") {
+        config.image_std = value;
+    }
+    if let Some(value) = raw.get("do_rescale").and_then(Value::as_bool) {
+        config.do_rescale = value;
+    }
+    if let Some(value) = raw.get("do_normalize").and_then(Value::as_bool) {
+        config.do_normalize = value;
+    }
+
+    let size = raw.get("size");
+    if let Some(value) = read_i32(&raw, "min_pixels")
+        .or_else(|| size.and_then(|v| read_i32(v, "min_pixels")))
+        .or_else(|| size.and_then(|v| read_i32(v, "shortest_edge")))
+    {
+        config.min_pixels = value;
+    }
+    if let Some(value) = read_i32(&raw, "max_pixels")
+        .or_else(|| size.and_then(|v| read_i32(v, "max_pixels")))
+        .or_else(|| size.and_then(|v| read_i32(v, "longest_edge")))
+    {
+        config.max_pixels = value;
+    }
+
+    config
+}
+
+#[cfg(target_family = "wasm")]
+fn attach_vision_encoder_if_present(
+    inner: &mut Qwen35MoeInner,
+    raw: &Value,
+    config: &Qwen3_5MoeConfig,
+    vision_params: Option<HashMap<String, MxArray>>,
+    processor_config_json: Option<&str>,
+) -> Result<()> {
+    let Some(vparams) = vision_params else {
+        info!("Qwen3.5 MoE model loaded successfully");
+        return Ok(());
+    };
+
+    let vision_config = parse_vision_config(raw);
+    info!(
+        "Vision config: {} layers, hidden={}, heads={}, patch={}",
+        vision_config.num_layers,
+        vision_config.hidden_size,
+        vision_config.num_heads,
+        vision_config.patch_size,
+    );
+
+    let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+    load_vision_weights(&mut vision_encoder, &vparams, &vision_config)?;
+
+    inner.init_mrope_layers(
+        vec![11, 11, 10],
+        config.rope_theta,
+        config.max_position_embeddings,
+    )?;
+    inner.set_vision_encoder(vision_encoder);
+    let processor_config =
+        parse_browser_image_processor_config(processor_config_json, &vision_config);
+    inner.set_image_processor(Qwen35VLImageProcessor::new(Some(processor_config)));
+    inner.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+    info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
+    Ok(())
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn build_model_inner_from_gpu_buffers(
+    config_json: &str,
+    gpu_tensors: Vec<GpuTensorInfo>,
+    tokenizer_json: &str,
+    tokenizer_config_json: Option<&str>,
+    processor_config_json: Option<&str>,
+) -> Result<Qwen35MoeInner> {
+    use mlx_sys as sys;
+    use tokenizers::Tokenizer;
+
+    let raw: Value = serde_json::from_str(config_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse config JSON: {}", e)))?;
+    let config = parse_config(&raw)?;
+
+    info!(
+        "Qwen3.5 MoE GPU-buffer load: {} layers, hidden={}, experts={}x{}, tensors={}",
+        config.num_layers,
+        config.hidden_size,
+        config.num_experts,
+        config.num_experts_per_tok,
+        gpu_tensors.len(),
+    );
+
+    let mut raw_params: HashMap<String, MxArray> = HashMap::with_capacity(gpu_tensors.len());
+    for tensor in &gpu_tensors {
+        let dtype = dtype_from_code(tensor.dtype_code)?;
+        let shape_i64: Vec<i64> = tensor.shape.iter().map(|&d| d as i64).collect();
+        let arr = crate::utils::safetensors::array_from_gpu_buffer(
+            tensor.handle,
+            tensor.byte_size as usize,
+            &shape_i64,
+            dtype,
+        )?;
+        if tensor.packed_bf16.unwrap_or(false) {
+            unsafe {
+                sys::mlx_wgpu_mark_buffer_packed_bf16(arr.as_raw_ptr());
+            }
+        }
+        raw_params.insert(tensor.name.clone(), arr);
+    }
+    info!("Created {} MoE arrays from GPU buffers", raw_params.len());
+
+    let (text_raw_params, vision_params) = split_text_vision_params(raw_params);
+    if let Some(ref vparams) = vision_params {
+        info!(
+            "Split MoE GPU-buffer weights: {} vision tensors, {} text tensors",
+            vparams.len(),
+            text_raw_params.len(),
+        );
+    }
+
+    let params = sanitize_weights(text_raw_params, &config)?;
+    let quantized = is_quantized_checkpoint(&params);
+    info!(
+        "Sanitized MoE weights to {} parameters (quantized={})",
+        params.len(),
+        quantized,
+    );
+
+    let quant_cfg = raw
+        .get("quantization")
+        .or_else(|| raw.get("quantization_config"));
+    let quant_bits = quant_cfg
+        .and_then(|q| q["bits"].as_i64())
+        .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+    let quant_group_size = quant_cfg
+        .and_then(|q| q["group_size"].as_i64())
+        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+    let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+        .and_then(|q| q.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter(|(_, v)| v.is_object())
+                .filter_map(|(k, v)| {
+                    let bits = v["bits"].as_i64()? as i32;
+                    let gs = v["group_size"].as_i64().unwrap_or(quant_group_size as i64) as i32;
+                    let normalized = k
+                        .strip_prefix("model.language_model.")
+                        .or_else(|| k.strip_prefix("language_model.model."))
+                        .or_else(|| k.strip_prefix("language_model."))
+                        .or_else(|| k.strip_prefix("model."))
+                        .unwrap_or(k)
+                        .to_string();
+                    Some((normalized, (bits, gs)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tokenizer = Tokenizer::from_bytes(tokenizer_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse tokenizer JSON: {}", e)))?;
+    let mut tok = Qwen3Tokenizer::from_tokenizer(tokenizer);
+    let chat_template = tokenizer_config_json.and_then(|cfg_json| {
+        serde_json::from_str::<Value>(cfg_json)
+            .ok()
+            .and_then(|v| v.get("chat_template")?.as_str().map(String::from))
+    });
+    tok.set_chat_template(chat_template);
+
+    let mut inner = Qwen35MoeInner::new(config.clone())?;
+    apply_weights_moe_inner(
+        &mut inner,
+        &params,
+        &config,
+        quant_bits,
+        quant_group_size,
+        &per_layer_quant,
+    )?;
+
+    {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap();
+        unsafe { sys::mlx_clear_weights() };
+    }
+
+    inner.set_tokenizer(Arc::new(tok));
+    attach_vision_encoder_if_present(
+        &mut inner,
+        &raw,
+        &config,
+        vision_params,
+        processor_config_json,
+    )?;
+
+    info!("Qwen3.5 MoE inner model loaded from GPU buffers successfully");
+    Ok(inner)
 }
 
 /// Register all sanitized weights with the C++ MoE forward pass.
