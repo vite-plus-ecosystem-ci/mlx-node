@@ -220,3 +220,8 @@ crates/mlx-sys/mlx
 
 # Superpowers brainstorm + visual companion artifacts
 .superpowers/
+
+# Void local state
+node_modules
+.void
+.wrangler
