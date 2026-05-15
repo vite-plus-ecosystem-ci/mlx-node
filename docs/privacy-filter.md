@@ -46,11 +46,12 @@ Static async factory. Returns a `PrivacyFilter` bound to the checkpoint at `mode
 
 ### `pf.classify(text, opts?) → { entities, tokens? }`
 
-| Option         | Type                          | Default | Purpose                                                                |
-| -------------- | ----------------------------- | ------- | ---------------------------------------------------------------------- |
-| `threshold`    | `number`                      | `0.5`   | Minimum mean per-token probability for a span to be kept.              |
-| `calibration`  | `Partial<ViterbiCalibration>` | —       | Per-call overrides on top of the checkpoint default (see Calibration). |
-| `returnTokens` | `boolean`                     | `false` | When `true`, the result includes a `tokens` array.                     |
+| Option                | Type                                                  | Default | Purpose                                                                           |
+| --------------------- | ----------------------------------------------------- | ------- | --------------------------------------------------------------------------------- |
+| `threshold`           | `number`                                              | `0.5`   | Minimum mean per-token probability for a span/group to be kept.                   |
+| `calibration`         | `Partial<ViterbiCalibration>`                         | —       | Per-call overrides on top of the checkpoint default (see Calibration).            |
+| `returnTokens`        | `boolean`                                             | `false` | When `true`, the result includes a `tokens` array.                                |
+| `aggregationStrategy` | `'none' \| 'simple' \| 'first' \| 'average' \| 'max'` | —       | Opt into Hugging Face `aggregation_strategy` behavior (see below). Skips Viterbi. |
 
 Each entity:
 
@@ -65,6 +66,22 @@ interface Entity {
 ```
 
 When `returnTokens: true`, `tokens[i]` carries `{ text, tag, score, start, end }` where `tag` is the full BIOES tag (`'O'` or `'B-…'`/`'I-…'`/`'E-…'`/`'S-…'`) and `score` is the softmax probability of the argmax class at that token.
+
+### Aggregation strategy
+
+By default `classify` runs the constrained BIOES Viterbi decoder over log-softmax emissions (using the checkpoint's `viterbi_calibration.json`) and emits coherent multi-token spans. This is the strict, "spans you actually want" path and is what most callers should keep.
+
+If you need byte-for-byte compatibility with Hugging Face `TokenClassificationPipeline.aggregation_strategy`, pass `aggregationStrategy`. The Viterbi decoder is skipped — raw per-token softmax + HF's grouping pipeline runs instead — and `calibration` is silently ignored on this path.
+
+| Strategy    | Behavior                                                                                                                                                                                                                                                                                              |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `'none'`    | One entity per non-`O` token. `label` retains the full BIOES tag (e.g. `'B-private_email'`). No grouping.                                                                                                                                                                                             |
+| `'simple'`  | Per-token argmax → HF `group_entities`. **HF quirk:** `E-X` and `S-X` are treated as their own opaque tags rather than as continuations of `X`, so a BIOES span tagged `B-X I-X E-X` produces two groups (`[B-X, I-X]` and `[E-X]`) rather than one. This is HF behavior, not a bug — match upstream. |
+| `'first'`   | Aggregate consecutive subwords into "words" using the offset heuristic, take the first subword's score vector per word, then `group_entities`.                                                                                                                                                        |
+| `'average'` | Aggregate subwords as above, element-wise nanmean of the score vectors.                                                                                                                                                                                                                               |
+| `'max'`     | Aggregate subwords as above, pick the subword whose peak score is largest.                                                                                                                                                                                                                            |
+
+`threshold` still applies as a final filter — per-token for `'none'`, per-group mean for the other four. `returnTokens: true` works on this path too; the per-token `tag` is the raw argmax BIOES tag and `score` is the argmax probability (no Viterbi).
 
 ### `pf.redact(text, opts?) → { redacted, entities }`
 
@@ -188,7 +205,7 @@ All four quantization modes preserve the named-entity tag positions on the canon
 
 - **mxfp8** and **mxfp4** miss the leading `I-account_number` token (the "123" in "Account 1234567890") on input #4. The remaining account-number tokens are still tagged correctly, so the span is just shorter by one token at the start. These divergences are stable run-to-run.
 - **affine** drops the lone `E-private_address` token ("Springfield") on input #2. Stable run-to-run.
-- **nvfp4** is **deterministic** but **argmax-fragile**: on inputs #3 (URL `https://example.org/profile/jdoe`) and #4 (secret `sk-ZZZZ…`), the raw per-token argmax flips on a small number of boundary tokens compared to bf16, occasionally dropping entire URL/secret span tags at the raw-tag level. The Viterbi BIOES decoder (`crates/mlx-core/src/models/privacy_filter/viterbi.rs`) recovers the correct entity spans via path constraints, so `pf.classify()` output stays stable run-to-run and matches the other modes at the entity level. Per-tensor reconstruction quality (cosine similarity vs the bf16 weights) is actually higher for nvfp4 (~0.9946) than mxfp4 (~0.9915) — the issue is noise *direction*, not magnitude: nvfp4's residual error happens to point across decision boundaries for a few boundary tokens, even though its overall reconstruction is more accurate.
+- **nvfp4** is **deterministic** but **argmax-fragile**: on inputs #3 (URL `https://example.org/profile/jdoe`) and #4 (secret `sk-ZZZZ…`), the raw per-token argmax flips on a small number of boundary tokens compared to bf16, occasionally dropping entire URL/secret span tags at the raw-tag level. The Viterbi BIOES decoder (`crates/mlx-core/src/models/privacy_filter/viterbi.rs`) recovers the correct entity spans via path constraints, so `pf.classify()` output stays stable run-to-run and matches the other modes at the entity level. Per-tensor reconstruction quality (cosine similarity vs the bf16 weights) is actually higher for nvfp4 (~0.9946) than mxfp4 (~0.9915) — the issue is noise _direction_, not magnitude: nvfp4's residual error happens to point across decision boundaries for a few boundary tokens, even though its overall reconstruction is more accurate.
 
 These divergences are surfaced by the Rust test `parity_across_quantized_modes` in [`crates/mlx-core/src/models/privacy_filter/forward.rs`](../crates/mlx-core/src/models/privacy_filter/forward.rs); it gates on raw argmax tags rather than Viterbi-decoded entities, so it intentionally fails to keep the boundary-token flips visible. Treat the table above as a guide: **`mxfp8` is the safest quantized mode for production**. **`nvfp4` is safe at the entity level (`pf.classify()` / `pf.redact()`) but not recommended if downstream tooling consumes the raw per-token tag labels directly** — prefer `mxfp4` or `mxfp8` in that case.
 
@@ -222,6 +239,115 @@ Quality on long-form text was validated only on a 5-fixture short-input parity s
 ## Memory on Apple Silicon
 
 `process.memoryUsage().rss` undercounts Metal buffer allocations because Apple's unified memory architecture charges GPU buffers to the process's **`phys_footprint`** (what Activity Monitor's "Memory" column displays) rather than the resident set. For accurate measurements use `vmmap -summary <pid> | grep "Physical footprint"` or the `footprint` CLI. Each `classify()` call clears the MLX buffer cache before returning, so steady-state footprint stays bounded; transient peaks between calls scale with input length.
+
+## Fine-tuning with LoRA
+
+The bf16 base checkpoint can be specialized for a downstream domain (e.g. shell-history secrets, customer ticket PII, in-house secret formats) by training a small LoRA adapter on top of the frozen base. The adapter attaches to every attention projection (`q_proj` / `k_proj` / `v_proj` / `o_proj`) on every layer, plus the classifier head (`score.weight` / `score.bias`), and stays at a tiny fraction of the base parameter count.
+
+### Why LoRA, and what's frozen
+
+- **The base forward pass runs in bf16 for speed.** Full fine-tuning would require materializing the entire model in fp32 (or pulling in mixed-precision optimizer state for tens of millions of bf16 weights) — neither fits the "tiny extension on top of the existing inference path" goal of this port. LoRA decouples the trainable rank-`r` correction from the frozen base, so the adapter is the only thing that needs fp32 optimizer state.
+- **LoRA `A`/`B` matrices are kept in fp32 regardless of the base dtype.** This matches mlx-lm and HuggingFace PEFT. AdamW updates for a typical LoRA rank are often well below bf16 epsilon (~4e-3), and storing the trainable matrices in bf16 silently rounds those updates to zero so training plateaus after step 1. The forward path casts the LoRA delta back to the base dtype before adding it to the residual stream, so this does not change inference numerics; the storage cost is negligible (≈2 MB for rank=16 across 8 layers × 4 projections).
+- **The MoE feed-forward layers stay frozen.** The expert router is the most numerically sensitive part of the model; injecting adapters there would either need very careful per-expert rank scheduling or risk de-routing on adaptation. The plan intentionally leaves expert MLPs out of v1; the recipe gets ~90% of the quality of full fine-tuning at <2% of the trainable-parameter cost.
+- **No QLoRA in v1.** The trainer requires a dense (non-quantized) base — `loadAdapter` will error if it sees an adapter on top of a quantized projection. Quantize the fused model after training, not the base before.
+
+### Workflow
+
+1. **Prepare the dataset.** The trainer consumes a pre-tokenized JSONL, one example per line. The raw input format is `{ "text": "...", "entities": [{ "start": 0, "end": 4, "label": "private_person" }, ...] }` — the same format the eval harness reads.
+
+   ```bash
+   # Convert raw {text, entities[]} into the trainer's tokenized JSONL.
+   mlx convert privacy-prep-dataset \
+     --model .cache/models/privacy-filter \
+     -i raw.jsonl \
+     -o tokenized.jsonl
+   ```
+
+2. **Train the adapter.**
+
+   ```bash
+   mlx train privacy-lora \
+     --model .cache/models/privacy-filter \
+     --data tokenized.jsonl \
+     --output .cache/adapters/run-001 \
+     --rank 16 --alpha 32 --num-epochs 3 --batch-size 4
+   ```
+
+   The output directory will contain `adapter.safetensors`, `adapter_config.json`, `optimizer_state.safetensors`, and `trainer_state.json`. The config records `rank`, `alpha`, `dropout`, the LoRA target modules, and the absolute base-model path (so `mlx convert lora-fuse` can resolve it without `--base`).
+
+3. **Fuse for production (optional).** Adapter-mode inference is fully supported (`PrivacyFilter.loadAdapter`), but fusing produces a fresh `model.safetensors` that drops the LoRA branch from the forward pass — slightly faster and easier to ship.
+
+   ```bash
+   mlx convert lora-fuse \
+     --adapter .cache/adapters/run-001 \
+     --out .cache/models/privacy-filter-shell
+   ```
+
+   Errors if any LoRA adapter sits on top of a quantized projection — fuse against the dense base first, then quantize the fused checkpoint with `mlx convert -q`.
+
+### Programmatic API
+
+```typescript
+import { PrivacyFilter } from '@mlx-node/privacy';
+
+const pf = await PrivacyFilter.load('.cache/models/privacy-filter');
+await pf.loadAdapter('.cache/adapters/run-001');
+
+// classify / redact now use the adapted weights.
+const { entities } = await pf.classify('Internal ticket #ABC-1234 escalated by alice');
+
+// Drop the adapter and restore the original classifier head.
+await pf.clearAdapter();
+```
+
+### Evaluation
+
+The eval harness lives at [`scripts/evaluate-privacy.ts`](../scripts/evaluate-privacy.ts) and computes per-label precision / recall / F1 plus an overall micro-average, against a JSONL file in the same `{text, entities[]}` format as `raw.jsonl`.
+
+```bash
+# Baseline.
+oxnode scripts/evaluate-privacy.ts \
+  --model .cache/models/privacy-filter \
+  --eval data/eval.jsonl \
+  --out reports/baseline.json
+
+# Adapter-loaded.
+oxnode scripts/evaluate-privacy.ts \
+  --model .cache/models/privacy-filter \
+  --adapter .cache/adapters/run-001 \
+  --eval data/eval.jsonl \
+  --out reports/adapter.json
+```
+
+Span-level F1 (the default) treats a prediction as a true positive iff it byte-exactly matches a ground-truth `(start, end, label)`. Pass `--metric token` for character-level scoring that's robust to one-byte tokenizer boundary jitter. The same function is exported for programmatic use:
+
+```typescript
+import { evaluatePrivacy, formatReport } from '../../../scripts/evaluate-privacy.ts';
+
+const report = await evaluatePrivacy(modelPath, evalPath, { adapterPath, metric: 'span' });
+console.log(formatReport(report));
+```
+
+For end-to-end secret-recall comparisons against the curated zsh-history ground truth, [`scripts/compare-strategies.ts`](../scripts/compare-strategies.ts) accepts `--base` and `--adapter` flags and prints a side-by-side delta:
+
+```bash
+oxnode scripts/compare-strategies.ts \
+  --base .cache/models/privacy-filter \
+  --adapter .cache/adapters/run-001
+```
+
+A regression test (`packages/privacy/__test__/eval-regression.test.ts`) gates the workflow: an adapter must not regress overall recall by more than 2 percentage points vs the bf16 baseline on the canned eval set. The test auto-skips when no checkpoint is present, so CI without artifacts stays green.
+
+### Known limitations
+
+- **fp32 LoRA, bf16 base.** LoRA `A`/`B` matrices are stored as fp32 (matching mlx-lm / HuggingFace PEFT) and saved as fp32 in `adapter.safetensors`. The base model stays in bf16 throughout training; the LoRA delta is cast back to bf16 before being added to the residual stream so inference numerics are unchanged. Legacy v1 adapters with bf16 A/B are still loadable — the loader transparently upcasts to fp32 on read.
+- **MoE expert weights are frozen.** Only attention projections + classifier head receive LoRA updates. Tasks whose decision boundary depends on per-expert specialization (e.g. distinguishing two structurally similar secret formats that route through different experts) will see diminishing returns.
+- **No QLoRA.** Quantize the base only after fusing. The training path will error out if it sees a quantized projection.
+- **Single-adapter composition only.** Stacking multiple adapters on top of the same base isn't supported — call `clearAdapter()` between adapters. The internal shape (`LoadedProj.lora: Option<LoRALinear>`) leaves room to grow to `Vec<LoRALinear>` later.
+
+### Reference
+
+The full design — gradient routing, optimizer state layout, adapter file format, dataset alignment, and the BIOES-Viterbi training loss — is documented in [`docs/superpowers/specs/2026-05-13-privacy-filter-design.md`](superpowers/specs/2026-05-13-privacy-filter-design.md). The implementation plan tracking phases A–G lives in the project plan archive (`create-our-own-lora-logical-waffle.md`).
 
 ## Internals
 

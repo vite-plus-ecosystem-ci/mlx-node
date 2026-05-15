@@ -166,6 +166,12 @@ pub struct ModelWeights {
     /// `[num_classes]` — classifier bias.
     pub score_bias: MxArray,
     pub layers: Vec<LayerWeights>,
+    /// Backup of `score_weight` before an adapter override. `None` when no
+    /// adapter is loaded. Used by `clear_adapter` to revert.
+    pub(crate) score_weight_backup: Option<MxArray>,
+    /// Backup of `score_bias` before an adapter override. `None` when no
+    /// adapter is loaded.
+    pub(crate) score_bias_backup: Option<MxArray>,
 }
 
 pub struct LayerWeights {
@@ -476,6 +482,8 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
             score_weight,
             score_bias,
             layers,
+            score_weight_backup: None,
+            score_bias_backup: None,
         },
         tokenizer: Arc::new(tokenizer),
         label_strs,

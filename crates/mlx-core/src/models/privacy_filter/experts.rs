@@ -167,7 +167,7 @@ impl<'a> GptOssMlp<'a> {
                 let h_seq = h_shape[1];
                 let h_dim = h_shape[2];
                 let x_flat = hidden.reshape(&[h_batch * h_seq, h_dim])?;
-                let logits = project_2d(&x_flat, proj)?;
+                let logits = project_2d(&x_flat, proj, false)?;
                 let (tw_flat, ti_flat) = topk_from_logits(
                     &logits,
                     config.num_experts as i32,
@@ -194,12 +194,10 @@ impl<'a> GptOssMlp<'a> {
             let sorted = gather_sort(hidden, &top_indices)?;
             (sorted.x_sorted, sorted.idx_sorted, Some(sorted.inv_order))
         } else {
-            // Unsorted path: reshape hidden to `[B*T, 1, 1, H]` so the
-            // gather_mm's per-slot expansion still works. `top_indices`
-            // is passed as `[B, T, K]` and gather_mm broadcasts
-            // appropriately. This mirrors `SwitchGLU`'s small-batch
-            // branch.
-            let x_expanded = hidden.reshape(&[batch * seq_len, 1, 1, hidden_size])?;
+            // Unsorted path mirrors mlx-lm's `expand_dims(x, (-2, -3))`:
+            // preserve the `[B, T]` leading axes so gather_mm's default
+            // lhs indices broadcast with rhs indices `[B, T, K]`.
+            let x_expanded = hidden.reshape(&[batch, seq_len, 1, 1, hidden_size])?;
             (x_expanded, top_indices.clone(), None)
         };
 
@@ -278,7 +276,12 @@ impl<'a> GptOssMlp<'a> {
         // ---- 9. Weighted combine over the top_k axis. ----
         let weights_expanded = top_weights.reshape(&[batch, seq_len, top_k, 1])?;
         let weighted = per_expert.mul(&weights_expanded)?;
-        weighted.sum(Some(&[-2]), Some(false))
+        let combined = weighted.sum(Some(&[-2]), Some(false))?;
+
+        // The MoE router and expert weights are frozen for privacy-filter LoRA
+        // fine-tuning. Detaching here avoids MLX's gather_mm VJP while keeping
+        // the block residual path trainable for attention LoRA and the head.
+        combined.stop_gradient()
     }
 }
 

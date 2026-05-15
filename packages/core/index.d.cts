@@ -1059,17 +1059,108 @@ export declare class PrivacyFilterModel {
    * Pipeline:
    * 1. Tokenize the text with byte offsets, no special tokens.
    * 2. Run the forward pass to get `[1, T, 33]` logits.
-   * 3. Softmax + argmax per token → tag id and max-prob per token.
+   * 3. Compute softmax (for per-tag confidences) and log-softmax (for
+   *    Viterbi emissions) over the class axis.
    * 4. Build the transition matrix from the default calibration
    *    merged with any per-call overrides.
    * 5. Viterbi-decode using log-softmax emissions to get the BIOES
    *    tag sequence.
-   * 6. Walk the tags + offsets + per-token probabilities to extract
-   *    coherent spans whose mean probability clears `threshold`.
+   * 6. For each token, take the softmax probability of the
+   *    Viterbi-emitted tag (so per-token `tag` and `score` share
+   *    decoders), then walk the tags + offsets + those probabilities
+   *    to extract coherent spans whose mean probability clears
+   *    `threshold`.
    */
   classify(text: string, opts?: PrivacyClassifyOptions | undefined | null): PrivacyClassifyResult;
+  /**
+   * Load a LoRA adapter from a directory containing `adapter.safetensors`
+   * and `adapter_config.json`. The adapter is attached to all layers'
+   * attention projections (q/k/v/o) and overrides the classifier head's
+   * `score.weight` / `score.bias`. Any existing adapter is cleared first.
+   *
+   * `adapter_config.json` must provide `rank` (i64), `alpha` (f32), and
+   * `dropout` (f32). `target_modules` must include all of `q_proj`,
+   * `k_proj`, `v_proj`, and `o_proj` — this is enforced at load time
+   * because the corresponding `lora_a` / `lora_b` tensors are looked up
+   * unconditionally for every layer/projection and a missing tensor
+   * raises a `missing key` error from
+   * [`crate::nn::lora::LoRALinear::from_safetensors`]. The
+   * `base_model_path` key is informational and may be absent.
+   */
+  loadAdapter(adapterDir: string): void;
+  /**
+   * Drop all LoRA adapters and restore the original classifier weights.
+   * Idempotent — calling it on a model without an adapter is a no-op.
+   */
+  clearAdapter(): void;
+  /**
+   * Bake the currently-loaded adapter into the base weights and write the
+   * result to `<out_dir>/model.safetensors`. Errors if any LoRA adapter
+   * sits on top of a quantized projection (dequantization is not supported
+   * in this phase). The in-memory model state is unchanged after this call.
+   *
+   * **Aux files are not copied.** Only `model.safetensors` is written.
+   * Callers must copy the following files from the base checkpoint
+   * directory into `out_dir` themselves (the fused output is otherwise
+   * not loadable as a standalone privacy-filter checkpoint):
+   *
+   * - `config.json`
+   * - `tokenizer.json`
+   * - `tokenizer_config.json`
+   * - `viterbi_calibration.json`
+   *
+   * This method only borrows `self` immutably — it reads the in-memory
+   * weights and serializes them; no mutation of the live model occurs.
+   */
+  fuseAdapter(outDir: string): void;
 }
 export type PrivacyFilterModelJs = PrivacyFilterModel;
+
+/**
+ * NAPI-exposed handle to a [`PrivacyLoraTrainer`].
+ *
+ * Construct via [`PrivacyLoraTrainerJs::create`] (synchronous factory — the
+ * underlying [`PrivacyLoraTrainer::create`] is itself synchronous and loads
+ * the base model + dataset on the calling thread). Drive training via
+ * [`PrivacyLoraTrainerJs::train`] and persist results via
+ * [`PrivacyLoraTrainerJs::save_adapter`].
+ *
+ * The trainer is held behind a `tokio::sync::Mutex<PrivacyLoraTrainer>` and
+ * shared via an `Arc` so it can be cloned into a `spawn_blocking` task. The
+ * blocking task acquires the mutex with `blocking_lock()` — we never hold
+ * the mutex across an `.await`, so a plain `Mutex<T>` (no `Option` /
+ * take-restore dance) is enough. Concurrent calls from JS serialize on the
+ * mutex.
+ */
+export declare class PrivacyLoraTrainerJs {
+  /**
+   * Construct a new trainer.
+   *
+   * Synchronous: the heavy lifting (loading the base checkpoint, attaching
+   * zero-B LoRA adapters, parsing the JSONL dataset) happens inline. Use
+   * from a Node.js worker if you need to keep the event loop responsive
+   * during creation.
+   */
+  static create(config: PrivacyLoraTrainConfigJs): PrivacyLoraTrainerJs;
+  /**
+   * Run the full training loop and return the final optimizer step count.
+   *
+   * The trainer iterates over the JSONL dataset for `num_epochs` epochs,
+   * applying gradient accumulation per step. Intermediate checkpoints are
+   * written every `save_every` steps if that field is non-zero.
+   *
+   * Errors:
+   * - If another call (e.g. a previous `train()` or `saveAdapter()`) is
+   *   in flight, this method will block waiting for the mutex.
+   */
+  train(): Promise<number>;
+  /**
+   * Persist adapter weights, optimizer state, and trainer progress to the
+   * configured `output_dir`. Overwrites any previous checkpoint at that
+   * path.
+   */
+  saveAdapter(): Promise<void>;
+}
 
 /**
  * Qianfan-OCR Vision-Language Model (InternVL architecture).
@@ -3628,15 +3719,23 @@ export interface PrivacyCalibration {
  * Options for [`PrivacyFilterModelJs::classify`].
  *
  * - `threshold` (default `0.5`): minimum mean per-token probability for
- *   an extracted span to be returned.
+ *   an extracted span/group to be returned.
  * - `calibration`: per-call overrides on top of the checkpoint default.
+ *   Ignored when `aggregation_strategy` is set (no Viterbi pass is run).
  * - `return_tokens` (default `false`): when `true`, the result includes
- *   a `tokens` array with one entry per input token.
+ *   a `tokens` array with one entry per input token. When combined with
+ *   `aggregation_strategy`, the per-token `tag` is the raw argmax BIOES
+ *   tag and `score` is the argmax probability (no Viterbi).
+ * - `aggregation_strategy`: opt into Hugging Face
+ *   `TokenClassificationPipeline.aggregation_strategy` behavior. One of
+ *   `"none"`, `"simple"`, `"first"`, `"average"`, `"max"`. When set, the
+ *   Viterbi decoder is skipped and raw per-token argmax is used.
  */
 export interface PrivacyClassifyOptions {
   threshold?: number;
   calibration?: PrivacyCalibration;
   returnTokens?: boolean;
+  aggregationStrategy?: string;
 }
 
 /** Result of [`PrivacyFilterModelJs::classify`]. */
@@ -3650,8 +3749,9 @@ export interface PrivacyClassifyResult {
  *
  * `start`/`end` are byte offsets into the input string (Hugging Face
  * `tokenizers` convention). `label` is the privacy class without the
- * BIOES prefix (e.g. `"private_email"`). `score` is the mean of the
- * per-token max-softmax probabilities across the span's tokens.
+ * BIOES prefix (e.g. `"private_email"`). `score` is the mean — across
+ * the span's tokens — of the softmax probability of the Viterbi-emitted
+ * tag at each token.
  */
 export interface PrivacyEntity {
   label: string;
@@ -3662,10 +3762,70 @@ export interface PrivacyEntity {
 }
 
 /**
+ * JS-shaped configuration for [`PrivacyLoraTrainerJs::create`].
+ *
+ * Mirrors [`PrivacyLoraTrainConfig`], but uses NAPI-compatible numeric types
+ * (`f64` instead of `f32`, `u32` instead of `usize`/`i64` for counts) and
+ * `Option<T>` for every tunable so JavaScript callers can omit any field to
+ * fall back to the documented defaults.
+ */
+export interface PrivacyLoraTrainConfigJs {
+  /** Filesystem path to the base privacy-filter checkpoint directory. */
+  modelPath: string;
+  /** Path to the training JSONL dataset (pre-tokenized). */
+  dataPath: string;
+  /**
+   * Optional evaluation JSONL dataset path. Currently ignored by the
+   * trainer — reserved for future eval-loop integration.
+   */
+  evalPath?: string;
+  /**
+   * Directory where `adapter.safetensors`, `adapter_config.json`,
+   * `optimizer_state.safetensors`, and `trainer_state.json` are written.
+   */
+  outputDir: string;
+  /** LoRA rank. Default: 16. */
+  rank?: number;
+  /** LoRA alpha (scaling factor). Default: 32. */
+  alpha?: number;
+  /** LoRA dropout probability. Default: 0.05. */
+  dropout?: number;
+  /** AdamW learning rate for the LoRA A/B matrices. Default: 1e-4. */
+  loraLr?: number;
+  /** AdamW learning rate for the classifier head. Default: 5e-5. */
+  classifierLr?: number;
+  /** Examples per micro-batch. Default: 2. */
+  batchSize?: number;
+  /** Maximum sequence length (longer examples are truncated). Default: 256. */
+  maxSeqLen?: number;
+  /** Number of epochs to iterate over the dataset. Default: 3. */
+  numEpochs?: number;
+  /** Number of micro-batches accumulated per optimizer step. Default: 4. */
+  gradAccumSteps?: number;
+  /** L2 norm clipping threshold across all gradients. Default: 1.0. */
+  gradClip?: number;
+  /**
+   * Save an intermediate checkpoint every N optimizer steps. Default: 500.
+   * Set to 0 to disable intermediate checkpointing.
+   */
+  saveEvery?: number;
+  /**
+   * Optional path to an existing `output_dir`-style checkpoint to resume
+   * from. Loads `adapter.safetensors`, `optimizer_state.safetensors`, and
+   * `trainer_state.json` if present.
+   */
+  resumeFrom?: string;
+  /** Token id used to pad short sequences. Default: 0. */
+  padTokenId?: number;
+}
+
+/**
  * Per-token output emitted when [`PrivacyClassifyOptions::return_tokens`]
  * is `true`. `tag` is the full BIOES tag (`"O"` or `"B-..."`/`"I-..."`/
- * `"E-..."`/`"S-..."`). `score` is the softmax probability of the
- * argmax class at that token.
+ * `"E-..."`/`"S-..."`) chosen by the Viterbi decoder. `score` is the
+ * softmax probability of that emitted tag at this token, so `tag` and
+ * `score` always share decoders (at boundary tokens the Viterbi tag can
+ * differ from the local argmax).
  */
 export interface PrivacyToken {
   text: string;

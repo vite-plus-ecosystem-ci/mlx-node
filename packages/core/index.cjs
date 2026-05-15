@@ -752,6 +752,7 @@ module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry;
 module.exports.OutputStore = nativeBinding.OutputStore;
 module.exports.PrivacyFilterModel = nativeBinding.PrivacyFilterModel;
 module.exports.PrivacyFilterModelJs = nativeBinding.PrivacyFilterModelJs;
+module.exports.PrivacyLoraTrainerJs = nativeBinding.PrivacyLoraTrainerJs;
 module.exports.QianfanOCRModel = nativeBinding.QianfanOCRModel;
 module.exports.Qwen35Model = nativeBinding.Qwen35Model;
 module.exports.Qwen3_5Model = nativeBinding.Qwen3_5Model;

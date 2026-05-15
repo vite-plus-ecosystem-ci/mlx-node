@@ -57,18 +57,44 @@ export interface ViterbiCalibration {
 }
 
 /**
+ * Hugging Face `TokenClassificationPipeline.aggregation_strategy` values.
+ *
+ * - `'none'`: emit one entity per non-`O` token; `label` retains the full
+ *   BIOES tag (e.g. `'B-private_email'`).
+ * - `'simple'`: per-token argmax → HF `group_entities`. Note the HF quirk:
+ *   `E-X` and `S-X` are treated as their own opaque tag rather than as
+ *   continuations of `X`, so multi-token spans tagged `B-X I-X E-X`
+ *   produce two groups (`[B-X, I-X]` and `[E-X]`) rather than one. This
+ *   is byte-for-byte HF behavior, not a bug.
+ * - `'first'`: aggregate subwords to words by taking the first subword's
+ *   scores, then `group_entities`.
+ * - `'average'`: aggregate subwords by element-wise mean of score vectors.
+ * - `'max'`: pick the subword with the largest peak score.
+ */
+export type AggregationStrategy = 'none' | 'simple' | 'first' | 'average' | 'max';
+
+/**
  * Options for {@link PrivacyFilter.classify}.
  *
  * - `threshold` (default `0.5`): minimum mean per-token probability for an
- *   extracted span to be returned.
+ *   extracted span/group to be returned.
  * - `calibration`: per-call overrides on top of the checkpoint default.
+ *   **Ignored when `aggregationStrategy` is set** (HF aggregation paths
+ *   skip the Viterbi decoder entirely).
  * - `returnTokens` (default `false`): when `true`, the result includes a
- *   `tokens` array with one entry per input token.
+ *   `tokens` array with one entry per input token. With
+ *   `aggregationStrategy`, the per-token `tag` is the raw argmax BIOES
+ *   tag and `score` is the argmax probability.
+ * - `aggregationStrategy`: when set, skip the constrained BIOES Viterbi
+ *   decoder and replicate Hugging Face's
+ *   `TokenClassificationPipeline.aggregation_strategy` behavior on raw
+ *   per-token softmax. See {@link AggregationStrategy}.
  */
 export interface ClassifyOptions {
   threshold?: number;
   calibration?: Partial<ViterbiCalibration>;
   returnTokens?: boolean;
+  aggregationStrategy?: AggregationStrategy;
 }
 
 /**

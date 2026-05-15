@@ -44,7 +44,11 @@ impl<'a> AttentionLayer<'a> {
     /// [`PrivacyFilterConfig::band_for_layer`]). Per gpt-oss defaults,
     /// half the layers alternate to full attention — applying the sliding
     /// band to every layer cripples the bidirectional receptive field.
-    pub fn forward(&self, hidden: &MxArray, band: i32) -> Result<MxArray> {
+    ///
+    /// `training` toggles LoRA dropout inside `project_2d`. Pass `false`
+    /// for inference and `true` for training. When no LoRA adapter is
+    /// attached, this flag has no effect.
+    pub fn forward(&self, hidden: &MxArray, band: i32, training: bool) -> Result<MxArray> {
         let batch = hidden.shape_at(0)?;
         let seq_len = hidden.shape_at(1)?;
 
@@ -62,9 +66,9 @@ impl<'a> AttentionLayer<'a> {
         //    `mlx_quantized_matmul(transpose=true)` and adds the bias
         //    after dequantize; both branches return the same shape so
         //    the rest of this forward pass is unchanged.
-        let q = project_2d(hidden, &self.weights.q_proj)?;
-        let k = project_2d(hidden, &self.weights.k_proj)?;
-        let v = project_2d(hidden, &self.weights.v_proj)?;
+        let q = project_2d(hidden, &self.weights.q_proj, training)?;
+        let k = project_2d(hidden, &self.weights.k_proj, training)?;
+        let v = project_2d(hidden, &self.weights.v_proj, training)?;
 
         // 2. Reshape `[B, T, *]` to `[B, T, H, D]` and permute to `[B, H, T, D]`.
         let q = q
@@ -147,7 +151,7 @@ impl<'a> AttentionLayer<'a> {
             .transpose(Some(&[0, 2, 1, 3]))?
             .reshape(&[batch, seq_len, q_dim])?;
 
-        let out = project_2d(&merged, &self.weights.o_proj)?;
+        let out = project_2d(&merged, &self.weights.o_proj, training)?;
 
         // Output shape sanity: `[B, T, hidden_size]`. Use a debug_assert so
         // tests pin the contract without paying for a shape check on every
@@ -212,7 +216,9 @@ mod tests {
         .expect("random hidden");
 
         let band = loaded.config.band_for_layer(0);
-        let out = layer.forward(&hidden, band).expect("attention forward");
+        let out = layer
+            .forward(&hidden, band, false)
+            .expect("attention forward");
 
         let shape = out.shape().unwrap().to_vec();
         assert_eq!(shape, vec![1, 8, loaded.config.hidden_size as i64]);
@@ -261,8 +267,8 @@ mod tests {
         .expect("random hidden");
 
         let band = loaded.config.band_for_layer(0);
-        let a = layer.forward(&hidden, band).expect("forward 1");
-        let b = layer.forward(&hidden, band).expect("forward 2");
+        let a = layer.forward(&hidden, band, false).expect("forward 1");
+        let b = layer.forward(&hidden, band, false).expect("forward 2");
 
         let av = a.astype(DType::Float32).unwrap().to_float32().unwrap();
         let bv = b.astype(DType::Float32).unwrap().to_float32().unwrap();

@@ -14,21 +14,25 @@ Usage:
   mlx <command> [options]
 
 Commands:
-  download model     Download a model from HuggingFace
-  download dataset   Download a dataset from HuggingFace
-  convert            Convert model weights to MLX format
-  redact             Redact PII from text using a privacy-filter model
-  launch claude      Start a local server and spawn Claude Code pointed at it
+  download model       Download a model from HuggingFace
+  download dataset     Download a dataset from HuggingFace
+  convert              Convert model weights to MLX format
+  convert lora-fuse    Fuse a privacy-filter LoRA adapter into base weights
+  redact               Redact PII from text using a privacy-filter model
+  train privacy-lora   LoRA fine-tune a privacy-filter checkpoint
+  launch claude        Start a local server and spawn Claude Code pointed at it
 
 Options:
-  -h, --help         Show this help message
-  -v, --version      Show version number
+  -h, --help           Show this help message
+  -v, --version        Show version number
 
 Examples:
   mlx download model -m Qwen/Qwen3-0.6B
   mlx download dataset -d openai/gsm8k
   mlx convert -i ~/.mlx-node/models/qwen3-0.6b -o ~/.mlx-node/models/qwen3-0.6b-mlx -d bf16
+  mlx convert lora-fuse --adapter ./out/run-001 --out ./out/run-001-fused
   mlx redact -m .cache/models/privacy-filter -i input.txt -o redacted.txt
+  mlx train privacy-lora --config train.json
   mlx launch claude
 `);
 }
@@ -74,9 +78,18 @@ Run mlx download <subcommand> --help for more information.
     }
 
     case 'convert': {
-      const rest = args.slice(1);
-      const { run } = await import('./commands/convert.js');
-      await run(rest);
+      // Route `mlx convert lora-fuse ...` to the LoRA-fuse subcommand.
+      // Plain `mlx convert -i ... -o ...` (no subcommand) falls through to
+      // the legacy weight converter for backwards compatibility.
+      if (subcommand === 'lora-fuse') {
+        const rest = args.slice(2);
+        const { run } = await import('./commands/convert-lora.js');
+        await run(rest);
+      } else {
+        const rest = args.slice(1);
+        const { run } = await import('./commands/convert.js');
+        await run(rest);
+      }
       break;
     }
 
@@ -84,6 +97,28 @@ Run mlx download <subcommand> --help for more information.
       const rest = args.slice(1);
       const { run } = await import('./commands/redact.js');
       await run(rest);
+      break;
+    }
+
+    case 'train': {
+      if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+        console.log(`
+Usage:
+  mlx train privacy-lora     LoRA fine-tune a privacy-filter checkpoint
+
+Run mlx train <subcommand> --help for more information.
+`);
+        return;
+      }
+      const rest = args.slice(2);
+      if (subcommand === 'privacy-lora') {
+        const { run } = await import('./commands/train-privacy.js');
+        await run(rest);
+      } else {
+        console.error(`Unknown train subcommand: ${subcommand}`);
+        console.error('Available: privacy-lora');
+        process.exit(1);
+      }
       break;
     }
 

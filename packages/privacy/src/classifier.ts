@@ -51,4 +51,30 @@ export class PrivacyFilter {
     const { entities } = await this.classify(text, opts);
     return redactImpl(text, entities, opts);
   }
+
+  /**
+   * Attach a LoRA adapter from a directory containing
+   * `adapter.safetensors` and `adapter_config.json`. The adapter is
+   * applied to every attention projection (q/k/v/o) and overrides the
+   * classifier head's `score.weight` / `score.bias`. Any previously
+   * loaded adapter is cleared first.
+   *
+   * `adapter_config.json` must provide `rank` (number), `alpha` (number),
+   * and `dropout` (number). `target_modules` and `base_model_path` are
+   * informational and may be absent.
+   */
+  async loadAdapter(adapterDir: string): Promise<void> {
+    // Native `loadAdapter` is synchronous; we keep the public surface
+    // async to mirror the rest of the wrapper and leave room for future
+    // off-main-thread loading without an ABI break.
+    this.native.loadAdapter(adapterDir);
+  }
+
+  /**
+   * Drop all LoRA adapters and restore the original classifier head.
+   * Idempotent — calling on a model without an adapter is a no-op.
+   */
+  async clearAdapter(): Promise<void> {
+    this.native.clearAdapter();
+  }
 }

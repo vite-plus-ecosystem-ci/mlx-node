@@ -1,4 +1,5 @@
 //! OpenAI Privacy Filter — token-classification PII detector.
+pub mod aggregation;
 pub mod attention;
 pub mod classifier;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod spans;
 pub mod transformer;
 pub mod viterbi;
 pub mod yarn;
+pub use aggregation::AggregationStrategy;
 pub use attention::AttentionLayer;
 pub use classifier::classifier_forward;
 pub use config::{PrivacyFilterConfig, RopeParameters};
@@ -30,8 +32,10 @@ pub use yarn::compute_yarn_freqs;
 
 use crate::array::{DType, MxArray};
 use crate::nn::Activations;
+use crate::nn::lora::{LoRAConfig, LoRALinear};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A privacy entity detected by [`PrivacyFilterModelJs::classify`].
@@ -83,15 +87,23 @@ pub struct PrivacyCalibration {
 /// Options for [`PrivacyFilterModelJs::classify`].
 ///
 /// - `threshold` (default `0.5`): minimum mean per-token probability for
-///   an extracted span to be returned.
+///   an extracted span/group to be returned.
 /// - `calibration`: per-call overrides on top of the checkpoint default.
+///   Ignored when `aggregation_strategy` is set (no Viterbi pass is run).
 /// - `return_tokens` (default `false`): when `true`, the result includes
-///   a `tokens` array with one entry per input token.
+///   a `tokens` array with one entry per input token. When combined with
+///   `aggregation_strategy`, the per-token `tag` is the raw argmax BIOES
+///   tag and `score` is the argmax probability (no Viterbi).
+/// - `aggregation_strategy`: opt into Hugging Face
+///   `TokenClassificationPipeline.aggregation_strategy` behavior. One of
+///   `"none"`, `"simple"`, `"first"`, `"average"`, `"max"`. When set, the
+///   Viterbi decoder is skipped and raw per-token argmax is used.
 #[napi(object)]
 pub struct PrivacyClassifyOptions {
     pub threshold: Option<f64>,
     pub calibration: Option<PrivacyCalibration>,
     pub return_tokens: Option<bool>,
+    pub aggregation_strategy: Option<String>,
 }
 
 /// Result of [`PrivacyFilterModelJs::classify`].
@@ -151,9 +163,16 @@ impl PrivacyFilterModelJs {
             threshold: None,
             calibration: None,
             return_tokens: None,
+            aggregation_strategy: None,
         });
         let threshold = opts.threshold.unwrap_or(0.5) as f32;
         let return_tokens = opts.return_tokens.unwrap_or(false);
+        let aggregation_strategy = match opts.aggregation_strategy.as_deref() {
+            Some(s) => Some(AggregationStrategy::parse(s).map_err(|e| {
+                napi::Error::from_reason(format!("invalid aggregationStrategy: {e}"))
+            })?),
+            None => None,
+        };
 
         // ---- 1. Tokenize with byte offsets (no special tokens). ----
         //
@@ -227,6 +246,81 @@ impl PrivacyFilterModelJs {
         drop(input_ids);
         crate::array::memory::synchronize_and_clear_cache();
 
+        let id2label = self.inner.loaded.label_strs.clone();
+
+        // ---- HF aggregation-strategy branch (skips Viterbi). ----
+        //
+        // When the caller opts into one of the HF aggregation strategies,
+        // we use raw per-token argmax + the HF `gather_pre_entities` →
+        // `aggregate` → `group_entities` pipeline instead of our
+        // constrained BIOES Viterbi decoder. `calibration` is silently
+        // ignored on this path (the spec mandates this).
+        if let Some(strategy) = aggregation_strategy {
+            let entities_internal = aggregation::aggregate(
+                &probs_flat,
+                num_classes,
+                &id2label,
+                &offsets,
+                &text,
+                threshold,
+                strategy,
+            );
+
+            let entities: Vec<PrivacyEntity> = entities_internal
+                .into_iter()
+                .map(|e| PrivacyEntity {
+                    label: e.label,
+                    start: e.start as u32,
+                    end: e.end as u32,
+                    score: e.score as f64,
+                    text: e.text,
+                })
+                .collect();
+
+            // Tokens output on this path uses raw per-token argmax — `tag`
+            // is the full BIOES label of the argmax class, `score` is its
+            // softmax probability. No Viterbi is run on this path.
+            let tokens = if return_tokens {
+                let mut out = Vec::with_capacity(n_tokens);
+                for t in 0..n_tokens {
+                    let (start, end) = offsets[t];
+                    let tok_text = if start == 0 && end == 0 {
+                        self.inner
+                            .loaded
+                            .tokenizer
+                            .id_to_token(ids_u32[t])
+                            .unwrap_or_default()
+                    } else {
+                        text.get(start..end).unwrap_or("").to_string()
+                    };
+                    let row = &probs_flat[t * num_classes..(t + 1) * num_classes];
+                    let mut best_idx = 0usize;
+                    let mut best_val = f32::NEG_INFINITY;
+                    for (i, &v) in row.iter().enumerate() {
+                        if v > best_val {
+                            best_val = v;
+                            best_idx = i;
+                        }
+                    }
+                    out.push(PrivacyToken {
+                        text: tok_text,
+                        tag: id2label
+                            .get(best_idx)
+                            .cloned()
+                            .unwrap_or_else(|| "O".to_string()),
+                        score: best_val as f64,
+                        start: start as u32,
+                        end: end as u32,
+                    });
+                }
+                Some(out)
+            } else {
+                None
+            };
+
+            return Ok(PrivacyClassifyResult { entities, tokens });
+        }
+
         // ---- 4. Build the emission matrix [T, num_classes] from
         //         log-softmax. ----
         let mut emit: Vec<Vec<f32>> = Vec::with_capacity(n_tokens);
@@ -262,7 +356,6 @@ impl PrivacyFilterModelJs {
         }
 
         // ---- 7. Extract spans. ----
-        let id2label = self.inner.loaded.label_strs.clone();
         let entities_internal = extract_spans(
             &tags,
             &id2label,
@@ -328,6 +421,342 @@ impl PrivacyFilterModelJs {
         };
 
         Ok(PrivacyClassifyResult { entities, tokens })
+    }
+
+    /// Load a LoRA adapter from a directory containing `adapter.safetensors`
+    /// and `adapter_config.json`. The adapter is attached to all layers'
+    /// attention projections (q/k/v/o) and overrides the classifier head's
+    /// `score.weight` / `score.bias`. Any existing adapter is cleared first.
+    ///
+    /// `adapter_config.json` must provide `rank` (i64), `alpha` (f32), and
+    /// `dropout` (f32). `target_modules` must include all of `q_proj`,
+    /// `k_proj`, `v_proj`, and `o_proj` — this is enforced at load time
+    /// because the corresponding `lora_a` / `lora_b` tensors are looked up
+    /// unconditionally for every layer/projection and a missing tensor
+    /// raises a `missing key` error from
+    /// [`crate::nn::lora::LoRALinear::from_safetensors`]. The
+    /// `base_model_path` key is informational and may be absent.
+    #[napi]
+    pub fn load_adapter(&mut self, adapter_dir: String) -> Result<()> {
+        // 1. Clear any previously loaded adapter so load is idempotent.
+        self.clear_adapter()?;
+
+        // 2. Parse adapter_config.json.
+        let cfg_path = Path::new(&adapter_dir).join("adapter_config.json");
+        let cfg_json = std::fs::read_to_string(&cfg_path).map_err(|e| {
+            Error::from_reason(format!("failed to read {}: {e}", cfg_path.display()))
+        })?;
+        let cfg_val: serde_json::Value = serde_json::from_str(&cfg_json).map_err(|e| {
+            Error::from_reason(format!("failed to parse {}: {e}", cfg_path.display()))
+        })?;
+
+        let rank = cfg_val
+            .get("rank")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| Error::from_reason("adapter_config.json: 'rank' missing or not int"))?;
+        let alpha = cfg_val
+            .get("alpha")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| {
+                Error::from_reason("adapter_config.json: 'alpha' missing or not number")
+            })? as f32;
+        let dropout = cfg_val
+            .get("dropout")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32;
+
+        let lora_cfg = LoRAConfig {
+            rank,
+            alpha,
+            dropout,
+        };
+
+        // 3. Load adapter.safetensors.
+        let adapter_path = Path::new(&adapter_dir).join("adapter.safetensors");
+        let tensors: HashMap<String, MxArray> =
+            crate::utils::safetensors::load_safetensors_lazy(&adapter_path)?;
+
+        // 4. Attach LoRA to each layer's attention projections.
+        let num_layers = self.inner.loaded.weights.layers.len();
+        for i in 0..num_layers {
+            let layer = &mut self.inner.loaded.weights.layers[i];
+            let attn = &mut layer.self_attn;
+
+            let q_name = format!("model.layers.{i}.self_attn.q_proj");
+            let k_name = format!("model.layers.{i}.self_attn.k_proj");
+            let v_name = format!("model.layers.{i}.self_attn.v_proj");
+            let o_name = format!("model.layers.{i}.self_attn.o_proj");
+
+            *attn.q_proj.lora_mut() =
+                Some(LoRALinear::from_safetensors(&tensors, &q_name, &lora_cfg)?);
+            *attn.k_proj.lora_mut() =
+                Some(LoRALinear::from_safetensors(&tensors, &k_name, &lora_cfg)?);
+            *attn.v_proj.lora_mut() =
+                Some(LoRALinear::from_safetensors(&tensors, &v_name, &lora_cfg)?);
+            *attn.o_proj.lora_mut() =
+                Some(LoRALinear::from_safetensors(&tensors, &o_name, &lora_cfg)?);
+        }
+
+        // 5. Override classifier head weights and back up originals.
+        let new_score_weight = tensors
+            .get("score.weight")
+            .cloned()
+            .ok_or_else(|| Error::from_reason("adapter.safetensors: missing 'score.weight'"))?;
+        let new_score_bias = tensors
+            .get("score.bias")
+            .cloned()
+            .ok_or_else(|| Error::from_reason("adapter.safetensors: missing 'score.bias'"))?;
+
+        // Validate shapes match the model's classifier head.
+        let old_sw_shape = self
+            .inner
+            .loaded
+            .weights
+            .score_weight
+            .shape()?
+            .as_ref()
+            .to_vec();
+        let new_sw_shape = new_score_weight.shape()?.as_ref().to_vec();
+        if old_sw_shape != new_sw_shape {
+            return Err(Error::from_reason(format!(
+                "adapter score.weight shape mismatch: model has {:?}, adapter has {:?}",
+                old_sw_shape, new_sw_shape
+            )));
+        }
+        let old_sb_shape = self
+            .inner
+            .loaded
+            .weights
+            .score_bias
+            .shape()?
+            .as_ref()
+            .to_vec();
+        let new_sb_shape = new_score_bias.shape()?.as_ref().to_vec();
+        if old_sb_shape != new_sb_shape {
+            return Err(Error::from_reason(format!(
+                "adapter score.bias shape mismatch: model has {:?}, adapter has {:?}",
+                old_sb_shape, new_sb_shape
+            )));
+        }
+
+        // Stash originals.
+        let backup_w = self.inner.loaded.weights.score_weight.clone();
+        let backup_b = self.inner.loaded.weights.score_bias.clone();
+        self.inner.loaded.weights.score_weight_backup = Some(backup_w);
+        self.inner.loaded.weights.score_bias_backup = Some(backup_b);
+
+        // Install override.
+        self.inner.loaded.weights.score_weight = new_score_weight;
+        self.inner.loaded.weights.score_bias = new_score_bias;
+
+        Ok(())
+    }
+
+    /// Drop all LoRA adapters and restore the original classifier weights.
+    /// Idempotent — calling it on a model without an adapter is a no-op.
+    #[napi]
+    pub fn clear_adapter(&mut self) -> Result<()> {
+        // Clear LoRA from every attention projection.
+        for layer in &mut self.inner.loaded.weights.layers {
+            let attn = &mut layer.self_attn;
+            *attn.q_proj.lora_mut() = None;
+            *attn.k_proj.lora_mut() = None;
+            *attn.v_proj.lora_mut() = None;
+            *attn.o_proj.lora_mut() = None;
+        }
+
+        // Restore classifier head from backups (if any).
+        if let Some(backup) = self.inner.loaded.weights.score_weight_backup.take() {
+            self.inner.loaded.weights.score_weight = backup;
+        }
+        if let Some(backup) = self.inner.loaded.weights.score_bias_backup.take() {
+            self.inner.loaded.weights.score_bias = backup;
+        }
+
+        Ok(())
+    }
+
+    /// Bake the currently-loaded adapter into the base weights and write the
+    /// result to `<out_dir>/model.safetensors`. Errors if any LoRA adapter
+    /// sits on top of a quantized projection (dequantization is not supported
+    /// in this phase). The in-memory model state is unchanged after this call.
+    ///
+    /// **Aux files are not copied.** Only `model.safetensors` is written.
+    /// Callers must copy the following files from the base checkpoint
+    /// directory into `out_dir` themselves (the fused output is otherwise
+    /// not loadable as a standalone privacy-filter checkpoint):
+    ///
+    /// - `config.json`
+    /// - `tokenizer.json`
+    /// - `tokenizer_config.json`
+    /// - `viterbi_calibration.json`
+    ///
+    /// This method only borrows `self` immutably — it reads the in-memory
+    /// weights and serializes them; no mutation of the live model occurs.
+    #[napi]
+    pub fn fuse_adapter(&self, out_dir: String) -> Result<()> {
+        let out_path = Path::new(&out_dir);
+        std::fs::create_dir_all(out_path).map_err(|e| {
+            Error::from_reason(format!(
+                "failed to create output directory {}: {e}",
+                out_path.display()
+            ))
+        })?;
+
+        let weights = &self.inner.loaded.weights;
+        let mut map: HashMap<String, MxArray> = HashMap::new();
+
+        // Top-level weights.
+        map.insert(
+            "model.embed_tokens.weight".to_string(),
+            weights.embed_tokens.clone(),
+        );
+        map.insert("model.norm.weight".to_string(), weights.final_norm.clone());
+        // Classifier head: use current score_weight/score_bias (already overridden).
+        map.insert("score.weight".to_string(), weights.score_weight.clone());
+        map.insert("score.bias".to_string(), weights.score_bias.clone());
+
+        // Per-layer weights.
+        for (i, layer) in weights.layers.iter().enumerate() {
+            let p = format!("model.layers.{i}");
+
+            // Layer norms.
+            map.insert(
+                format!("{p}.input_layernorm.weight"),
+                layer.input_layernorm.clone(),
+            );
+            map.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                layer.post_attention_layernorm.clone(),
+            );
+
+            // Attention sinks.
+            map.insert(
+                format!("{p}.self_attn.sinks"),
+                layer.self_attn.sinks.clone(),
+            );
+
+            // Attention projections — fuse LoRA if attached.
+            let proj_names = ["q_proj", "k_proj", "v_proj", "o_proj"];
+            let projs = [
+                &layer.self_attn.q_proj,
+                &layer.self_attn.k_proj,
+                &layer.self_attn.v_proj,
+                &layer.self_attn.o_proj,
+            ];
+            for (proj_name, proj) in proj_names.iter().zip(projs.iter()) {
+                let prefix = format!("{p}.self_attn.{proj_name}");
+                if let Some(lora) = proj.lora() {
+                    if proj.is_quantized() {
+                        return Err(Error::from_reason(format!(
+                            "fuse_adapter: cannot fuse LoRA on quantized projection {prefix} \
+                             (dequantization is not supported in Phase B — dequantize the \
+                             checkpoint first)"
+                        )));
+                    }
+                    let fused = lora.fuse_into_weight(proj.weight())?;
+                    map.insert(format!("{prefix}.weight"), fused);
+                } else {
+                    map.insert(format!("{prefix}.weight"), proj.weight().clone());
+                }
+                // Bias (if present — always plain, never quantized companion).
+                let bias_opt = match *proj {
+                    LoadedProj::Plain { bias, .. } => bias.as_ref(),
+                    LoadedProj::Quantized { bias, .. } => bias.as_ref(),
+                };
+                if let Some(b) = bias_opt {
+                    map.insert(format!("{prefix}.bias"), b.clone());
+                }
+                // Quantization companions.
+                if let LoadedProj::Quantized { scales, biases, .. } = *proj {
+                    map.insert(format!("{prefix}.scales"), scales.clone());
+                    if let Some(qb) = biases {
+                        map.insert(format!("{prefix}.biases"), qb.clone());
+                    }
+                }
+            }
+
+            // Router.
+            match &layer.mlp.router {
+                LoadedRouter::Plain(router) => {
+                    let router_prefix = format!("{p}.mlp.router");
+                    map.insert(format!("{router_prefix}.weight"), router.weight.clone());
+                    map.insert(format!("{router_prefix}.bias"), router.bias.clone());
+                }
+                LoadedRouter::Quantized { proj: rproj, .. } => {
+                    let router_prefix = format!("{p}.mlp.router");
+                    map.insert(format!("{router_prefix}.weight"), rproj.weight().clone());
+                    if let LoadedProj::Quantized {
+                        scales,
+                        biases,
+                        bias,
+                        ..
+                    } = rproj
+                    {
+                        map.insert(format!("{router_prefix}.scales"), scales.clone());
+                        if let Some(qb) = biases {
+                            map.insert(format!("{router_prefix}.biases"), qb.clone());
+                        }
+                        if let Some(b) = bias {
+                            map.insert(format!("{router_prefix}.bias"), b.clone());
+                        }
+                    } else if let LoadedProj::Plain { bias: Some(b), .. } = rproj {
+                        map.insert(format!("{router_prefix}.bias"), b.clone());
+                    }
+                }
+            }
+
+            // MoE expert weights (bare keys — no .weight suffix for plain tensors).
+            let gate_up_prefix = format!("{p}.mlp.experts.gate_up_proj");
+            let down_prefix = format!("{p}.mlp.experts.down_proj");
+
+            match &layer.mlp.gate_up_proj {
+                LoadedProj::Plain { weight, .. } => {
+                    map.insert(gate_up_prefix.clone(), weight.clone());
+                }
+                LoadedProj::Quantized {
+                    weight,
+                    scales,
+                    biases,
+                    ..
+                } => {
+                    map.insert(format!("{gate_up_prefix}.weight"), weight.clone());
+                    map.insert(format!("{gate_up_prefix}.scales"), scales.clone());
+                    if let Some(qb) = biases {
+                        map.insert(format!("{gate_up_prefix}.biases"), qb.clone());
+                    }
+                }
+            }
+            match &layer.mlp.down_proj {
+                LoadedProj::Plain { weight, .. } => {
+                    map.insert(down_prefix.clone(), weight.clone());
+                }
+                LoadedProj::Quantized {
+                    weight,
+                    scales,
+                    biases,
+                    ..
+                } => {
+                    map.insert(format!("{down_prefix}.weight"), weight.clone());
+                    map.insert(format!("{down_prefix}.scales"), scales.clone());
+                    if let Some(qb) = biases {
+                        map.insert(format!("{down_prefix}.biases"), qb.clone());
+                    }
+                }
+            }
+            map.insert(
+                format!("{p}.mlp.experts.gate_up_proj_bias"),
+                layer.mlp.gate_up_bias.clone(),
+            );
+            map.insert(
+                format!("{p}.mlp.experts.down_proj_bias"),
+                layer.mlp.down_bias.clone(),
+            );
+        }
+
+        let out_file = out_path.join("model.safetensors");
+        crate::utils::safetensors::save_safetensors(&out_file, &map, None)?;
+        Ok(())
     }
 }
 

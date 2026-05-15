@@ -62,6 +62,7 @@ pub enum LoadedProj {
     Plain {
         weight: MxArray,
         bias: Option<MxArray>,
+        lora: Option<crate::nn::lora::LoRALinear>,
     },
     Quantized {
         weight: MxArray,
@@ -71,6 +72,7 @@ pub enum LoadedProj {
         bits: i32,
         group_size: i32,
         mode: String,
+        lora: Option<crate::nn::lora::LoRALinear>,
     },
 }
 
@@ -133,6 +135,7 @@ impl LoadedProj {
                     bits: q.bits,
                     group_size: q.group_size,
                     mode: q.mode.clone(),
+                    lora: None,
                 })
             }
             None => {
@@ -147,7 +150,11 @@ impl LoadedProj {
                             "missing tensor: neither {weight_key} nor {prefix} present"
                         ))
                     })?;
-                Ok(LoadedProj::Plain { weight, bias })
+                Ok(LoadedProj::Plain {
+                    weight,
+                    bias,
+                    lora: None,
+                })
             }
         }
     }
@@ -155,6 +162,30 @@ impl LoadedProj {
     /// True if this projection is quantized.
     pub fn is_quantized(&self) -> bool {
         matches!(self, LoadedProj::Quantized { .. })
+    }
+
+    /// Return a reference to the optional LoRA adapter for this projection.
+    pub fn lora(&self) -> Option<&crate::nn::lora::LoRALinear> {
+        match self {
+            LoadedProj::Plain { lora, .. } => lora.as_ref(),
+            LoadedProj::Quantized { lora, .. } => lora.as_ref(),
+        }
+    }
+
+    /// Return a mutable reference to the optional LoRA adapter slot.
+    pub fn lora_mut(&mut self) -> &mut Option<crate::nn::lora::LoRALinear> {
+        match self {
+            LoadedProj::Plain { lora, .. } => lora,
+            LoadedProj::Quantized { lora, .. } => lora,
+        }
+    }
+
+    /// Return a reference to the underlying weight tensor (either branch).
+    pub fn weight(&self) -> &MxArray {
+        match self {
+            LoadedProj::Plain { weight, .. } => weight,
+            LoadedProj::Quantized { weight, .. } => weight,
+        }
     }
 }
 
@@ -234,13 +265,18 @@ impl PrivacyFilterQuantizedSwitchLinear {
 /// fusion as the legacy code path. For the `Quantized` branch the
 /// kernel handles the dequantization internally and we add the linear
 /// bias afterwards (matches `QuantizedLinear::forward`).
-pub fn project_2d(x: &MxArray, proj: &LoadedProj) -> Result<MxArray> {
-    match proj {
-        LoadedProj::Plain { weight, bias } => {
+///
+/// If the projection has an attached LoRA adapter, the adapter delta
+/// (`scale * (dropout(x) @ A) @ B`) is added to the base output.
+/// `training` controls whether dropout is active. Pass `false` for
+/// inference.
+pub fn project_2d(x: &MxArray, proj: &LoadedProj, training: bool) -> Result<MxArray> {
+    let base = match proj {
+        LoadedProj::Plain { weight, bias, .. } => {
             let weight_t = weight.transpose(Some(&[1, 0]))?;
             match bias {
-                Some(b) => x.addmm(b, &weight_t, None, None),
-                None => x.matmul(&weight_t),
+                Some(b) => x.addmm(b, &weight_t, None, None)?,
+                None => x.matmul(&weight_t)?,
             }
         }
         LoadedProj::Quantized {
@@ -251,6 +287,7 @@ pub fn project_2d(x: &MxArray, proj: &LoadedProj) -> Result<MxArray> {
             bits,
             group_size,
             mode,
+            ..
         } => {
             let mode_c = CString::new(mode.as_str())
                 .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
@@ -269,10 +306,18 @@ pub fn project_2d(x: &MxArray, proj: &LoadedProj) -> Result<MxArray> {
             };
             let result = MxArray::from_handle(handle, "privacy_filter quantized_matmul")?;
             match bias {
-                Some(b) => result.add(b),
-                None => Ok(result),
+                Some(b) => result.add(b)?,
+                None => result,
             }
         }
+    };
+
+    // Apply LoRA delta if an adapter is attached to this projection.
+    if let Some(lora) = proj.lora() {
+        let delta = lora.delta(x, training)?;
+        base.add(&delta)
+    } else {
+        Ok(base)
     }
 }
 

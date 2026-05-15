@@ -30,6 +30,7 @@ sqlx = { workspace = true }
 unicode-width = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 zip = { workspace = true }
+clap = { version = "4", features = ["derive"] }
 
 [dependencies.mimalloc-safe]
 workspace = true

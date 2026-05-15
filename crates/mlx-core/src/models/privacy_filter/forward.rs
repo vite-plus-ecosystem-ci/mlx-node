@@ -66,18 +66,22 @@ impl PrivacyFilterModel {
     ///   shipped checkpoint); callers wanting f32 should `astype` the
     ///   result themselves.
     pub fn forward_logits(&self, input_ids: &MxArray) -> Result<MxArray> {
+        self.forward_logits_training(input_ids, false)
+    }
+
+    /// Training-mode variant of [`Self::forward_logits`].
+    ///
+    /// Identical to `forward_logits` in inference mode, but threads a
+    /// `training` flag through the attention layers so LoRA dropout
+    /// fires when an adapter with `dropout > 0` is attached.
+    pub fn forward_logits_training(&self, input_ids: &MxArray, training: bool) -> Result<MxArray> {
         let weights = &self.loaded.weights;
         let cfg = &self.loaded.config;
 
         // 1. Embedding lookup: hidden = embed_tokens[input_ids].
-        //    `take(axis=0)` on `[vocab, hidden]` with `[B, T]` indices
-        //    produces `[B, T, hidden]`. Same pattern as
-        //    `crate::nn::Embedding::forward`.
         let mut hidden = weights.embed_tokens.take(input_ids, 0)?;
 
-        // 2. Run all 8 transformer blocks. Each block needs its index to
-        //    decide whether to apply the sliding band or run full
-        //    bidirectional attention — gpt-oss alternates by default.
+        // 2. Run all transformer blocks.
         for (layer_idx, layer) in weights.layers.iter().enumerate() {
             let block = Block {
                 weights: layer,
@@ -85,7 +89,7 @@ impl PrivacyFilterModel {
                 yarn_freqs: &self.yarn_freqs,
                 layer_idx,
             };
-            hidden = block.forward(&hidden)?;
+            hidden = block.forward(&hidden, training)?;
         }
 
         // 3. Final RMSNorm (model.norm).
@@ -256,6 +260,504 @@ mod tests {
             "expected B-private_email in tag sequence; got {:?}",
             pred_tags
         );
+    }
+
+    // ---- LoRA Phase B tests ---- //
+
+    /// Helper: attach a synthetic zero-B adapter (all attention projections,
+    /// score head uses original weights) and run classify. Returns the
+    /// per-token softmax probabilities as a flat Vec<f32>.
+    fn attach_zero_adapter_and_classify(
+        model: &mut PrivacyFilterModel,
+        text: &str,
+        rank: i64,
+    ) -> Vec<f32> {
+        use crate::array::DType;
+        use crate::nn::lora::{LoRAConfig, LoRALinear};
+
+        let cfg = LoRAConfig {
+            rank,
+            alpha: rank as f32 * 2.0,
+            dropout: 0.0,
+        };
+        let num_layers = model.loaded.weights.layers.len();
+        let hidden = model.loaded.config.hidden_size as i64;
+        let num_q = model.loaded.config.num_attention_heads as i64;
+        let num_kv = model.loaded.config.num_key_value_heads as i64;
+        let head_dim = model.loaded.config.head_dim as i64;
+        let q_out = num_q * head_dim;
+        let kv_out = num_kv * head_dim;
+
+        // Use the original score_weight / score_bias as the override —
+        // so the head is unchanged.
+        let orig_sw = model.loaded.weights.score_weight.clone();
+        let orig_sb = model.loaded.weights.score_bias.clone();
+
+        for i in 0..num_layers {
+            let attn = &mut model.loaded.weights.layers[i].self_attn;
+            *attn.q_proj.lora_mut() = Some(
+                LoRALinear::new_zero_b(
+                    hidden,
+                    q_out,
+                    &cfg,
+                    &format!("model.layers.{i}.self_attn.q_proj"),
+                    DType::BFloat16,
+                )
+                .unwrap(),
+            );
+            *attn.k_proj.lora_mut() = Some(
+                LoRALinear::new_zero_b(
+                    hidden,
+                    kv_out,
+                    &cfg,
+                    &format!("model.layers.{i}.self_attn.k_proj"),
+                    DType::BFloat16,
+                )
+                .unwrap(),
+            );
+            *attn.v_proj.lora_mut() = Some(
+                LoRALinear::new_zero_b(
+                    hidden,
+                    kv_out,
+                    &cfg,
+                    &format!("model.layers.{i}.self_attn.v_proj"),
+                    DType::BFloat16,
+                )
+                .unwrap(),
+            );
+            *attn.o_proj.lora_mut() = Some(
+                LoRALinear::new_zero_b(
+                    q_out,
+                    hidden,
+                    &cfg,
+                    &format!("model.layers.{i}.self_attn.o_proj"),
+                    DType::BFloat16,
+                )
+                .unwrap(),
+            );
+        }
+
+        // Stash backups and install identity override for classifier head.
+        model.loaded.weights.score_weight_backup = Some(model.loaded.weights.score_weight.clone());
+        model.loaded.weights.score_bias_backup = Some(model.loaded.weights.score_bias.clone());
+        model.loaded.weights.score_weight = orig_sw;
+        model.loaded.weights.score_bias = orig_sb;
+
+        // Run classify.
+        let ids_u32 = model
+            .loaded
+            .tokenizer
+            .encode_sync(text, Some(false))
+            .unwrap();
+        let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+        let n = ids.len() as i64;
+        let input_ids = MxArray::from_int32(&ids, &[1, n]).unwrap();
+        let logits = model.forward_logits(&input_ids).unwrap();
+        let logits_f32 = logits.astype(DType::Float32).unwrap();
+        let probs = crate::nn::Activations::softmax(&logits_f32, Some(-1)).unwrap();
+        probs.eval();
+        probs.to_float32().unwrap().to_vec()
+    }
+
+    /// With a zero-B LoRA adapter attached, the model forward pass should
+    /// produce output bit-exactly (or near-bit-exactly) equal to the base
+    /// model. Max-abs-diff < 1e-5 in softmax probability space is the gate.
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter — run with --ignored"]
+    fn forward_parity_with_zero_adapter() {
+        use crate::array::DType;
+        use crate::nn::Activations;
+
+        let text = "Hi I am Alice Smith, email alice@example.com.";
+        let ckpt = checkpoint_dir();
+
+        // Base model probs (no adapter).
+        let base_probs = {
+            let model = PrivacyFilterModel::load_from_dir(&ckpt).unwrap();
+            let ids_u32 = model
+                .loaded
+                .tokenizer
+                .encode_sync(text, Some(false))
+                .unwrap();
+            let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+            let n = ids.len() as i64;
+            let input_ids = MxArray::from_int32(&ids, &[1, n]).unwrap();
+            let logits = model.forward_logits(&input_ids).unwrap();
+            let logits_f32 = logits.astype(DType::Float32).unwrap();
+            let probs = Activations::softmax(&logits_f32, Some(-1)).unwrap();
+            probs.eval();
+            probs.to_float32().unwrap().to_vec()
+        };
+
+        // Adapter model probs (zero-B adapter).
+        let adapter_probs = {
+            let mut model = PrivacyFilterModel::load_from_dir(&ckpt).unwrap();
+            attach_zero_adapter_and_classify(&mut model, text, 16)
+        };
+
+        assert_eq!(
+            base_probs.len(),
+            adapter_probs.len(),
+            "prob vector length mismatch"
+        );
+
+        let max_diff = base_probs
+            .iter()
+            .zip(adapter_probs.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-5,
+            "zero-B adapter changed softmax probs by {max_diff:.2e} (expected < 1e-5)"
+        );
+    }
+
+    /// Save a synthetic adapter with known A weights to disk, load it via
+    /// `load_adapter`, and verify the in-memory adapter weights match.
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter — run with --ignored"]
+    fn adapter_save_load_roundtrip() {
+        use crate::array::DType;
+        use crate::nn::lora::{LoRAConfig, LoRALinear};
+        use crate::utils::safetensors::save_safetensors;
+        use std::collections::HashMap;
+
+        let rank = 8i64;
+        let cfg = LoRAConfig {
+            rank,
+            alpha: 16.0,
+            dropout: 0.05,
+        };
+
+        let ckpt = checkpoint_dir();
+        let model_ref = PrivacyFilterModel::load_from_dir(&ckpt).unwrap();
+        let num_layers = model_ref.loaded.config.num_hidden_layers;
+        let hidden = model_ref.loaded.config.hidden_size as i64;
+        let num_q = model_ref.loaded.config.num_attention_heads as i64;
+        let num_kv = model_ref.loaded.config.num_key_value_heads as i64;
+        let head_dim = model_ref.loaded.config.head_dim as i64;
+        let q_out = num_q * head_dim;
+        let kv_out = num_kv * head_dim;
+        let num_classes = model_ref.loaded.label_strs.len() as i64;
+        drop(model_ref);
+
+        // Build a synthetic adapter tensor map with deterministic A values.
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+        let proj_specs: &[(&str, i64, i64)] = &[
+            ("q_proj", hidden, q_out),
+            ("k_proj", hidden, kv_out),
+            ("v_proj", hidden, kv_out),
+            ("o_proj", q_out, hidden),
+        ];
+        // We'll check layer 0 q_proj A after loading.
+        let q0_a_data: Vec<f32> = (0..hidden * rank).map(|i| (i as f32) * 1e-4).collect();
+        let q0_a_ref = MxArray::from_float32(&q0_a_data, &[hidden, rank]).unwrap();
+
+        for i in 0..num_layers {
+            for &(proj_name, in_dim, out_dim) in proj_specs {
+                let name = format!("model.layers.{i}.self_attn.{proj_name}");
+                let mut adapter =
+                    LoRALinear::new_zero_b(in_dim, out_dim, &cfg, &name, DType::Float32).unwrap();
+                if i == 0 && proj_name == "q_proj" {
+                    adapter
+                        .set_weights(
+                            q0_a_ref.clone(),
+                            MxArray::zeros(&[rank, out_dim], Some(DType::Float32)).unwrap(),
+                        )
+                        .unwrap();
+                }
+                for (key, arr) in adapter.params() {
+                    tensors.insert(key.to_owned(), arr.clone());
+                }
+            }
+        }
+        // Classifier override: all-zero score.weight / score.bias for simplicity.
+        tensors.insert(
+            "score.weight".to_owned(),
+            MxArray::zeros(&[num_classes, hidden], Some(DType::Float32)).unwrap(),
+        );
+        tensors.insert(
+            "score.bias".to_owned(),
+            MxArray::zeros(&[num_classes], Some(DType::Float32)).unwrap(),
+        );
+
+        // Write to tempdir.
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx_lora_roundtrip_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let adapter_st = tmp.join("adapter.safetensors");
+        save_safetensors(&adapter_st, &tensors, None).unwrap();
+
+        // Write adapter_config.json.
+        let adapter_cfg_json = serde_json::json!({
+            "rank": rank,
+            "alpha": cfg.alpha,
+            "dropout": cfg.dropout,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "base_model_path": ckpt.display().to_string()
+        });
+        std::fs::write(
+            tmp.join("adapter_config.json"),
+            serde_json::to_string_pretty(&adapter_cfg_json).unwrap(),
+        )
+        .unwrap();
+
+        // Load adapter.
+        let mut js_model =
+            crate::models::privacy_filter::PrivacyFilterModelJs::load(ckpt.display().to_string())
+                .unwrap();
+        js_model
+            .load_adapter(tmp.display().to_string())
+            .expect("load_adapter");
+
+        // Verify layer 0 q_proj A matches.
+        let loaded_a = js_model.inner.loaded.weights.layers[0]
+            .self_attn
+            .q_proj
+            .lora()
+            .expect("q_proj should have LoRA")
+            .a();
+        let loaded_a_f32 = loaded_a
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let ref_a_f32 = q0_a_ref.to_float32().unwrap().to_vec();
+        assert_eq!(loaded_a_f32.len(), ref_a_f32.len());
+        let max_diff = loaded_a_f32
+            .iter()
+            .zip(ref_a_f32.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "q_proj A weight mismatch after roundtrip: max_diff={max_diff:.2e}"
+        );
+
+        // Verify score_weight was overridden (should be zeros now).
+        let sw = &js_model.inner.loaded.weights.score_weight;
+        let sw_vals = sw
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        for &v in &sw_vals {
+            assert!(
+                v.abs() < 1e-6,
+                "score_weight should be zeros after adapter load, got {v}"
+            );
+        }
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Load the model, attach a small random adapter, run fuse_adapter to a
+    /// tempdir, reload from that tempdir, and verify classify output matches
+    /// (within 5e-3 in softmax probability).
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter — run with --ignored"]
+    fn fuse_then_forward_matches_unfused() {
+        use crate::array::DType;
+        use crate::nn::Activations;
+        use crate::nn::lora::{LoRAConfig, LoRALinear};
+        use std::collections::HashMap;
+
+        let text = "Hi I am Alice Smith, email alice@example.com.";
+        let ckpt = checkpoint_dir();
+
+        let rank = 4i64;
+        let cfg = LoRAConfig {
+            rank,
+            alpha: 8.0,
+            dropout: 0.0,
+        };
+
+        // Build adapter tensors with tiny random A values (small perturbation).
+        let num_layers;
+        let hidden;
+        let q_out;
+        let kv_out;
+        let num_classes;
+        {
+            let model_ref = PrivacyFilterModel::load_from_dir(&ckpt).unwrap();
+            num_layers = model_ref.loaded.config.num_hidden_layers;
+            hidden = model_ref.loaded.config.hidden_size as i64;
+            let num_q = model_ref.loaded.config.num_attention_heads as i64;
+            let num_kv = model_ref.loaded.config.num_key_value_heads as i64;
+            let head_dim = model_ref.loaded.config.head_dim as i64;
+            q_out = num_q * head_dim;
+            kv_out = num_kv * head_dim;
+            num_classes = model_ref.loaded.label_strs.len() as i64;
+        }
+
+        let proj_specs: &[(&str, i64, i64)] = &[
+            ("q_proj", hidden, q_out),
+            ("k_proj", hidden, kv_out),
+            ("v_proj", hidden, kv_out),
+            ("o_proj", q_out, hidden),
+        ];
+
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+        for i in 0..num_layers {
+            for &(proj_name, in_dim, out_dim) in proj_specs {
+                let name = format!("model.layers.{i}.self_attn.{proj_name}");
+                // Use small uniform random A, zero B — still a legit zero-delta adapter
+                // but with a non-trivial A matrix for the roundtrip fidelity check.
+                let small_a_data: Vec<f32> = (0..in_dim * rank)
+                    .map(|k| ((k as f32 * 1.1 + i as f32) * 1e-6).sin() * 0.01)
+                    .collect();
+                let mut adapter =
+                    LoRALinear::new_zero_b(in_dim, out_dim, &cfg, &name, DType::Float32).unwrap();
+                adapter
+                    .set_weights(
+                        MxArray::from_float32(&small_a_data, &[in_dim, rank]).unwrap(),
+                        MxArray::zeros(&[rank, out_dim], Some(DType::Float32)).unwrap(),
+                    )
+                    .unwrap();
+                for (key, arr) in adapter.params() {
+                    tensors.insert(key.to_owned(), arr.clone());
+                }
+            }
+        }
+        // Classifier override = identity (load original weights).
+        let model_for_sw = PrivacyFilterModel::load_from_dir(&ckpt).unwrap();
+        tensors.insert(
+            "score.weight".to_owned(),
+            model_for_sw.loaded.weights.score_weight.clone(),
+        );
+        tensors.insert(
+            "score.bias".to_owned(),
+            model_for_sw.loaded.weights.score_bias.clone(),
+        );
+        drop(model_for_sw);
+
+        // Create tempdir for adapter and fused output.
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx_lora_fuse_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let adapter_dir = tmp.join("adapter");
+        let fused_dir = tmp.join("fused");
+        std::fs::create_dir_all(&adapter_dir).unwrap();
+        std::fs::create_dir_all(&fused_dir).unwrap();
+
+        // Save adapter.
+        crate::utils::safetensors::save_safetensors(
+            adapter_dir.join("adapter.safetensors"),
+            &tensors,
+            None,
+        )
+        .unwrap();
+        let adapter_cfg_json = serde_json::json!({
+            "rank": rank,
+            "alpha": cfg.alpha,
+            "dropout": cfg.dropout,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        });
+        std::fs::write(
+            adapter_dir.join("adapter_config.json"),
+            serde_json::to_string_pretty(&adapter_cfg_json).unwrap(),
+        )
+        .unwrap();
+
+        // Copy config files to fused_dir so it can be loaded.
+        for fname in &[
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "viterbi_calibration.json",
+        ] {
+            let src = ckpt.join(fname);
+            if src.exists() {
+                std::fs::copy(&src, fused_dir.join(fname)).unwrap();
+            }
+        }
+
+        // Load model, attach adapter, classify (unfused).
+        let mut js_model =
+            crate::models::privacy_filter::PrivacyFilterModelJs::load(ckpt.display().to_string())
+                .unwrap();
+        js_model
+            .load_adapter(adapter_dir.display().to_string())
+            .expect("load_adapter");
+
+        let unfused_probs = {
+            let ids_u32 = js_model
+                .inner
+                .loaded
+                .tokenizer
+                .encode_sync(text, Some(false))
+                .unwrap();
+            let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+            let n = ids.len() as i64;
+            let input_ids = MxArray::from_int32(&ids, &[1, n]).unwrap();
+            let logits = js_model.inner.forward_logits(&input_ids).unwrap();
+            let logits_f32 = logits.astype(DType::Float32).unwrap();
+            let probs = Activations::softmax(&logits_f32, Some(-1)).unwrap();
+            probs.eval();
+            probs.to_float32().unwrap().to_vec()
+        };
+        let n_tokens = unfused_probs.len() / num_classes as usize;
+
+        // Fuse adapter.
+        js_model
+            .fuse_adapter(fused_dir.display().to_string())
+            .expect("fuse_adapter");
+
+        // Load fused model and classify.
+        let fused_probs = {
+            let fused_model =
+                PrivacyFilterModel::load_from_dir(&fused_dir).expect("load fused model");
+            let ids_u32 = fused_model
+                .loaded
+                .tokenizer
+                .encode_sync(text, Some(false))
+                .unwrap();
+            let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+            let n = ids.len() as i64;
+            let input_ids = MxArray::from_int32(&ids, &[1, n]).unwrap();
+            let logits = fused_model.forward_logits(&input_ids).unwrap();
+            let logits_f32 = logits.astype(DType::Float32).unwrap();
+            let probs = Activations::softmax(&logits_f32, Some(-1)).unwrap();
+            probs.eval();
+            probs.to_float32().unwrap().to_vec()
+        };
+
+        assert_eq!(
+            unfused_probs.len(),
+            fused_probs.len(),
+            "prob vector length mismatch"
+        );
+
+        // Since B=0 the fused and unfused outputs should be identical to the base
+        // model; allow 5e-3 tolerance for any floating-point rounding in the fuse.
+        let max_diff = unfused_probs
+            .iter()
+            .zip(fused_probs.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!("fuse_then_forward: n_tokens={n_tokens}, max_diff={max_diff:.2e}");
+        assert!(
+            max_diff < 5e-3,
+            "fused model softmax probs differ from unfused by {max_diff:.2e} (threshold 5e-3)"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Run the canonical PII sentence through a quantized variant and

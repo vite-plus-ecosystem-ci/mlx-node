@@ -53,7 +53,10 @@ impl<'a> Block<'a> {
     /// Run one block. Input shape `[B, T, hidden_size]`, output shape
     /// `[B, T, hidden_size]`. Dtype is preserved (bf16 for the shipped
     /// checkpoint).
-    pub fn forward(&self, hidden: &MxArray) -> Result<MxArray> {
+    ///
+    /// `training` toggles LoRA dropout inside attention `project_2d`
+    /// calls. Pass `false` for inference, `true` for fine-tuning.
+    pub fn forward(&self, hidden: &MxArray, training: bool) -> Result<MxArray> {
         let eps = self.config.rms_norm_eps as f64;
 
         // 1. Pre-attention RMSNorm.
@@ -69,7 +72,7 @@ impl<'a> Block<'a> {
             yarn_freqs: self.yarn_freqs,
         };
         let band = self.config.band_for_layer(self.layer_idx);
-        let attn_out = attn.forward(&attn_in, band)?;
+        let attn_out = attn.forward(&attn_in, band, training)?;
 
         // 3. First residual.
         let hidden = hidden.add(&attn_out)?;

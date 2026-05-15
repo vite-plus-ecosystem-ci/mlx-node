@@ -3,6 +3,16 @@
 # Local git worktrees created by superpowers:using-git-worktrees
 /.worktrees/
 
+# Local Claude Code harness state
+/.claude/
+
+# Privacy-filter scratch artifacts that may contain real exposed secrets
+# extracted from local data sources (e.g. ~/.zsh_history). Never commit.
+/scripts/zsh-history-ground-truth.json
+/scripts/zsh-history-scan.json
+/scripts/zsh-history-scan-all.json
+/scripts/zsh-strategy-comparison.json
+
 
 ### Created by https://www.gitignore.io
 ### Node ###
