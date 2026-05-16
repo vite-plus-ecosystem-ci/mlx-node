@@ -4,12 +4,32 @@
 //! wrapper that funnels the heavy `train()` / `save_adapter()` calls through
 //! `spawn_blocking` so the Node.js event loop is not stalled.
 //!
-//! The wrapper owns the trainer behind an `Arc<tokio::sync::Mutex<_>>` so it
-//! can be cloned into the blocking task. The mutex is acquired synchronously
-//! inside the blocking task via `blocking_lock()`. The underlying trainer is
-//! single-threaded by nature (MLX state cannot be operated on in parallel from
-//! multiple threads), so callers should not invoke `train()` / `saveAdapter()`
-//! concurrently from JS either — overlapping calls block on the mutex.
+//! ## Threading model & MLX stream registration
+//!
+//! MLX's metal backend keeps `CommandEncoder` instances in
+//! `static thread_local` storage (see `mlx/backend/metal/device.cpp`). The
+//! per-thread "default stream" returned by `mlx::core::default_stream(d)`
+//! is also thread-local, and `set_default_stream(s)` does *not* register
+//! the encoder for `s` on the calling thread — it just updates the
+//! per-thread default index.
+//!
+//! Practical consequence: the model is loaded synchronously inside
+//! [`PrivacyLoraTrainerJs::create`] (the NAPI factory, which runs on the
+//! Node main thread). All of that model's arrays are stream-affinitised to
+//! whatever the main thread's default GPU stream is at load time. Tokio's
+//! `spawn_blocking` runs the training closure on a separate worker thread,
+//! and unless we explicitly register the model's stream there, MLX throws
+//! "There is no Stream(gpu, N) in current thread" on the first eval.
+//!
+//! The wrapper therefore captures the GPU stream at construction time, and
+//! every `spawn_blocking` closure registers + activates that same stream on
+//! its own worker thread before touching MLX state. See
+//! [`Stream::register_on_current_thread`].
+//!
+//! The trainer itself is held behind an `Arc<tokio::sync::Mutex<_>>` so it
+//! can be cloned into the blocking task; the mutex is acquired synchronously
+//! inside the blocking task via `blocking_lock()`. Concurrent calls from JS
+//! serialize on the mutex.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +37,8 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::Mutex;
+
+use crate::stream::{DeviceType, Stream};
 
 use super::privacy_lora_trainer::{PrivacyLoraTrainConfig, PrivacyLoraTrainer};
 
@@ -112,9 +134,15 @@ impl From<PrivacyLoraTrainConfigJs> for PrivacyLoraTrainConfig {
 /// the mutex across an `.await`, so a plain `Mutex<T>` (no `Option` /
 /// take-restore dance) is enough. Concurrent calls from JS serialize on the
 /// mutex.
+///
+/// `gpu_stream` is captured on the construction thread (where the model is
+/// loaded) and re-registered on every `spawn_blocking` worker so that all
+/// MLX ops, regardless of which Tokio worker runs them, share one logical
+/// default GPU stream. See the module-level docs for the why.
 #[napi]
 pub struct PrivacyLoraTrainerJs {
     inner: Arc<Mutex<PrivacyLoraTrainer>>,
+    gpu_stream: Stream,
 }
 
 #[napi]
@@ -127,10 +155,18 @@ impl PrivacyLoraTrainerJs {
     /// during creation.
     #[napi(factory)]
     pub fn create(config: PrivacyLoraTrainConfigJs) -> Result<Self> {
+        // Capture the calling thread's default GPU stream BEFORE loading the
+        // model. The model's arrays will end up affinitised to this stream
+        // (since `PrivacyFilterModel::load_from_dir` uses MLX ops that read
+        // the per-thread default), and we re-register the same `Stream`
+        // value on every Tokio worker that subsequently runs training.
+        let gpu_stream = Stream::default(DeviceType::Gpu);
+
         let inner_cfg: PrivacyLoraTrainConfig = config.into();
         let trainer = PrivacyLoraTrainer::create(inner_cfg)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(trainer)),
+            gpu_stream,
         })
     }
 
@@ -146,11 +182,18 @@ impl PrivacyLoraTrainerJs {
     #[napi]
     pub async fn train(&self) -> Result<u32> {
         let inner = self.inner.clone();
+        let stream = self.gpu_stream;
         let result = napi::bindgen_prelude::spawn_blocking(move || {
-            // Acquire the mutex inside the blocking task. Tokio's
-            // `blocking_lock` is the right tool here — we're not on a Tokio
-            // worker thread, so awaiting `.lock()` would be wrong; and we
-            // need to block until the (single-threaded) trainer is free.
+            // Adopt the construction-thread's GPU stream on this Tokio
+            // worker. `register_on_current_thread` seeds the per-thread
+            // CommandEncoder map for `stream.index`; `make_default` sets it
+            // as the default so subsequent MLX ops use it. Without this,
+            // the autograd worker fails on first eval with "no Stream(gpu,
+            // N) in current thread" because the model's arrays carry an
+            // index that exists only in the main thread's TLS.
+            stream.register_on_current_thread();
+            stream.make_default();
+
             let mut guard = inner.blocking_lock();
             guard.train()
         })
@@ -166,7 +209,11 @@ impl PrivacyLoraTrainerJs {
     #[napi]
     pub async fn save_adapter(&self) -> Result<()> {
         let inner = self.inner.clone();
+        let stream = self.gpu_stream;
         napi::bindgen_prelude::spawn_blocking(move || {
+            stream.register_on_current_thread();
+            stream.make_default();
+
             let mut guard = inner.blocking_lock();
             guard.save_adapter()
         })

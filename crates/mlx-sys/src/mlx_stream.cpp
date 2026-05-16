@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx/backend/gpu/eval.h"
 
 // ============================================================================
 // Stream Operations (extern "C" for FFI)
@@ -49,6 +50,43 @@ void mlx_set_default_stream(mlx_stream stream) {
     std::cerr << "[MLX] Exception in set_default_stream: " << e.what() << std::endl;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in set_default_stream" << std::endl;
+  }
+}
+
+// Register an existing stream's GPU CommandEncoder in the calling thread's
+// thread_local registry. Idempotent (try_emplace under the hood).
+//
+// Why this exists:
+//   `mlx::core::default_stream(d)` lazily creates a stream the first time it
+//   is called on a given thread, but `set_default_stream(s)` does NOT seed
+//   the per-thread CommandEncoder map for an existing stream `s`. When
+//   model arrays produced on thread A are evaluated on thread B, MLX looks
+//   up the encoder for the array's `Stream(gpu, index)` in thread B's
+//   `static thread_local` map (see
+//   `mlx/backend/metal/device.cpp::get_command_encoders`) and throws
+//   "There is no Stream(gpu, N) in current thread" when it's missing.
+//
+//   Calling this shim from each worker thread (Tokio spawn_blocking, etc.)
+//   makes that worker thread accept the shared stream. Combined with a
+//   single captured stream value, it gives us "one logical default stream
+//   across all worker threads" semantics that MLX itself does not provide.
+//
+// Returns 0 on success, -1 on caught exception (e.g. Metal unavailable).
+int32_t mlx_register_stream_on_current_thread(mlx_stream stream) {
+  try {
+    auto s = from_mlx_stream_helper(stream);
+    if (s.device == mlx::core::Device::gpu) {
+      mlx::core::gpu::new_stream(s);
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] Exception in register_stream_on_current_thread: "
+              << e.what() << std::endl;
+    return -1;
+  } catch (...) {
+    std::cerr << "[MLX] Unknown exception in register_stream_on_current_thread"
+              << std::endl;
+    return -1;
   }
 }
 

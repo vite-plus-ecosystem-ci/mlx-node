@@ -57,7 +57,7 @@ mod tests {
         .unwrap();
         let targets = MxArray::from_int32(&[0, 1, 2], &[3]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // With perfect predictions, loss should be close to 0
@@ -81,7 +81,7 @@ mod tests {
         .unwrap();
         let targets = MxArray::from_int32(&[0, 1], &[2]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Loss should be high for wrong predictions
@@ -99,7 +99,7 @@ mod tests {
             MxArray::from_float32(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &[2, 4]).unwrap();
         let targets = MxArray::from_int32(&[0, 3], &[2]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // For uniform distribution with 4 classes, entropy = log(4) ≈ 1.386
@@ -118,7 +118,7 @@ mod tests {
             MxArray::from_float32(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], &[3, 3]).unwrap();
         let targets = MxArray::from_int32(&[0, -1, 2], &[3]).unwrap(); // -1 is ignored
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, Some(-1), None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, Some(-1), None, None).unwrap();
         let loss_data = loss.to_float32().unwrap();
 
         // Loss should only consider non-ignored samples
@@ -132,7 +132,7 @@ mod tests {
         let logits = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
         let targets = MxArray::from_int32(&[-100, -100], &[2]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, Some(-100), None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, Some(-100), None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // No valid tokens, but should return 0.0 not NaN
@@ -146,7 +146,7 @@ mod tests {
         let logits = MxArray::from_float32(&[2.0, -1.0, 0.0, -1.0, 2.0, 0.0], &[2, 3]).unwrap();
         let probs = MxArray::from_float32(&[0.7, 0.2, 0.1, 0.1, 0.8, 0.1], &[2, 3]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &probs, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &probs, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Manual calculation
@@ -182,7 +182,8 @@ mod tests {
         let targets = MxArray::from_int32(&[0, 1], &[2]).unwrap();
 
         let loss =
-            Losses::cross_entropy(&logits, &targets, None, None, Some(smoothing as f64)).unwrap();
+            Losses::cross_entropy(&logits, &targets, None, None, Some(smoothing as f64), None)
+                .unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Manual calculation with label smoothing
@@ -214,7 +215,7 @@ mod tests {
         let logits = MxArray::from_float32(&[2.0, 1.0, 0.1], &[1, 3]).unwrap();
         let targets = MxArray::from_int32(&[0], &[1]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Manual: loss = -log_softmax(logits)[target]
@@ -241,7 +242,7 @@ mod tests {
                     .unwrap();
             let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
-            let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+            let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
             let shape = loss.shape().unwrap();
 
             // Loss should be a scalar
@@ -547,7 +548,7 @@ mod tests {
                 .unwrap();
         let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let shape = loss.shape().unwrap();
 
         assert!(shape.is_empty(), "Loss should be scalar");
@@ -568,7 +569,7 @@ mod tests {
                 .unwrap();
         let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         assert!(loss_value > 0.0, "Loss should be positive");
@@ -586,7 +587,7 @@ mod tests {
                 .unwrap();
         let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         assert!(loss_value > 0.0, "Loss should be positive");
@@ -604,7 +605,7 @@ mod tests {
                 .unwrap();
         let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         assert!(loss_value > 0.0, "Loss should be positive");
@@ -622,7 +623,7 @@ mod tests {
                 .unwrap();
         let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // For uniform random logits with vocab_size=151936:
@@ -653,7 +654,7 @@ mod tests {
         .unwrap();
         let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
         let expected_loss = (vocab_size as f32).ln();
 
@@ -681,7 +682,7 @@ mod tests {
             MxArray::from_float32(&logits_data, &[batch_size as i64, vocab_size as i64]).unwrap();
         let targets = MxArray::from_int32(&[0, 1], &[batch_size as i64]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // With very confident predictions, loss should be very small
@@ -710,7 +711,7 @@ mod tests {
         )
         .unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         assert!(
@@ -732,7 +733,7 @@ mod tests {
         // Mix of real targets and ignored indices
         let targets = MxArray::from_int32(&[100, -1, 200, -1], &[batch_size as i64]).unwrap();
 
-        let loss = Losses::cross_entropy(&logits, &targets, None, Some(-1), None).unwrap();
+        let loss = Losses::cross_entropy(&logits, &targets, None, Some(-1), None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Loss should only consider non-ignored samples
@@ -775,9 +776,9 @@ mod tests {
         let targets = MxArray::from_int32(&[0, 2], &[2]).unwrap();
 
         // Compute loss multiple times
-        let loss1 = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss1 = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         loss1.eval();
-        let loss2 = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
+        let loss2 = Losses::cross_entropy(&logits, &targets, None, None, None, None).unwrap();
         loss2.eval();
 
         let v1 = loss1.to_float32().unwrap()[0];

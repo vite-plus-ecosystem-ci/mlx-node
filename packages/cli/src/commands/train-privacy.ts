@@ -141,7 +141,9 @@ export async function run(argv: string[]): Promise<void> {
       ? { classifierLr: parseFloatFlag('--classifier-lr', args['classifier-lr']) }
       : {}),
     ...(args['batch-size'] !== undefined ? { batchSize: parseNonNegativeInt('--batch-size', args['batch-size']) } : {}),
-    ...(args['max-seq-len'] !== undefined ? { maxSeqLen: parseNonNegativeInt('--max-seq-len', args['max-seq-len']) } : {}),
+    ...(args['max-seq-len'] !== undefined
+      ? { maxSeqLen: parseNonNegativeInt('--max-seq-len', args['max-seq-len']) }
+      : {}),
     ...(args['num-epochs'] !== undefined ? { numEpochs: parseNonNegativeInt('--num-epochs', args['num-epochs']) } : {}),
     ...(args['grad-accum-steps'] !== undefined
       ? { gradAccumSteps: parseNonNegativeInt('--grad-accum-steps', args['grad-accum-steps']) }

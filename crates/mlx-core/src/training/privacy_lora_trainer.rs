@@ -630,7 +630,18 @@ impl PrivacyLoraTrainer {
                 let logits_flat = logits_f32.reshape(&[b * t, c])?;
                 let labels_flat = labels_clone.reshape(&[b * t])?;
 
-                Losses::cross_entropy(&logits_flat, &labels_flat, None, Some(-100), Some(0.0))
+                // check_finite=Some(false): we're inside the autograd closure
+                // (value_and_grad). The logits here are tracer arrays with NULL
+                // buffers; reading scalars off them via item_at_* would SIGSEGV.
+                // The finite-check on the returned loss happens after value_and_grad.
+                Losses::cross_entropy(
+                    &logits_flat,
+                    &labels_flat,
+                    None,
+                    Some(-100),
+                    Some(0.0),
+                    Some(false),
+                )
             })();
 
             // Restore the originals BEFORE returning. The tracer arrays
@@ -655,6 +666,24 @@ impl PrivacyLoraTrainer {
             g.eval();
         }
         let loss_value = loss_array.item_at_float32(0)? as f64;
+
+        // Replaces the eager NaN/Inf check that used to live inside
+        // `Losses::cross_entropy`. Doing it here (after value_and_grad has
+        // evaluated the graph) is the only place the loss value is actually
+        // materialized — inside the autograd closure the arrays are tracers
+        // with NULL buffers and reading them SIGSEGVs.
+        if !loss_value.is_finite() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!(
+                    "Non-finite loss after value_and_grad (loss={}). \
+                     Indicates numerical instability in the forward pass — \
+                     consider reducing learning rate or strengthening gradient clipping.",
+                    loss_value
+                ),
+            ));
+        }
+
         Ok((loss_value, grads))
     }
 
@@ -930,8 +959,8 @@ mod tests {
         let labels_data: Vec<i32> = vec![0, 1, -100];
         let labels = MxArray::from_int32(&labels_data, &[3]).unwrap();
 
-        let loss =
-            Losses::cross_entropy(&logits, &labels, None, Some(-100), Some(0.0)).expect("loss");
+        let loss = Losses::cross_entropy(&logits, &labels, None, Some(-100), Some(0.0), None)
+            .expect("loss");
         loss.eval();
         let v = loss.item_at_float32(0).unwrap();
 

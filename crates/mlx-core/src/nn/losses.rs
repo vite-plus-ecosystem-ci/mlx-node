@@ -11,12 +11,21 @@ pub struct Losses;
 impl Losses {
     /// Cross-entropy loss
     /// Expects logits of shape [batch_size, vocab_size] and targets of shape [batch_size]
+    ///
+    /// `check_finite` (default `Some(true)`) gates an eager NaN/Inf check on
+    /// `logits` that uses `item_at_float32`. That check MUST be disabled when
+    /// `cross_entropy` is called inside an autograd closure (e.g.
+    /// `value_and_grad`), because the logits there are tracer arrays whose
+    /// buffers are NULL until the full graph is evaluated — reading them
+    /// SIGSEGVs. Trainers should pass `Some(false)` and do a finite-check on
+    /// the loss value returned by `value_and_grad` instead.
     pub fn cross_entropy(
         logits: &MxArray,
         targets: &MxArray,
         _num_classes: Option<i32>, // Not used currently, but kept for API compatibility
         ignore_index: Option<i32>,
         label_smoothing: Option<f64>,
+        check_finite: Option<bool>,
     ) -> Result<MxArray> {
         let smoothing = label_smoothing.unwrap_or(0.0);
 
@@ -27,35 +36,42 @@ impl Losses {
             ));
         }
 
-        // Check for NaN/Inf in logits which would cause loss computation to fail
-        // This provides early detection of numerical instability in the forward pass
-        let logits_max = logits.max(None, None)?;
-        let logits_min = logits.min(None, None)?;
-        logits_max.eval();
-        logits_min.eval();
+        if check_finite.unwrap_or(true) {
+            // Check for NaN/Inf in logits which would cause loss computation to fail.
+            // This provides early detection of numerical instability in the forward
+            // pass. Skipped when called inside an autograd closure (see doc above).
+            let logits_max = logits.max(None, None)?;
+            let logits_min = logits.min(None, None)?;
+            logits_max.eval();
+            logits_min.eval();
 
-        let max_val = logits_max.item_at_float32(0)?;
-        let min_val = logits_min.item_at_float32(0)?;
+            let max_val = logits_max.item_at_float32(0)?;
+            let min_val = logits_min.item_at_float32(0)?;
 
-        if max_val.is_nan() || max_val.is_infinite() || min_val.is_nan() || min_val.is_infinite() {
-            return Err(Error::new(
-                Status::GenericFailure,
-                format!(
-                    "Logits contain NaN or Inf values (min={}, max={}). \
-                    This indicates numerical instability in the forward pass. \
-                    Consider reducing learning rate or adding gradient clipping.",
-                    min_val, max_val
-                ),
-            ));
-        }
+            if max_val.is_nan()
+                || max_val.is_infinite()
+                || min_val.is_nan()
+                || min_val.is_infinite()
+            {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Logits contain NaN or Inf values (min={}, max={}). \
+                        This indicates numerical instability in the forward pass. \
+                        Consider reducing learning rate or adding gradient clipping.",
+                        min_val, max_val
+                    ),
+                ));
+            }
 
-        // Warn if logits are very large (potential overflow risk)
-        if max_val > 50.0 || min_val < -50.0 {
-            tracing::warn!(
-                "Large logits detected (min={}, max={}), potential numerical instability",
-                min_val,
-                max_val
-            );
+            // Warn if logits are very large (potential overflow risk)
+            if max_val > 50.0 || min_val < -50.0 {
+                tracing::warn!(
+                    "Large logits detected (min={}, max={}), potential numerical instability",
+                    min_val,
+                    max_val
+                );
+            }
         }
 
         // Check if targets are probabilities (same ndim as logits) or class indices

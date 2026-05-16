@@ -49,7 +49,34 @@ impl Stream {
     pub fn make_default(&self) {
         unsafe { sys::mlx_set_default_stream(self.inner) }
     }
+
+    /// Register this stream's GPU `CommandEncoder` in the current thread's
+    /// thread_local registry.
+    ///
+    /// MLX's metal backend keeps `CommandEncoder`s in `static thread_local`
+    /// storage (see `mlx/backend/metal/device.cpp::get_command_encoders`).
+    /// `set_default_stream(s)` only updates the per-thread default *index*;
+    /// it does NOT seed the encoder map. When arrays produced on thread A
+    /// are evaluated on thread B, MLX looks up the encoder for the array's
+    /// stream in thread B's map and throws "There is no Stream(gpu, N)
+    /// in current thread" if it's missing.
+    ///
+    /// Call this on each worker thread (e.g. inside `spawn_blocking`) that
+    /// needs to participate in evaluation of arrays whose original stream
+    /// was created on a different thread. Idempotent.
+    pub fn register_on_current_thread(&self) {
+        unsafe { sys::mlx_register_stream_on_current_thread(self.inner) };
+    }
 }
+
+// SAFETY: `Stream` is a value type — just `(index, device_type)` — and the
+// `mlx::core::Stream` it identifies is owned globally by MLX's scheduler.
+// All FFI shims that consume this struct either (a) treat it as an opaque
+// identifier or (b) re-resolve to the global `Stream` via index. The struct
+// itself contains no thread-bound pointers, so sharing across threads is
+// safe.
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
 
 /// Stream context manager (RAII pattern)
 ///

@@ -117,12 +117,16 @@ pub(crate) fn compute_sft_loss_and_gradients(
             let ignore_idx = loss_config_clone.ignore_index.unwrap_or(-100);
             let label_smoothing = loss_config_clone.label_smoothing.unwrap_or(0.0);
 
+            // check_finite=Some(false): we're inside the autograd closure
+            // (value_and_grad). The logits here are tracer arrays with NULL
+            // buffers; reading scalars off them via item_at_* would SIGSEGV.
             Losses::cross_entropy(
                 &logits_flat,
                 &labels_flat,
                 None,
                 Some(ignore_idx),
                 Some(label_smoothing),
+                Some(false),
             )
         };
 
@@ -140,6 +144,13 @@ pub(crate) fn compute_sft_loss_and_gradients(
 
         // Extract values before scope ends
         let loss_val = loss_array.item_at_float32(0)? as f64;
+        if !loss_val.is_finite() {
+            return Err(Error::from_reason(format!(
+                "Non-finite SFT loss after value_and_grad (loss={loss_val}). \
+                 Indicates numerical instability in the forward pass — \
+                 consider reducing learning rate or strengthening gradient clipping."
+            )));
+        }
         let grads: HashMap<String, MxArray> = param_names
             .into_iter()
             .enumerate()

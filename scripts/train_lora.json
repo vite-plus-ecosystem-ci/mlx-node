@@ -1,0 +1,17 @@
+{
+  "modelPath": ".cache/models/privacy-filter",
+  "dataPath": "/Volumes/P4510/.cache/datasets/curated/train.tokenized.jsonl",
+  "outputDir": ".cache/adapters/privacy-lora-v1",
+  "rank": 16,
+  "alpha": 32,
+  "dropout": 0.05,
+  "loraLr": 1e-4,
+  "classifierLr": 5e-5,
+  "batchSize": 4,
+  "maxSeqLen": 256,
+  "numEpochs": 3,
+  "gradAccumSteps": 4,
+  "gradClip": 1.0,
+  "saveEvery": 200,
+  "padTokenId": 0
+}

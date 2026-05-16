@@ -1131,6 +1131,11 @@ export type PrivacyFilterModelJs = PrivacyFilterModel;
  * the mutex across an `.await`, so a plain `Mutex<T>` (no `Option` /
  * take-restore dance) is enough. Concurrent calls from JS serialize on the
  * mutex.
+ *
+ * `gpu_stream` is captured on the construction thread (where the model is
+ * loaded) and re-registered on every `spawn_blocking` worker so that all
+ * MLX ops, regardless of which Tokio worker runs them, share one logical
+ * default GPU stream. See the module-level docs for the why.
  */
 export declare class PrivacyLoraTrainerJs {
   /**
