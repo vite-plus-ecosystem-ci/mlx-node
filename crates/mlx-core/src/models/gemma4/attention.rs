@@ -7,6 +7,7 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::nn::{Linear, RMSNorm, RoPE};
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -467,6 +468,7 @@ impl Gemma4Attention {
     ///
     /// Output: `[1, seq_len, hidden_size]` so the decoder layer's
     /// `apply_ffn_ple_scalar` tail can consume it unchanged.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
@@ -848,6 +850,7 @@ impl Gemma4Attention {
     ///
     /// Output: `[1, seq_len, hidden_size]`, ready for the decoder
     /// layer's `apply_ffn_ple_scalar` tail.
+    #[cfg(feature = "full")]
     pub fn forward_paged_shared(
         &self,
         x: &MxArray,

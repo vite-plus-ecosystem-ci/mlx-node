@@ -66,6 +66,19 @@ impl LinearProj {
             LinearProj::Quantized(ql) => ql.get_weight().clone(),
         }
     }
+
+    /// Return the bias of a `LinearProj::Standard` projection.
+    ///
+    /// Returns `None` for both biasless Standard projections and any
+    /// Quantized variant (quantized linears expose quantization scale
+    /// biases via `QuantizedLinear::get_biases`, which is a different
+    /// concept and not what callers of this method want).
+    pub fn get_bias(&self) -> Option<MxArray> {
+        match self {
+            LinearProj::Standard(l) => l.get_bias(),
+            LinearProj::Quantized(_) => None,
+        }
+    }
 }
 
 /// An MLP that can be either standard or quantized.

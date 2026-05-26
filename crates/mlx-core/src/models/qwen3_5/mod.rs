@@ -8,6 +8,7 @@ pub mod gated_delta;
 pub mod gated_delta_net;
 pub mod layer_cache;
 pub mod model;
+#[cfg(feature = "full")]
 pub(crate) mod paged_forward;
 pub mod persistence;
 pub(crate) mod persistence_common;

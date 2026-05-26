@@ -15,6 +15,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
 use crate::transformer::{
@@ -285,6 +286,7 @@ pub(crate) struct Gemma4Inner {
     /// global attention layers through this adapter. Defaults to `None`
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
+    #[cfg(feature = "full")]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
@@ -502,6 +504,7 @@ struct Gemma4PagedTurnPreparation {
     sliding_primed_prefix_len: u32,
 }
 
+#[cfg(feature = "full")]
 fn compute_gemma4_paged_prefix_block_hash(
     tokens: &[u32],
     prefix_len: u32,
@@ -737,6 +740,7 @@ impl Gemma4Inner {
         // Cache dtype: BFloat16 (Gemma4's production dtype). KV-shared layers
         // are aliases and do not consume physical pool slots; they resolve to
         // their anchor's group ordinal through `compute_layer_kinds`.
+        #[cfg(feature = "full")]
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             let block_size = config.paged_block_size.unwrap_or(16);
             let kv_cache_specs =
@@ -883,6 +887,7 @@ impl Gemma4Inner {
             caches: None,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            #[cfg(feature = "full")]
             paged_adapter,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
@@ -1028,6 +1033,7 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn find_gemma4_sliding_prefix_checkpoint(
         &self,
         tokens: &[u32],
@@ -1116,6 +1122,7 @@ impl Gemma4Inner {
         Ok(best_hit)
     }
 
+    #[cfg(feature = "full")]
     fn remember_gemma4_sliding_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1190,6 +1197,7 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn remember_gemma4_sliding_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1260,6 +1268,7 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn remember_gemma4_sliding_materialized_prompt_boundary_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1321,6 +1330,7 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn maybe_remember_gemma4_sliding_decode_boundary_checkpoint(
         &mut self,
         trace_label: &str,
@@ -1364,6 +1374,7 @@ impl Gemma4Inner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
         &mut self,
         trace_label: &str,
@@ -1401,6 +1412,7 @@ impl Gemma4Inner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn prepare_gemma4_sliding_prefix_state(
         &mut self,
         tokens: &[u32],
@@ -1761,6 +1773,7 @@ impl Gemma4Inner {
         // off-by-default behavior is byte-identical to before this
         // commit. Vision turns always use the flat path (paged dispatch
         // is text-only at this stage).
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() && !has_images {
             return self.chat_sync_core_paged(
                 tokens,
@@ -2260,6 +2273,7 @@ impl Gemma4Inner {
         // Block-paged streaming dispatch: same gate as the non-streaming
         // path. See `chat_sync_core` for the rationale (text-only at
         // this stage, flat path for vision turns).
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() && !has_images {
             return self.chat_stream_sync_core_paged(
                 tokens,
@@ -2629,6 +2643,7 @@ impl Gemma4Inner {
     //   prompt token is always recomputed to produce logits.
     // =================================================================
 
+    #[cfg(feature = "full")]
     fn suppress_large_sliding_prefix_reuse_if_needed(
         &mut self,
         trace_label: &str,
@@ -2693,6 +2708,7 @@ impl Gemma4Inner {
         Ok(true)
     }
 
+    #[cfg(feature = "full")]
     fn prepare_gemma4_paged_turn(
         &mut self,
         trace_label: &str,
@@ -2815,6 +2831,7 @@ impl Gemma4Inner {
     /// images. The caller has already done image processing /
     /// expansion / template rendering, so this method receives a
     /// fully-baked `tokens` vector and dispatches the paged forward.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged(
         &mut self,
@@ -2989,6 +3006,7 @@ impl Gemma4Inner {
     /// Inner forward + decode loop for [`Self::chat_sync_core_paged`].
     /// Split out so the outer can wrap with adapter `release_request`
     /// on either path.
+    #[cfg(feature = "full")]
     fn chat_sync_core_paged_inner(
         &mut self,
         tokens: &[u32],
@@ -3081,6 +3099,7 @@ impl Gemma4Inner {
     }
 
     /// Streaming variant of [`Self::chat_sync_core_paged`].
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged(
         &mut self,
@@ -3296,6 +3315,7 @@ impl Gemma4Inner {
     /// Inner streaming forward + decode loop for
     /// [`Self::chat_stream_sync_core_paged`]. Emits text deltas via the
     /// stream callback as tokens are produced.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged_inner(
         &mut self,
@@ -3505,6 +3525,7 @@ impl Gemma4Inner {
     /// `<turn|>` stop signal to be missed and the decoder to fall into
     /// the all-zero-input cycle (`mean(V)` attention output → `id+1`
     /// counting cascade).
+    #[cfg(feature = "full")]
     fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
@@ -3917,6 +3938,7 @@ impl Gemma4Inner {
     /// on the paged adapter so `update_keys_values`'s alignment check
     /// (`first_logical_position == current_token_count - chunk.len()`)
     /// passes.
+    #[cfg(feature = "full")]
     fn run_paged_prefill_layer_loop(
         &mut self,
         chunk_tokens: &[u32],
@@ -4157,6 +4179,7 @@ impl Gemma4Inner {
     }
 
     /// Run one paged decode step: feed `[token_id]` through the model.
+    #[cfg(feature = "full")]
     fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
         let first_logical_position = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
@@ -4326,6 +4349,7 @@ impl Gemma4Inner {
     /// Global layers run as read-only Q projections against their existing
     /// paged K/V. That keeps hidden states flowing into later sliding layers
     /// without rebuilding throwaway global K/V for the cached prefix.
+    #[cfg(feature = "full")]
     fn run_sliding_only_prefill(
         &mut self,
         prefix_tokens: &[u32],
@@ -4440,6 +4464,7 @@ impl Gemma4Inner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn run_sliding_prefix_restore_layer_loop(
         &mut self,
         chunk_tokens: &[u32],
@@ -4858,6 +4883,7 @@ impl Gemma4Inner {
         // suffix (just the delta tokens) gets the same SDPA reduction
         // order as turn 1's prefill→decode boundary. Mirrors Qwen3's
         // `chat_tokens_delta_sync` paged dispatch.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             let mut full_token_history = self.cached_token_history.clone();
             full_token_history.extend(delta_tokens.iter().copied());
@@ -5288,6 +5314,7 @@ impl Gemma4Inner {
         // history (cached + delta) through the paged streaming pipeline
         // and let `find_cached_prefix` discover the prefix that turn 1
         // registered for reuse.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             let mut full_token_history = self.cached_token_history.clone();
             full_token_history.extend(delta_tokens.iter().copied());

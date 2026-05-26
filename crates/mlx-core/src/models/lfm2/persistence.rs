@@ -474,7 +474,10 @@ impl Lfm2Model {
                 let (inner, weight_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let config = inner.config.clone();
+                #[cfg(feature = "full")]
                 let paged_active = inner.paged_adapter.is_some();
+                #[cfg(not(feature = "full"))]
+                let paged_active = false;
                 Ok((inner, (config, cache_limit_guard, paged_active)))
             },
             handle_lfm2_cmd,

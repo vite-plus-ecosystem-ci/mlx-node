@@ -1379,7 +1379,10 @@ impl Gemma4Model {
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
+                #[cfg(feature = "full")]
                 let paged_active = inner.paged_adapter.is_some();
+                #[cfg(not(feature = "full"))]
+                let paged_active = false;
                 Ok((
                     inner,
                     (model_id, has_vision, cache_limit_guard, paged_active),
