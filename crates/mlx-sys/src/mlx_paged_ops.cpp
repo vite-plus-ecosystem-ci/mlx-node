@@ -32,7 +32,15 @@
 #include <utility>
 #include <vector>
 
+#if !defined(__wasi__)
+// `mlx/backend/metal/device.h` transitively includes `<Metal/Metal.hpp>`,
+// which is unavailable on the WASM/WebGPU build. We only need this
+// header inside the Metal-only `eval_gpu` paths below. We detect the
+// non-Metal build by `__wasi__` (auto-defined by the WASI clang driver)
+// because mlx-sys/build.rs does not currently pass `-DMLX_USE_METAL` on
+// the native cc::Build path.
 #include "mlx/backend/metal/device.h"
+#endif
 #include "mlx/compile.h"
 #include "mlx/transforms_impl.h"
 
@@ -98,10 +106,13 @@ mlx::core::Dtype cache_dtype_for_kv_dtype(KvDtype kv_dtype) {
   return mlx::core::bfloat16;
 }
 
+#if !defined(__wasi__)
 // Translate the public `KvDtype` enum into the dispatch-internal
 // `paged::KvDtype` so we can call `mlx::core::fast::paged::dispatch_*`.
 // Phase 2: both enums have the same wire values; the cast just
-// satisfies the type system.
+// satisfies the type system. The internal `paged::KvDtype` only exists
+// when the Metal-backed dispatcher is compiled in (see
+// `mlx_paged_dispatch.h`), so this helper is Metal-only too.
 mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
   switch (d) {
     case KvDtype::Fp16:
@@ -113,6 +124,7 @@ mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
   }
   return mlx::core::fast::paged::KvDtype::Bf16;
 }
+#endif // !__wasi__
 
 // Reject non-row-contiguous or nonzero-offset views at the factory.
 //
@@ -826,6 +838,7 @@ void PagedKVWrite::eval_gpu(
     }
   }
 
+#if !defined(__wasi__)
   // Phase 2: dispatch onto MLX's command encoder. MLX's dependency
   // tracking handles ordering against any preceding/following ops.
   auto& s = stream();
@@ -848,6 +861,18 @@ void PagedKVWrite::eval_gpu(
       block_size_,
       x_pack_,
       to_paged_dtype(kv_dtype_));
+#else
+  // Non-Metal build (WASM/WebGPU): the paged-attention dispatcher in
+  // `mlx_paged_dispatch.cpp` is gated out because it relies on
+  // `mlx/backend/metal/device.h`. Production WASM forward paths should
+  // never reach this primitive — Qwen3.5's WASM/WebGPU path uses MLX's
+  // own backend rather than the compile-traceable C++ paged primitives.
+  // Throw so any mistaken dispatch surfaces loudly.
+  (void)num_tokens;
+  throw std::runtime_error(
+      "PagedKVWrite::eval_gpu is Metal-only; the compile-traceable C++ "
+      "paged primitive has no WebGPU/WASM dispatch yet.");
+#endif // !__wasi__
 }
 
 std::vector<array> PagedKVWrite::vjp(
@@ -1036,6 +1061,7 @@ void PagedAttention::eval_gpu(
   // the buffer must exist by the time the dispatch runs.
   out.set_data(allocator::malloc(out.nbytes()));
 
+#if !defined(__wasi__)
   // Phase 2: dispatch onto MLX's command encoder. MLX's dependency
   // tracking handles ordering against any preceding/following ops,
   // so callers no longer need to `eval()` ancestors before invoking
@@ -1067,6 +1093,17 @@ void PagedAttention::eval_gpu(
       softcap_,
       sliding_window_,
       to_paged_dtype(kv_dtype_));
+#else
+  // Non-Metal build (WASM/WebGPU): see the matching comment in
+  // `PagedKVWrite::eval_gpu`. The compile-traceable C++ paged primitive
+  // is Metal-only; WASM forward paths take a different code path.
+  (void)num_seqs;
+  (void)max_blocks_per_seq;
+  (void)max_context_len;
+  throw std::runtime_error(
+      "PagedAttention::eval_gpu is Metal-only; the compile-traceable C++ "
+      "paged primitive has no WebGPU/WASM dispatch yet.");
+#endif // !__wasi__
 }
 
 std::vector<array> PagedAttention::vjp(

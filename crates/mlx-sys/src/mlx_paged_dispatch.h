@@ -32,6 +32,22 @@
 
 #pragma once
 
+// The kernel-dispatch wrappers declared in this header take
+// `mlx::core::metal::CommandEncoder&` / `mlx::core::metal::Device&` and
+// transitively pull in `<Metal/Metal.hpp>` via
+// `mlx/backend/metal/device.h`. They are only callable when the Metal
+// backend is built; on the WASM/WebGPU build the entire header is empty
+// so translation units that include it (e.g. `mlx_paged_ops.cpp`) still
+// compile while their `eval_gpu` paths are themselves Metal-gated.
+//
+// Build detection: we key off `__wasi__` (auto-defined by the WASI
+// clang driver) rather than `MLX_USE_METAL`, because mlx-sys/build.rs
+// does not currently `.define()` `MLX_USE_METAL` on the native cc::Build
+// path. The negation `!defined(__wasi__)` is therefore TRUE on the
+// macOS/Metal build (preserving the pre-change byte-identical behavior)
+// and FALSE on the WASI/WebGPU build (where Metal/Metal.hpp is absent).
+#if !defined(__wasi__)
+
 #include <cstdint>
 
 #include "mlx/array.h"
@@ -128,3 +144,5 @@ void dispatch_paged_attention_auto(
     KvDtype kv_dtype);
 
 } // namespace mlx::core::fast::paged
+
+#endif // !__wasi__
