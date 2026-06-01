@@ -927,11 +927,49 @@ pub(crate) fn build_qwen35_recipe(
     default_bits: i32,
     default_group_size: i32,
 ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
-    let high_bits = (default_bits + 2).min(8);
-    let down_proj_bits = (default_bits + 1).min(8);
+    // MLX quantize supports {2, 3, 4, 5, 6, 8} (no 7).
+    let snap_bits = |b: i32| -> i32 {
+        match b {
+            b if b <= 2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 5,
+            6 => 6,
+            7 => 8,
+            _ => 8,
+        }
+    };
+    let high_bits = snap_bits((default_bits + 2).min(8));
+    let down_proj_bits = snap_bits((default_bits + 1).min(8));
+    let embed_bits = snap_bits(default_bits + 2);
+    let lm_head_bits = snap_bits(default_bits + 3);
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
+        // Handle embed_tokens and lm_head BEFORE `should_quantize` (which
+        // skips them). Under `--q-mode nvfp4` the global default is NVFP4
+        // 4-bit gs=16; loading these two as bare bf16 silently dispatches
+        // the inference path through paths that expect quantized data on
+        // hybrid Qwen3.5/3.6 models — empirically the model loads but
+        // generates garbage. Matches `build_unsloth_recipe`'s treatment
+        // and Unsloth's NVFP4_K_XL on-disk layout (embed_tokens at
+        // 6-bit affine gs=64, lm_head at 8-bit affine gs=64 with
+        // default_bits=4, gs=64).
+        if key.contains("embed_tokens") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: embed_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: lm_head_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+
         if !should_quantize(key) {
             return QuantDecision::Skip;
         }
@@ -945,16 +983,31 @@ pub(crate) fn build_qwen35_recipe(
             };
         }
 
-        // ssm_out (linear_attn.out_proj): "dramatically increases KLD" — skip entirely.
-        // Disk savings are minuscule and quality impact is severe.
-        if key.contains("linear_attn.out_proj") {
+        // Skip the non-AWQ-correctable attention outputs entirely:
+        // - `linear_attn.out_proj`: KLD ~6.0 — worst tensor in hybrid models
+        // - `self_attn.o_proj`: KLD ~1.5 — feeds the residual without a
+        //   layernorm in front, so we cannot pre-scale weights via AWQ;
+        //   quantizing degrades coherence end-to-end. Unsloth keeps both at
+        //   bf16 for the same reason (build_unsloth_recipe).
+        //
+        // Prior to 2026-05-19 the `is_attn_sensitive` predicate below was
+        // `key.contains("self_attn.")`, which silently matched o_proj and
+        // quantized it at high_bits. Under `--q-mode nvfp4` that produced
+        // checkpoints that loaded cleanly but generated garbage — the
+        // recipe path's known landmine on hybrid Qwen3.5/3.6 models.
+        if key.contains("linear_attn.out_proj") || key.contains("self_attn.o_proj") {
             return QuantDecision::Skip;
         }
 
-        // Attention projections (q_proj, k_proj, v_proj, o_proj) and
-        // remaining SSM-sensitive weights (in_proj_qkv, in_proj_z).
-        // Note: in_proj_a/b and A_log/dt_bias are already excluded by should_quantize().
-        let is_attn_sensitive = key.contains("self_attn.")
+        // AWQ-correctable attention/SSM projections — input_layernorm
+        // absorbs an inverse scale, so high_bits affine is near-lossless
+        // even without an imatrix. Includes `q_proj`, `k_proj`, `v_proj`
+        // (NOT `o_proj`), `linear_attn.in_proj_qkv`, and
+        // `linear_attn.in_proj_z`. `in_proj_a/b` and `A_log`/`dt_bias` are
+        // already excluded by `should_quantize`.
+        let is_attn_sensitive = key.contains("self_attn.q_proj")
+            || key.contains("self_attn.k_proj")
+            || key.contains("self_attn.v_proj")
             || key.contains("linear_attn.in_proj_qkv")
             || key.contains("linear_attn.in_proj_z");
 
@@ -2196,4 +2249,1390 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
         }
     }
     max_layer.map_or(0, |m| m + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convenience: classify a key under a given mode.
+    fn classify(
+        predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync),
+        key: &str,
+    ) -> QuantDecision {
+        predicate(key)
+    }
+
+    fn assert_skip(predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync), key: &str) {
+        match classify(predicate, key) {
+            QuantDecision::Skip => {}
+            other => panic!("expected Skip for {key}, got {other:?}"),
+        }
+    }
+
+    fn assert_custom(
+        predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync),
+        key: &str,
+        expect_bits: i32,
+        expect_group: i32,
+        expect_mode: &str,
+    ) {
+        match classify(predicate, key) {
+            QuantDecision::Custom {
+                bits,
+                group_size,
+                mode,
+            } => {
+                assert_eq!(bits, expect_bits, "bits mismatch for {key}");
+                assert_eq!(group_size, expect_group, "group_size mismatch for {key}");
+                assert_eq!(mode, expect_mode, "mode mismatch for {key}");
+            }
+            other => panic!(
+                "expected Custom({expect_bits},{expect_group},{expect_mode}) for {key}, got {other:?}"
+            ),
+        }
+    }
+
+    /// Tensor inventory mirroring the shipped privacy-filter checkpoint.
+    fn inventory_keys() -> Vec<&'static str> {
+        vec![
+            // Top-level
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "score.weight",
+            "score.bias",
+            // Per-layer (layer 0; predicate is layer-agnostic)
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.k_proj.bias",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.v_proj.bias",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.o_proj.bias",
+            "model.layers.0.self_attn.sinks",
+            "model.layers.0.mlp.router.weight",
+            "model.layers.0.mlp.router.bias",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.mlp.experts.down_proj_bias",
+        ]
+    }
+
+    /// Keys we expect the predicate to **always** skip, regardless of mode.
+    fn always_skip_keys() -> Vec<&'static str> {
+        vec![
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "score.weight",
+            "score.bias",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.self_attn.k_proj.bias",
+            "model.layers.0.self_attn.v_proj.bias",
+            "model.layers.0.self_attn.o_proj.bias",
+            "model.layers.0.self_attn.sinks",
+            "model.layers.0.mlp.router.bias",
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            "model.layers.0.mlp.experts.down_proj_bias",
+        ]
+    }
+
+    /// Keys we expect to be quantized at default (bits, group_size, mode) in any mode.
+    fn always_quantize_at_default_keys() -> Vec<&'static str> {
+        vec![
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+        ]
+    }
+
+    #[test]
+    fn privacy_filter_predicate_affine_default_recipe() {
+        let predicate = build_privacy_filter_predicate(4, 64, "affine");
+        // Projections + experts at default
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 4, 64, "affine");
+        }
+        // Router quantized at 8-bit affine in affine mode
+        assert_custom(
+            &*predicate,
+            "model.layers.0.mlp.router.weight",
+            8,
+            64,
+            "affine",
+        );
+        // Always-skip set
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+        // Sanity: every inventory key got a decision (no panic)
+        for key in inventory_keys() {
+            let _ = classify(&*predicate, key);
+        }
+    }
+
+    #[test]
+    fn privacy_filter_predicate_mxfp4_skips_router() {
+        let predicate = build_privacy_filter_predicate(4, 32, "mxfp4");
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 4, 32, "mxfp4");
+        }
+        // Router skipped under FP modes
+        assert_skip(&*predicate, "model.layers.0.mlp.router.weight");
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+    }
+
+    #[test]
+    fn privacy_filter_predicate_mxfp8_skips_router() {
+        let predicate = build_privacy_filter_predicate(8, 32, "mxfp8");
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 8, 32, "mxfp8");
+        }
+        assert_skip(&*predicate, "model.layers.0.mlp.router.weight");
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+    }
+
+    #[test]
+    fn privacy_filter_predicate_nvfp4_skips_router() {
+        let predicate = build_privacy_filter_predicate(4, 16, "nvfp4");
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 4, 16, "nvfp4");
+        }
+        assert_skip(&*predicate, "model.layers.0.mlp.router.weight");
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+    }
+
+    /// Predicate applies to any layer index, not just layer 0.
+    #[test]
+    fn privacy_filter_predicate_layer_agnostic() {
+        let predicate = build_privacy_filter_predicate(8, 32, "mxfp8");
+        for layer in [0_usize, 3, 7] {
+            assert_custom(
+                &*predicate,
+                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                8,
+                32,
+                "mxfp8",
+            );
+            assert_custom(
+                &*predicate,
+                &format!("model.layers.{layer}.mlp.experts.down_proj"),
+                8,
+                32,
+                "mxfp8",
+            );
+            assert_skip(
+                &*predicate,
+                &format!("model.layers.{layer}.mlp.router.weight"),
+            );
+            assert_skip(
+                &*predicate,
+                &format!("model.layers.{layer}.input_layernorm.weight"),
+            );
+        }
+    }
+
+    /// Routers can have substring `router` appearing elsewhere — make sure we
+    /// only match `.mlp.router.weight` exactly.
+    #[test]
+    fn privacy_filter_predicate_router_match_is_exact() {
+        let predicate = build_privacy_filter_predicate(4, 32, "mxfp4");
+        // A hypothetical key containing "router" but not the right suffix.
+        assert_skip(&*predicate, "model.layers.0.mlp.router.bias");
+    }
+
+    fn const_predicate(
+        decision: QuantDecision,
+    ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
+        Box::new(move |_key: &str| decision.clone())
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_passes_through_skip() {
+        let wrapped = apply_mxfp_upgrade(const_predicate(QuantDecision::Skip), 8);
+        assert_eq!(wrapped("model.embed_tokens.weight"), QuantDecision::Skip);
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Skip
+        );
+        assert_eq!(wrapped(""), QuantDecision::Skip);
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_promotes_default_with_8_bits() {
+        let wrapped = apply_mxfp_upgrade(const_predicate(QuantDecision::Default), 8);
+        assert_eq!(
+            wrapped("model.layers.0.mlp.up_proj.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 32,
+                mode: "mxfp8".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_promotes_default_with_4_bits() {
+        let wrapped = apply_mxfp_upgrade(const_predicate(QuantDecision::Default), 4);
+        assert_eq!(
+            wrapped("model.layers.0.mlp.up_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_default_with_other_bits() {
+        for default_bits in [3, 5, 6] {
+            let wrapped = apply_mxfp_upgrade(const_predicate(QuantDecision::Default), default_bits);
+            assert_eq!(
+                wrapped("model.layers.0.mlp.up_proj.weight"),
+                QuantDecision::Default,
+                "default_bits = {default_bits} should leave Default unchanged",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_upgrades_custom_8bit_to_mxfp8() {
+        // default_bits=3 to prove the Custom arm doesn't read default_bits.
+        let wrapped = apply_mxfp_upgrade(
+            const_predicate(QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }),
+            3,
+        );
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 32,
+                mode: "mxfp8".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_upgrades_custom_4bit_to_mxfp4() {
+        let wrapped = apply_mxfp_upgrade(
+            const_predicate(QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }),
+            3,
+        );
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_other_custom_bits() {
+        for bits in [2, 3, 5, 6, 7] {
+            let original = QuantDecision::Custom {
+                bits,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
+            let wrapped = apply_mxfp_upgrade(const_predicate(original.clone()), 8);
+            assert_eq!(
+                wrapped("model.layers.0.mlp.down_proj.weight"),
+                original,
+                "Custom {{ bits: {bits}, .. }} should pass through unchanged",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_threads_key_through_to_inner_predicate() {
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = Box::new(|key: &str| {
+            if key.contains("q_proj") {
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                }
+            } else if key.contains("gate_proj") {
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                }
+            } else {
+                QuantDecision::Default
+            }
+        });
+        let wrapped = apply_mxfp_upgrade(inner, 8);
+
+        assert_eq!(
+            wrapped("layer.0.q_proj"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 32,
+                mode: "mxfp8".to_string(),
+            }
+        );
+        assert_eq!(
+            wrapped("layer.0.gate_proj"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            }
+        );
+        // Default → default_bits=8 → mxfp8
+        assert_eq!(
+            wrapped("layer.0.unknown"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 32,
+                mode: "mxfp8".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_lm_head_8bit_decision() {
+        // Dense Qwen3.5 lm_head loader is affine-only (Linear::load_quantized
+        // hardcodes "affine"); the unsloth recipe emits an 8-bit affine
+        // decision for lm_head and apply_mxfp_upgrade must NOT promote that to
+        // mxfp8, otherwise the on-disk weights are silently mis-dequantized.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 8);
+        assert_eq!(
+            wrapped("lm_head.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+            "lm_head must not be upgraded to mxfp8"
+        );
+        // Also check the language_model-prefixed naming variant.
+        assert_eq!(
+            wrapped("language_model.lm_head.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_router_proj_decision() {
+        // Gemma4 router.proj uses Linear::load_quantized (affine-only); the
+        // upgrade must skip it for the same reason as lm_head.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 8);
+        assert_eq!(
+            wrapped("language_model.model.layers.0.router.proj.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+            "router.proj must not be upgraded to mxfp8"
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_embed_tokens_decision() {
+        // Gemma4 (and others) load `embed_tokens` via
+        // `Embedding::load_quantized`, which calls
+        // `mlx_dequantize(..., "affine")` unconditionally. The upgrade must
+        // NOT promote these keys to mxfp4/mxfp8.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 8);
+        for key in [
+            "embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "language_model.model.embed_tokens.weight",
+            // PLE embedding (Gemma4 per-layer-embedding).
+            "embed_tokens_per_layer.weight",
+            "model.embed_tokens_per_layer.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must not be upgraded to mxfp8"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_embed_tokens_under_4bit_promotion() {
+        // Same check but for the 4-bit -> mxfp4 promotion path.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Default);
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+        // A non-excluded key DOES get promoted.
+        assert_eq!(
+            wrapped("layers.0.mlp.up_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            }
+        );
+        // embed_tokens / embed_tokens_per_layer are passed through (Default
+        // remains Default — the no-recipe legacy block downgrades these to
+        // affine separately).
+        assert_eq!(wrapped("embed_tokens.weight"), QuantDecision::Default);
+        assert_eq!(
+            wrapped("embed_tokens_per_layer.weight"),
+            QuantDecision::Default
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_embedding_projection_decision() {
+        // Gemma4's `embed_vision.embedding_projection` loads through
+        // affine-only `Linear::load_quantized`, so MXFP weights here would
+        // be silently mis-dequantized. The upgrade must NOT promote it.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 8);
+        for key in [
+            "embed_vision.embedding_projection.weight",
+            "model.embed_vision.embedding_projection.weight",
+            "language_model.model.embed_vision.embedding_projection.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must not be upgraded to mxfp8"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_embedding_projection_under_4bit_promotion() {
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Default);
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+        assert_eq!(
+            wrapped("embed_vision.embedding_projection.weight"),
+            QuantDecision::Default
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_router_gate_decision() {
+        // Qwen3.5 MoE router gates (`mlp.gate`) and `shared_expert_gate`
+        // must NOT be upgraded to MXFP8. MXFP8's E8M0 power-of-two scales
+        // have ~10x the round-trip error of affine 8-bit on small-magnitude
+        // gate weights — too much noise for top-K expert routing, which
+        // produces gibberish output. Python mlx-lm's `quant_predicate` in
+        // `qwen3_5.py` hardcodes these gates to 8-bit affine.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 8);
+        for key in [
+            "model.layers.0.mlp.gate.weight",
+            "language_model.model.layers.7.mlp.gate.weight",
+            "layers.0.mlp.gate.weight",
+            "model.layers.0.mlp.shared_expert_gate.weight",
+            "language_model.model.layers.5.mlp.shared_expert_gate.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must not be upgraded to mxfp8"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_forces_router_gate_to_affine_under_default() {
+        // When the inner predicate returns Default, router gates would
+        // otherwise inherit the global default mode (mxfp8 for --q-mxfp
+        // --q-bits 8) via `quantize_weights_inner`'s Default arm. The
+        // upgrade wrapper MUST instead force Custom{8, 64, affine} so that
+        // top-K routing precision is preserved.
+        let wrapped = apply_mxfp_upgrade(const_predicate(QuantDecision::Default), 8);
+        assert_eq!(
+            wrapped("model.layers.0.mlp.gate.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+        );
+        assert_eq!(
+            wrapped("model.layers.0.mlp.shared_expert_gate.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_preserves_router_gate_skip_decision() {
+        // If a future recipe explicitly Skips router gate quantization,
+        // the upgrade should preserve that (don't force-quantize a Skip).
+        let wrapped = apply_mxfp_upgrade(const_predicate(QuantDecision::Skip), 8);
+        assert_eq!(
+            wrapped("model.layers.0.mlp.gate.weight"),
+            QuantDecision::Skip,
+        );
+    }
+
+    // ── NVFP4 validator tests ────────────────────────────────────────────────
+    //
+    // These validators are called from `convert_model` (safetensors path) and
+    // `convert_gguf_to_safetensors` (GGUF path). They surface bad combos with
+    // a clear message rather than letting them bubble up as confusing FFI
+    // errors mid-conversion (or worse, silently writing an inconsistent
+    // checkpoint when a 3-bit recipe default is paired with NVFP4's
+    // unconditional 4-bit per-layer overrides).
+
+    #[test]
+    fn nvfp4_validator_rejects_bits_8() {
+        let err = validate_nvfp4_invariants(8, 16).expect_err("bits=8 must be rejected");
+        assert!(
+            err.contains("requires bits=4"),
+            "error must mention 'requires bits=4', got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_validator_rejects_group_size_32() {
+        let err = validate_nvfp4_invariants(4, 32).expect_err("group_size=32 must be rejected");
+        assert!(
+            err.contains("group_size=16"),
+            "error must mention 'group_size=16', got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_validator_accepts_bits_4_group_size_16() {
+        validate_nvfp4_invariants(4, 16).expect("bits=4, group_size=16 must be accepted");
+    }
+
+    #[test]
+    fn nvfp4_recipe_rejects_mixed_4_6() {
+        let err = validate_nvfp4_recipe("mixed_4_6")
+            .expect_err("mixed_4_6 must be rejected under --q-mode nvfp4");
+        assert!(
+            err.contains("supported only for 'unsloth' and 'qwen3_5'"),
+            "error must mention restriction to 'unsloth' and 'qwen3_5', got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_recipe_accepts_unsloth_and_qwen3_5() {
+        validate_nvfp4_recipe("unsloth").expect("unsloth recipe must be accepted");
+        validate_nvfp4_recipe("qwen3_5").expect("qwen3_5 recipe must be accepted");
+    }
+
+    #[test]
+    fn nvfp4_recipe_rejects_all_mixed_variants() {
+        for recipe in ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"] {
+            assert!(
+                validate_nvfp4_recipe(recipe).is_err(),
+                "{recipe} must be rejected under --q-mode nvfp4"
+            );
+        }
+    }
+
+    #[test]
+    fn nvfp4_no_recipe_error_names_supported_recipes() {
+        // Error must point users at the two valid recipes so the recovery
+        // path is obvious. If a future recipe joins the allowlist, update
+        // both the error and this assertion.
+        assert!(
+            NVFP4_NO_RECIPE_ERROR.contains("qwen3_5"),
+            "error must mention 'qwen3_5' as the no-imatrix recipe, got: {NVFP4_NO_RECIPE_ERROR}"
+        );
+        assert!(
+            NVFP4_NO_RECIPE_ERROR.contains("unsloth"),
+            "error must mention 'unsloth' as the imatrix-required recipe, got: {NVFP4_NO_RECIPE_ERROR}"
+        );
+    }
+
+    #[test]
+    fn qwen35_recipe_skips_o_proj_and_out_proj() {
+        // Both `self_attn.o_proj` (KLD ~1.5) and `linear_attn.out_proj`
+        // (KLD ~6.0) feed the residual without a preceding layernorm, so
+        // they cannot be AWQ-corrected. The recipe MUST Skip both; a
+        // prior `key.contains("self_attn.")` predicate silently caught
+        // o_proj and produced garbage NVFP4 checkpoints.
+        let recipe = build_qwen35_recipe(4, 16);
+        assert_skip(
+            &*recipe,
+            "language_model.model.layers.11.self_attn.o_proj.weight",
+        );
+        assert_skip(
+            &*recipe,
+            "language_model.model.layers.0.linear_attn.out_proj.weight",
+        );
+    }
+
+    #[test]
+    fn qwen35_recipe_quantizes_lm_head_and_embed_tokens() {
+        // Under `--q-mode nvfp4` (default_bits=4, recipe_gs=64) lm_head
+        // must end up at 8-bit affine gs=64 and embed_tokens at 6-bit
+        // affine gs=64, matching Unsloth's NVFP4_K_XL on-disk layout.
+        // Leaving them at bf16 (the pre-2026-05-19 behavior, via
+        // `should_quantize`) silently produces a checkpoint that loads
+        // but generates garbage on hybrid Qwen3.5/3.6 models.
+        let recipe = build_qwen35_recipe(4, 64);
+        assert_custom(&*recipe, "language_model.lm_head.weight", 8, 64, "affine");
+        assert_custom(
+            &*recipe,
+            "language_model.model.embed_tokens.weight",
+            6,
+            64,
+            "affine",
+        );
+    }
+
+    #[test]
+    fn qwen35_recipe_quantizes_qkv_proj_and_in_proj() {
+        // q/k/v_proj and linear_attn.in_proj_{qkv,z} ARE AWQ-correctable
+        // (input_layernorm precedes them) — they should be quantized at
+        // high_bits = default_bits + 2 (clamped to 8).
+        let recipe = build_qwen35_recipe(4, 16);
+        // default_bits=4 → high_bits=6
+        for key in [
+            "language_model.model.layers.11.self_attn.q_proj.weight",
+            "language_model.model.layers.11.self_attn.k_proj.weight",
+            "language_model.model.layers.11.self_attn.v_proj.weight",
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.0.linear_attn.in_proj_z.weight",
+        ] {
+            assert_custom(&*recipe, key, 6, 16, "affine");
+        }
+    }
+
+    #[test]
+    fn nvfp4_no_recipe_error_names_sensitive_tensors() {
+        // The error names the high-KLD tensors the legacy path would
+        // corrupt so the user can correlate output garbage with the bug.
+        for needle in [
+            "linear_attn.out_proj",
+            "self_attn.o_proj",
+            "down_proj",
+            "in_proj_qkv",
+        ] {
+            assert!(
+                NVFP4_NO_RECIPE_ERROR.contains(needle),
+                "error must name the sensitive tensor '{needle}', got: {NVFP4_NO_RECIPE_ERROR}"
+            );
+        }
+    }
+
+    // ── apply_nvfp4_upgrade tests ────────────────────────────────────────────
+    //
+    // NVFP4 only promotes 4-bit decisions and uses `group_size = 16`. The
+    // affine-only-key and router-gate exclusions must match `apply_mxfp_upgrade`
+    // exactly so future tensors stay consistent across modes.
+
+    #[test]
+    fn apply_nvfp4_upgrade_passes_through_skip() {
+        let wrapped = apply_nvfp4_upgrade(const_predicate(QuantDecision::Skip));
+        assert_eq!(wrapped("model.embed_tokens.weight"), QuantDecision::Skip);
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Skip
+        );
+        assert_eq!(wrapped(""), QuantDecision::Skip);
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_promotes_default_with_4_bits() {
+        // Under `--q-mode nvfp4` the global default_bits is validated to be 4
+        // upstream, so the Default arm unconditionally promotes to NVFP4.
+        let wrapped = apply_nvfp4_upgrade(const_predicate(QuantDecision::Default));
+        assert_eq!(
+            wrapped("model.layers.0.mlp.up_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_upgrades_custom_4bit_to_nvfp4() {
+        let wrapped = apply_nvfp4_upgrade(const_predicate(QuantDecision::Custom {
+            bits: 4,
+            group_size: 32,
+            mode: "affine".to_string(),
+        }));
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_custom_8bit() {
+        // NVFP4 has no 8-bit variant: 8-bit Custom decisions pass through
+        // unchanged (e.g. unsloth recipe's lm_head/router-gate 8-bit affine).
+        let original = QuantDecision::Custom {
+            bits: 8,
+            group_size: 64,
+            mode: "affine".to_string(),
+        };
+        let wrapped = apply_nvfp4_upgrade(const_predicate(original.clone()));
+        assert_eq!(
+            wrapped("model.layers.0.mlp.down_proj.weight"),
+            original,
+            "Custom 8-bit must pass through under NVFP4 upgrade"
+        );
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_custom_3bit_5bit_6bit() {
+        for bits in [2, 3, 5, 6, 7] {
+            let original = QuantDecision::Custom {
+                bits,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
+            let wrapped = apply_nvfp4_upgrade(const_predicate(original.clone()));
+            assert_eq!(
+                wrapped("model.layers.0.mlp.down_proj.weight"),
+                original,
+                "Custom {{ bits: {bits}, .. }} should pass through unchanged under NVFP4",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_lm_head_decision() {
+        // Dense Qwen3.5 lm_head loader is affine-only — must not be upgraded
+        // to NVFP4.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_nvfp4_upgrade(inner);
+        for key in ["lm_head.weight", "language_model.lm_head.weight"] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must not be upgraded to nvfp4"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_embed_tokens_decision() {
+        // Gemma4 / others load `embed_tokens` through `Embedding::load_quantized`
+        // which is affine-only. Also covers PLE `embed_tokens_per_layer` via
+        // substring match.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_nvfp4_upgrade(inner);
+        for key in [
+            "embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "language_model.model.embed_tokens.weight",
+            "embed_tokens_per_layer.weight",
+            "model.embed_tokens_per_layer.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must not be upgraded to nvfp4"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_router_proj_decision() {
+        // Gemma4 MoE router uses affine-only `Linear::load_quantized`.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_nvfp4_upgrade(inner);
+        assert_eq!(
+            wrapped("language_model.model.layers.0.router.proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+            "router.proj must not be upgraded to nvfp4"
+        );
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_forces_affine_on_router_proj_default() {
+        // When the recipe defers (Default) for an affine-only key like
+        // Gemma4's router.proj, apply_nvfp4_upgrade must emit an explicit
+        // 8-bit affine override — preserving Default would let it fall
+        // through to the top-level `mode=nvfp4`, which the affine-only
+        // loader rejects at load time. Regression test for the Gemma4
+        // NVFP4 failure: "router.proj load: Non-affine FP mode Nvfp4 is
+        // not supported; affine only".
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Default);
+        let wrapped = apply_nvfp4_upgrade(inner);
+        for key in [
+            "language_model.model.layers.0.router.proj.weight",
+            "language_model.lm_head.weight",
+            "language_model.model.embed_tokens.weight",
+            "embed_vision.embedding_projection.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{} must get explicit 8-bit affine, not Default",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_embedding_projection_decision() {
+        // Gemma4's `embed_vision.embedding_projection` loads through affine-
+        // only `Linear::load_quantized` — must not be promoted.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_nvfp4_upgrade(inner);
+        for key in [
+            "embed_vision.embedding_projection.weight",
+            "model.embed_vision.embedding_projection.weight",
+            "language_model.model.embed_vision.embedding_projection.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must not be upgraded to nvfp4"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_forces_router_gate_to_affine() {
+        // Router gates and `shared_expert_gate` must ALWAYS land at 8-bit
+        // affine gs=64, even when the inner predicate returns Default or a
+        // 4-bit Custom decision. NVFP4's FP4 micro-block scales would destroy
+        // top-K routing precision (same rationale as MXFP8). This mirrors
+        // `apply_mxfp_upgrade`'s router-gate forcing.
+        for inner_decision in [
+            QuantDecision::Default,
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "affine".to_string(),
+            },
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+        ] {
+            let wrapped = apply_nvfp4_upgrade(const_predicate(inner_decision.clone()));
+            for key in [
+                "model.layers.0.mlp.gate.weight",
+                "language_model.model.layers.7.mlp.gate.weight",
+                "model.layers.0.mlp.shared_expert_gate.weight",
+            ] {
+                assert_eq!(
+                    wrapped(key),
+                    QuantDecision::Custom {
+                        bits: 8,
+                        group_size: 64,
+                        mode: "affine".to_string(),
+                    },
+                    "{key} (inner = {inner_decision:?}) must be forced to 8-bit affine"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_preserves_router_gate_skip_decision() {
+        // If a recipe explicitly Skips router-gate quantization, preserve it
+        // (mirrors `apply_mxfp_upgrade`).
+        let wrapped = apply_nvfp4_upgrade(const_predicate(QuantDecision::Skip));
+        assert_eq!(
+            wrapped("model.layers.0.mlp.gate.weight"),
+            QuantDecision::Skip,
+        );
+        assert_eq!(
+            wrapped("model.layers.0.mlp.shared_expert_gate.weight"),
+            QuantDecision::Skip,
+        );
+    }
+
+    #[test]
+    fn apply_nvfp4_upgrade_threads_key_through_to_inner_predicate() {
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = Box::new(|key: &str| {
+            if key.contains("q_proj") {
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 32,
+                    mode: "affine".to_string(),
+                }
+            } else if key.contains("o_proj") {
+                QuantDecision::Skip
+            } else if key.contains("down_proj") {
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                }
+            } else {
+                QuantDecision::Default
+            }
+        });
+        let wrapped = apply_nvfp4_upgrade(inner);
+
+        // 4-bit Custom → NVFP4.
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string(),
+            }
+        );
+        // Skip preserved.
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.o_proj.weight"),
+            QuantDecision::Skip
+        );
+        // 8-bit Custom preserved (no NVFP8 variant).
+        assert_eq!(
+            wrapped("model.layers.0.mlp.down_proj.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        // Default → NVFP4.
+        assert_eq!(
+            wrapped("model.layers.0.mlp.up_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string(),
+            }
+        );
+    }
+
+    /// Direct single-call `mlx_quantize` baseline for the tiled-quantize bit-
+    /// exactness tests. Returns `(packed, scales, biases?)` where packed is
+    /// always uint32, scales/biases dtypes depend on `mode`.
+    fn quantize_reference(
+        array: &MxArray,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> (MxArray, MxArray, Option<MxArray>) {
+        use std::ffi::CString;
+        let mode_c = CString::new(mode).unwrap();
+        let mut out_quantized: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_scales: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_biases: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                array.as_raw_ptr(),
+                group_size,
+                bits,
+                mode_c.as_ptr(),
+                &mut out_quantized,
+                &mut out_scales,
+                &mut out_biases,
+            )
+        };
+        assert!(ok, "mlx_quantize reference call failed for mode {}", mode);
+        let q_weight = MxArray::from_handle(out_quantized, "ref_quantize_weight").unwrap();
+        let q_scales = MxArray::from_handle(out_scales, "ref_quantize_scales").unwrap();
+        let q_biases = if out_biases.is_null() {
+            None
+        } else {
+            Some(MxArray::from_handle(out_biases, "ref_quantize_biases").unwrap())
+        };
+        (q_weight, q_scales, q_biases)
+    }
+
+    fn assert_shape_eq(a: &MxArray, b: &MxArray, label: &str) {
+        let sa: Vec<i64> = a.shape().unwrap().to_vec();
+        let sb: Vec<i64> = b.shape().unwrap().to_vec();
+        assert_eq!(sa, sb, "{label}: shape mismatch");
+    }
+
+    fn assert_uint32_bit_exact(a: &MxArray, b: &MxArray, label: &str) {
+        assert_shape_eq(a, b, label);
+        let va: Vec<u32> = a.to_uint32().unwrap().to_vec();
+        let vb: Vec<u32> = b.to_uint32().unwrap().to_vec();
+        assert_eq!(va.len(), vb.len(), "{label}: length mismatch");
+        for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+            assert_eq!(x, y, "{label}: bit mismatch at index {i}: {x:#x} vs {y:#x}");
+        }
+    }
+
+    fn assert_uint8_bit_exact(a: &MxArray, b: &MxArray, label: &str) {
+        assert_shape_eq(a, b, label);
+        let va = a.to_uint8().unwrap();
+        let vb = b.to_uint8().unwrap();
+        assert_eq!(va.len(), vb.len(), "{label}: length mismatch");
+        for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+            assert_eq!(x, y, "{label}: byte mismatch at index {i}: {x} vs {y}");
+        }
+    }
+
+    fn assert_float32_bit_exact(a: &MxArray, b: &MxArray, label: &str) {
+        assert_shape_eq(a, b, label);
+        let va: Vec<f32> = a.to_float32().unwrap().to_vec();
+        let vb: Vec<f32> = b.to_float32().unwrap().to_vec();
+        assert_eq!(va.len(), vb.len(), "{label}: length mismatch");
+        for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{label}: f32 bit mismatch at index {i}: {x} vs {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_with_optional_tiling_passthrough_for_2d() {
+        use std::ffi::CString;
+        // 2D input — must NOT tile, just delegate to mlx_quantize.
+        let w = MxArray::random_normal(&[64, 128], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let mode_c = CString::new("affine").unwrap();
+        let (packed, scales, biases) =
+            quantize_with_optional_tiling(&w, 64, 4, mode_c.as_c_str(), "test.2d.weight").unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 64, 4, "affine");
+        assert_uint32_bit_exact(&packed, &packed_ref, "affine-2d packed");
+        assert_float32_bit_exact(&scales, &scales_ref, "affine-2d scales");
+        assert!(biases.is_some() && biases_ref.is_some());
+        assert_float32_bit_exact(
+            biases.as_ref().unwrap(),
+            biases_ref.as_ref().unwrap(),
+            "affine-2d biases",
+        );
+    }
+
+    #[test]
+    fn quantize_with_optional_tiling_passthrough_for_small_3d() {
+        use std::ffi::CString;
+        // 3D but leading dim below threshold — must NOT tile.
+        let w = MxArray::random_normal(&[8, 32, 64], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let mode_c = CString::new("affine").unwrap();
+        let (packed, scales, biases) =
+            quantize_with_optional_tiling(&w, 64, 4, mode_c.as_c_str(), "test.small3d.weight")
+                .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 64, 4, "affine");
+        assert_uint32_bit_exact(&packed, &packed_ref, "affine-small3d packed");
+        assert_float32_bit_exact(&scales, &scales_ref, "affine-small3d scales");
+        assert_float32_bit_exact(
+            biases.as_ref().unwrap(),
+            biases_ref.as_ref().unwrap(),
+            "affine-small3d biases",
+        );
+    }
+
+    #[test]
+    fn quantize_with_optional_tiling_bit_exact_affine_4bit() {
+        use std::ffi::CString;
+        // [64, 32, 64] = 131072 elems, leading dim 64 >= threshold 32.
+        // Tiles into 2 chunks of 32.
+        let w = MxArray::random_normal(&[64, 32, 64], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let mode_c = CString::new("affine").unwrap();
+        let (packed, scales, biases) =
+            quantize_with_optional_tiling(&w, 64, 4, mode_c.as_c_str(), "test.tile.affine4.weight")
+                .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 64, 4, "affine");
+        assert_uint32_bit_exact(&packed, &packed_ref, "tiled affine-4bit packed");
+        assert_float32_bit_exact(&scales, &scales_ref, "tiled affine-4bit scales");
+        assert!(biases.is_some() && biases_ref.is_some());
+        assert_float32_bit_exact(
+            biases.as_ref().unwrap(),
+            biases_ref.as_ref().unwrap(),
+            "tiled affine-4bit biases",
+        );
+    }
+
+    #[test]
+    fn quantize_with_optional_tiling_bit_exact_mxfp8() {
+        use std::ffi::CString;
+        // mxfp8 requires bits=8 and group_size=32.
+        let w = MxArray::random_normal(&[64, 32, 64], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let mode_c = CString::new("mxfp8").unwrap();
+        let (packed, scales, biases) =
+            quantize_with_optional_tiling(&w, 32, 8, mode_c.as_c_str(), "test.tile.mxfp8.weight")
+                .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 32, 8, "mxfp8");
+        assert_uint32_bit_exact(&packed, &packed_ref, "tiled mxfp8 packed");
+        assert_uint8_bit_exact(&scales, &scales_ref, "tiled mxfp8 scales");
+        assert!(biases.is_none() && biases_ref.is_none());
+    }
+
+    #[test]
+    fn quantize_with_optional_tiling_bit_exact_mxfp4() {
+        use std::ffi::CString;
+        // mxfp4 requires bits=4 and group_size=32.
+        let w = MxArray::random_normal(&[64, 32, 64], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let mode_c = CString::new("mxfp4").unwrap();
+        let (packed, scales, biases) =
+            quantize_with_optional_tiling(&w, 32, 4, mode_c.as_c_str(), "test.tile.mxfp4.weight")
+                .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 32, 4, "mxfp4");
+        assert_uint32_bit_exact(&packed, &packed_ref, "tiled mxfp4 packed");
+        assert_uint8_bit_exact(&scales, &scales_ref, "tiled mxfp4 scales");
+        assert!(biases.is_none() && biases_ref.is_none());
+    }
+
+    #[test]
+    fn quantize_with_optional_tiling_uneven_remainder() {
+        use std::ffi::CString;
+        // 80 experts → 32 + 32 + 16; remainder chunk must concat correctly.
+        let w = MxArray::random_normal(&[80, 16, 64], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let mode_c = CString::new("affine").unwrap();
+        let (packed, scales, biases) =
+            quantize_with_optional_tiling(&w, 64, 8, mode_c.as_c_str(), "test.tile.uneven.weight")
+                .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 64, 8, "affine");
+        assert_uint32_bit_exact(&packed, &packed_ref, "uneven affine packed");
+        assert_float32_bit_exact(&scales, &scales_ref, "uneven affine scales");
+        assert_float32_bit_exact(
+            biases.as_ref().unwrap(),
+            biases_ref.as_ref().unwrap(),
+            "uneven affine biases",
+        );
+    }
+
+    #[test]
+    fn nvfp4_quantize_roundtrip_is_close_to_original() {
+        // NVFP4 is lossy (4 bits, group_size 16) so use loose tolerance.
+        // Round-trip: quantize -> dequantize -> compare to original.
+        let w = MxArray::random_normal(&[64, 128], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let original: Vec<f32> = w.to_float32().unwrap().to_vec();
+
+        let (packed, scales, biases) = quantize_reference(&w, 16, 4, "nvfp4");
+        assert!(biases.is_none(), "NVFP4 must not emit biases");
+        let packed_shape: Vec<i64> = packed.shape().unwrap().to_vec();
+        assert_eq!(
+            packed_shape,
+            vec![64, 16],
+            "NVFP4 packed shape: 128 / 8 per uint32 = 16 packs per row"
+        );
+        let scales_shape: Vec<i64> = scales.shape().unwrap().to_vec();
+        assert_eq!(
+            scales_shape,
+            vec![64, 8],
+            "NVFP4 scales shape: 128 / group_size 16 = 8 groups per row"
+        );
+        assert!(
+            matches!(scales.dtype().unwrap(), DType::Uint8),
+            "NVFP4 scales must be uint8 (E4M3 packed)"
+        );
+
+        let mode_c = std::ffi::CString::new("nvfp4").unwrap();
+        let dequant_handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                16,
+                4,
+                0, // out_dtype = float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(!dequant_handle.is_null(), "mlx_dequantize for nvfp4 failed");
+        let dequant = MxArray::from_handle(dequant_handle, "nvfp4_dequant").unwrap();
+        let restored: Vec<f32> = dequant.to_float32().unwrap().to_vec();
+        assert_eq!(restored.len(), original.len());
+        // Compute relative error tolerance for NVFP4 (4 bits, gs=16 — much
+        // higher precision per block than MXFP4 thanks to the finer block).
+        // Empirically restored values land within ~0.1 absolute on N(0,
+        // 0.02) inputs; we use a generous 0.2 to keep the test stable.
+        let max_abs = original
+            .iter()
+            .zip(&restored)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs < 0.2,
+            "NVFP4 round-trip max abs error {} too large",
+            max_abs
+        );
+    }
+
+    /// Compute relative L2 reconstruction error for a quantize/dequantize
+    /// round-trip on a given mode. Returns ||W - Q^-1(Q(W))||_2 / ||W||_2.
+    fn quantize_roundtrip_rel_l2(w: &MxArray, group_size: i32, bits: i32, mode: &str) -> f32 {
+        use std::ffi::CString;
+        let (packed, scales, biases) = quantize_reference(w, group_size, bits, mode);
+        let mode_c = CString::new(mode).unwrap();
+        let biases_ptr = biases
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+        let dequant_handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases_ptr,
+                group_size,
+                bits,
+                0, // out_dtype = float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(
+            !dequant_handle.is_null(),
+            "mlx_dequantize failed for {mode}"
+        );
+        let dequant = MxArray::from_handle(dequant_handle, "roundtrip_dequant").unwrap();
+        let original: Vec<f32> = w.to_float32().unwrap().to_vec();
+        let restored: Vec<f32> = dequant.to_float32().unwrap().to_vec();
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in original.iter().zip(restored.iter()) {
+            let d = (*a - *b) as f64;
+            num += d * d;
+            den += (*a as f64) * (*a as f64);
+        }
+        (num.sqrt() / den.sqrt().max(1e-12)) as f32
+    }
+
+    /// Diagnostic: compare MXFP8 vs affine-8bit round-trip error on a tensor
+    /// shaped like a Qwen3.5 MoE router gate ([num_experts=256, hidden=2048]).
+    ///
+    /// Router gate inputs are post-RMSNorm activations with small magnitudes;
+    /// gate weights are correspondingly small (initialized N(0, 0.02)). The
+    /// routing softmax + argpartition are extremely sensitive to per-row
+    /// noise. The Python mlx-lm `quant_predicate` in `qwen3_5.py` keeps gates
+    /// at 8-bit affine regardless of the global quantization mode for this
+    /// reason.
+    ///
+    /// This test documents that MXFP8 (E8M0 per-group power-of-two scale,
+    /// group_size 32) has materially worse round-trip error than affine
+    /// 8-bit (per-group scale + bias, group_size 64) on the gate-shaped
+    /// tensor. The check is loose: we only require MXFP8 error to exceed
+    /// affine error by at least 5x. Tightening this further would risk
+    /// flakiness across MLX backend changes.
+    #[test]
+    fn router_gate_shape_mxfp8_vs_affine_error() {
+        // Router gate shape from Qwen3.6-35B-A3B MoE: 256 experts, hidden 2048.
+        let w = MxArray::random_normal(&[256, 2048], 0.0, 0.02, Some(DType::Float32)).unwrap();
+        w.eval();
+        let err_mxfp8 = quantize_roundtrip_rel_l2(&w, 32, 8, "mxfp8");
+        let err_affine = quantize_roundtrip_rel_l2(&w, 64, 8, "affine");
+        eprintln!(
+            "router_gate_shape err: mxfp8={:.6}  affine8={:.6}  ratio={:.2}x",
+            err_mxfp8,
+            err_affine,
+            err_mxfp8 / err_affine.max(1e-9)
+        );
+        assert!(
+            err_mxfp8 > err_affine * 5.0,
+            "expected MXFP8 error to be much larger than affine 8-bit on router-gate-shaped tensor; \
+             got mxfp8={err_mxfp8}, affine8={err_affine}"
+        );
+    }
 }
