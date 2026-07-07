@@ -166,8 +166,21 @@ export declare class Gemma4Model {
    */
   hasBlockPagedCache(): boolean;
   modelId(): number;
+  /**
+   * Whether a DSpark draft model is loaded on this instance (via
+   * `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
+   * decode whole-turn path.
+   *
+   * Note: this only reports draft availability. Whether speculative
+   * decoding actually runs on a given call also requires the per-request
+   * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+   * surface, but it reports an external DSpark draft model, not
+   * in-checkpoint MTP heads. Stubs from `new(config)` always return
+   * `false`.
+   */
+  hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
-  static load(modelPath: string): Promise<Gemma4Model>;
+  static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
   /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
@@ -731,9 +744,20 @@ export declare class MxArray {
   divScalar(value: number): MxArray;
   matmul(other: MxArray): MxArray;
   /**
-   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-   * where self is A. More efficient than separate matmul and add operations.
-   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
+   * Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
+   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
+   *
+   * Computed explicitly (matmul, optional alpha scale, then add beta*C)
+   * rather than via the fused `mlx::core::addmm` primitive. The fused
+   * primitive is correct on a well-formed metallib, but this project's local
+   * release build is known to non-deterministically miscompile fused GEMM
+   * kernels (see the metallib-corruption notes), which manifested as the
+   * fused addmm dropping `beta*C` and corrupting every biased linear — most
+   * visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
+   * bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
+   * explicit form keeps the `C` term robust to that build hazard; the
+   * `nn::linear` unit tests assert it applies a non-zero `C`, so they double
+   * as a canary if a future build corrupts the matmul kernel too.
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
   abs(): MxArray;
@@ -1199,11 +1223,11 @@ export declare class Qwen35Model {
    *
    * `true` iff `Qwen35Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
-   * inference; image-bearing chat turns are rejected at runtime by
-   * the chat-entry sites. Surfaced through this NAPI method so
+   * `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
+   * checkpoints because parity is pending real-weights validation, and
+   * default-ON for VLM checkpoints). On VLM checkpoints dense image turns
+   * ONLY run on the paged-vision core; a vision turn that reaches a None
+   * adapter errors at dispatch. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
    * the model thread.
    */
@@ -2327,8 +2351,9 @@ export interface ChatConfig {
   reuseCache?: boolean | undefined;
   /**
    * MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-   * loop on the dense compiled path. Requires the model checkpoint to carry
-   * an MTP head (otherwise silently ignored). Default: `false`.
+   * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
+   * checkpoint to carry an MTP head (otherwise silently ignored). Default:
+   * `false`.
    */
   enableMtp?: boolean | undefined;
   /**
@@ -2524,7 +2549,7 @@ export interface ConversionOptions {
   quantGroupSize?: number;
   /**
    * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+   * "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
    * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
    */
   quantMode?: string;
@@ -2634,11 +2659,11 @@ export declare function createRandomQwen35Checkpoint(config: Qwen35Config, saveP
 /**
  * Create a random-init Qwen3.5 MoE model and save it to disk.
  *
- * Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
- * random-weight `Qwen35MoeInner` directly, then dispatches
- * `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
- * of the promise, so the in-memory model is released once the checkpoint has
- * been written. Used by TypeScript test fixtures that need an on-disk
+ * Spawns a dedicated model thread whose init runs
+ * [`create_random_qwen35_moe_checkpoint_sync`] (random-init inner + save);
+ * the thread holds no state and is dropped once the promise resolves, so
+ * the in-memory model is released as soon as the checkpoint has been
+ * written. Used by TypeScript test fixtures that need an on-disk
  * checkpoint without keeping a NAPI model instance alive.
  */
 export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
@@ -2916,6 +2941,19 @@ export interface Gemma4Config {
    * real Gemma-4-E2B weights.
    */
   useBlockPagedCache?: boolean | undefined;
+}
+
+/** Optional load-time settings for [`Gemma4Model::load`]. */
+export interface Gemma4LoadOptions {
+  /**
+   * Directory of a DSpark draft checkpoint (config.json +
+   * model.safetensors) to load alongside the target model for
+   * speculative decoding. DSpark runs only on the flat KV-cache path:
+   * setting this while the model config explicitly enables
+   * `use_block_paged_cache` is a hard load error, and an unset
+   * `use_block_paged_cache` is forced to `false`.
+   */
+  draftModelPath?: string;
 }
 
 /**
@@ -3918,13 +3956,18 @@ export interface Qwen35Config {
    * when unset, they run the eager flat decode. Either way the forward
    * is pure-Rust eager.
    *
-   * **VLM is rejected**: when both `vision_encoder.is_some()` and
-   * this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
-   * a descriptive error. Paged dispatch through M-RoPE / vision
-   * features is deferred.
+   * **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+   * dense image turns ONLY run on the paged-vision core. A fresh single-turn
+   * image-bearing prompt prefills through the paged adapter (M-RoPE positions
+   * feed the rotary; the merged vision embeddings feed the forward) and
+   * decodes plain AR — MTP weights are ignored on image turns. Warm
+   * image-bearing session continues / cache-hit reuse are still rejected at
+   * runtime (the GDN two-pass warm prefix is not byte-exact). A vision turn
+   * that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
+   * a sym8 checkpoint) errors at dispatch.
    *
-   * Default: `None` / `false` (use the eager flat decode path).
-   * Default-flip pending real-weights parity verification.
+   * Default: `None` for text-only checkpoints (eager flat decode);
+   * `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
    */
   useBlockPagedCache?: boolean | undefined;
   /**
@@ -4012,8 +4055,12 @@ export interface Qwen35MoeConfig {
    * either way. When disabled, full-attention layers run the eager flat
    * decode instead.
    *
-   * VLM (vision encoder present) is rejected with an error in
-   * `Qwen35MoeInner::new`.
+   * **VLM under paged**: a VLM checkpoint loads with this flag set, and a
+   * fresh single-turn image-bearing prompt prefills through the paged
+   * adapter (M-RoPE positions feed the rotary; the merged vision embeddings
+   * feed the forward). Image-bearing MTP turns are still rejected at
+   * runtime; warm image-bearing session continues / cache-hit reuse are
+   * cold-started (no warm GDN two-pass prefix).
    *
    * Default: `None` / `false`.
    */

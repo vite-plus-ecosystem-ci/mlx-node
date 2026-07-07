@@ -922,8 +922,12 @@ pub(crate) mod recipe {
         }
 
         fn sym8_supported(&self) -> bool {
-            // Dense qwen3_5 has a sym8 dispatch; qwen3_5_moe does not.
-            !self.is_moe
+            // Both dense qwen3_5 and qwen3_5_moe dispatch sym8. The MoE loader
+            // covers its non-expert sublayers (attention, GDN, shared-expert
+            // MLP body); 3-D stacked switch_mlp experts are forced to an
+            // affine-8 per-layer override by `sym8_eligible`, so the emitted
+            // checkpoint always loads back.
+            true
         }
 
         fn has_mtp(&self) -> MtpPolicy {
@@ -1548,7 +1552,7 @@ pub struct ConversionOptions {
     pub quant_group_size: Option<i32>,
 
     /// Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-    /// "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+    /// "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
     /// implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
     pub quant_mode: Option<String>,
 
@@ -1778,20 +1782,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     .to_string(),
             ));
         }
-        // sym8 v1 dispatch exists in the dense qwen3_5, lfm2/lfm2_moe, and
-        // gemma4 loaders (2D linears only — 3D stacked experts are auto-forced
-        // to affine-8 below). qwen3_5_moe still rejects sym8 up front (its
-        // per-expert SwitchMLP/gather path has no sym8 dispatch), so allowing
-        // it here would emit checkpoints this package cannot load back.
+        // sym8 dispatch exists in the qwen3_5 (dense + MoE non-expert
+        // sublayers), lfm2/lfm2_moe, and gemma4 loaders (2D linears only —
+        // 3D stacked experts are auto-forced to affine-8 below, so
+        // qwen3_5_moe's per-expert SwitchMLP/gather path never sees sym8).
         let sym8_supported = model_type
             .as_deref()
             .and_then(recipe::recipe_for)
             .is_some_and(|r| r.sym8_supported());
         if !sym8_supported {
             return Err(Error::from_reason(format!(
-                "sym8 is currently supported for model types qwen3_5 (dense), \
-                 lfm2, lfm2_moe, and gemma4 only (got {:?}); other families' \
-                 loaders have no sym8 dispatch",
+                "sym8 is currently supported for model types qwen3_5, \
+                 qwen3_5_moe, lfm2, lfm2_moe, and gemma4 only (got {:?}); \
+                 other families' loaders have no sym8 dispatch",
                 model_type.as_deref()
             )));
         }
@@ -2314,11 +2317,26 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Apply quantization if requested
     let mut per_layer_overrides: HashMap<String, serde_json::Value> =
         gemma_pre_overrides.unwrap_or_default();
-    // Effective mode/group_size recorded in config.json. The no-recipe path
-    // updates these when --q-mxfp upgrades the global mode to mxfp4/mxfp8 so
-    // downstream loaders dispatch to the correct builder.
+    // Effective mode/group_size/bits recorded in config.json. The no-recipe
+    // path updates mode/group_size when --q-mxfp upgrades the global mode to
+    // mxfp4/mxfp8 so downstream loaders dispatch to the correct builder.
     let mut quant_mode_effective = quant_mode.clone();
     let mut quant_group_size_effective = quant_group_size;
+    let mut quant_bits_effective = quant_bits;
+    // The gemma-prequant path never runs the quantize block below (--quantize
+    // is rejected up front), so the effective values would otherwise stay at
+    // the generic CLI defaults (affine / 4-bit / group 64) — dishonest: every
+    // sidecar the importer emits is a 128-group affine repack. External
+    // loaders that trust the top-level default for tensors without a
+    // per-layer override would mis-dequantize, so derive the top-level block
+    // from the importer's own override map instead.
+    if is_gemma_prequantized {
+        let (bits, group_size, mode) =
+            crate::convert_gemma_import::top_level_quant_metadata(&per_layer_overrides)?;
+        quant_bits_effective = bits;
+        quant_group_size_effective = group_size;
+        quant_mode_effective = mode;
+    }
     // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
     // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
     // lookup + quantized tied-head matmul), so the embedding table can be
@@ -2667,7 +2685,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         };
         let mut quant_obj = serde_json::json!({
             "group_size": group_size_value,
-            "bits": quant_bits,
+            "bits": quant_bits_effective,
             "mode": quant_mode_effective,
         });
         if let Some(obj) = quant_obj.as_object_mut() {
@@ -4419,8 +4437,9 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 /// Identify the CO-QUANTIZED group a weight base key (key minus `.weight`)
 /// belongs to, returning the full canonical member base list. Returns `None`
 /// for keys whose loaders resolve quantization per tensor (attention
-/// projections, GDN, embeddings, gemma4 MoE `experts.*`, qwen3_5_moe — the
-/// latter has no sym8 dispatch and fails loud up front on any sym8 config).
+/// projections, GDN, embeddings, gemma4 MoE `experts.*`, and qwen3_5_moe's
+/// router `.mlp.gate` / `.mlp.shared_expert_gate` — each of the latter builds
+/// through its own `try_build_ql` call with an independent dense fallback).
 ///
 /// These are the groups whose loaders are strict all-or-none:
 /// - dense MLP `{root}.mlp.{gate,up,down}_proj` — gemma4 (`gemma4/
@@ -4436,11 +4455,28 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 /// - lfm2 MoE quartet: router `{root}.feed_forward.gate` + 3D stacked
 ///   `{root}.feed_forward.switch_mlp.{gate,up,down}_proj` —
 ///   `moe_layer_is_quantized` couples all four (`moe_proj_bases`).
+/// - qwen3_5_moe switch_mlp trio `{root}.mlp.switch_mlp.{gate,up,down}_proj`
+///   AND shared_expert trio `{root}.mlp.shared_expert.{gate,up,down}_proj` —
+///   `qwen3_5_moe/persistence.rs` builds each trio all-or-none (`if let
+///   (Some(..), Some(..), Some(..))`); a partial trio drops ALL THREE members
+///   to the dense setters, where `ensure_dense_weight_floating` rejects the
+///   quantized members' packed non-float weights (matching the dense qwen3_5
+///   fallbacks). Reachable since qwen3_5_moe gained sym8 dispatch
+///   for its non-expert sublayers (the old blanket fail-loud-on-any-sym8-
+///   config guard is gone): under a sym8 default, 3-D switch_mlp experts and
+///   2-D members with `K % 16 != 0` are both forced to affine-8
+///   (`sym8_eligible`; a sym8 override reaching `try_build_qsl` fails loud at
+///   load), and a forced-affine member that ALSO fails the affine
+///   `K % group_size` alignment would silently stay dense next to quantized
+///   siblings without this table.
 ///
 /// `strip_suffix` is an exact tail match, so the tables cannot cross-match:
 /// `…switch_mlp.gate_proj` never strips as `.mlp.gate_proj` (the char before
-/// `mlp` is `_`, not `.`) and `…feed_forward.gate_proj` never strips as
-/// `.feed_forward.gate`.
+/// `mlp` is `_`, not `.`), `…feed_forward.gate_proj` never strips as
+/// `.feed_forward.gate`, qwen's `.mlp.switch_mlp.*` suffixes never match
+/// lfm2's `.feed_forward.switch_mlp.*` (different parent segment, both ways),
+/// and `….mlp.shared_expert.gate_proj` ends in `expert.gate_proj`, which no
+/// other table's suffix matches.
 fn coquant_group_members(base: &str) -> Option<Vec<String>> {
     const LFM2_MOE: [&str; 4] = [
         ".feed_forward.gate",
@@ -4453,8 +4489,24 @@ fn coquant_group_members(base: &str) -> Option<Vec<String>> {
         ".feed_forward.up_proj",
         ".feed_forward.down_proj",
     ];
+    const QWEN35_MOE_SWITCH: [&str; 3] = [
+        ".mlp.switch_mlp.gate_proj",
+        ".mlp.switch_mlp.up_proj",
+        ".mlp.switch_mlp.down_proj",
+    ];
+    const QWEN35_MOE_SHARED_EXPERT: [&str; 3] = [
+        ".mlp.shared_expert.gate_proj",
+        ".mlp.shared_expert.up_proj",
+        ".mlp.shared_expert.down_proj",
+    ];
     const DENSE_MLP: [&str; 3] = [".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"];
-    for table in [&LFM2_MOE[..], &LFM2_FFN[..], &DENSE_MLP[..]] {
+    for table in [
+        &LFM2_MOE[..],
+        &LFM2_FFN[..],
+        &QWEN35_MOE_SWITCH[..],
+        &QWEN35_MOE_SHARED_EXPERT[..],
+        &DENSE_MLP[..],
+    ] {
         for suffix in table {
             if let Some(root) = base.strip_suffix(suffix) {
                 return Some(table.iter().map(|s| format!("{root}{s}")).collect());
@@ -5168,7 +5220,18 @@ pub(crate) fn apply_awq_prescaling(
         // ── Group A: norm → gate_proj + up_proj ──
         let gate_key = format!("{prefix}.mlp.gate_proj.weight");
         let up_key = format!("{prefix}.mlp.up_proj.weight");
-        let norm_key = format!("{prefix}.post_attention_layernorm.weight");
+        // The inverse scale must land on the norm whose output the MLP reads.
+        // gemma4 sandwich layers feed the MLP from pre_feedforward_layernorm;
+        // their post_attention_layernorm normalizes the attention output into
+        // the residual, so folding 1/s there rescales the attention branch and
+        // leaves gate/up columns uncompensated. Two-norm families (qwen3_5,
+        // lfm2) have no pre_feedforward_layernorm and keep the classic target.
+        let sandwich_norm_key = format!("{prefix}.pre_feedforward_layernorm.weight");
+        let norm_key = if weights.contains_key(&sandwich_norm_key) {
+            sandwich_norm_key
+        } else {
+            format!("{prefix}.post_attention_layernorm.weight")
+        };
 
         if let Some(scales) = compute_group_a_scales(imatrix, &gate_key, &up_key, ratio)? {
             // gate_proj.weight *= scales (broadcast over columns: [out, in] * [1, in])
@@ -5588,6 +5651,133 @@ mod tests {
         );
     }
 
+    /// Group A must fold the inverse MLP scale into the norm whose output the
+    /// MLP actually consumes. In gemma4's 4-norm sandwich layer that is
+    /// `pre_feedforward_layernorm`; `post_attention_layernorm` there normalizes
+    /// the attention output into the residual stream, so dividing it by the MLP
+    /// scales corrupts the attention branch while leaving gate/up columns
+    /// uncompensated. Two-norm families (qwen3_5, lfm2) have no
+    /// pre_feedforward_layernorm and must keep folding into
+    /// post_attention_layernorm.
+    #[test]
+    fn awq_group_a_targets_sandwich_ffn_norm() {
+        use crate::utils::imatrix::ImatrixData;
+
+        const K: i64 = 4;
+        const N: i64 = 2;
+
+        let ones = |shape: &[i64]| {
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            MxArray::from_float32(&vec![1.0f32; numel], shape).expect("from_float32")
+        };
+        let read = |w: &MxArray| w.to_float32().expect("to_float32");
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 — gemma4-style sandwich layer (has pre_feedforward_layernorm).
+        for key in [
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            "language_model.model.layers.0.mlp.up_proj.weight",
+        ] {
+            weights.insert(key.into(), ones(&[N, K]));
+        }
+        weights.insert(
+            "language_model.model.layers.0.post_attention_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.pre_feedforward_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        // Layer 1 — qwen-style two-norm layer (no pre_feedforward_layernorm).
+        for key in [
+            "language_model.model.layers.1.mlp.gate_proj.weight",
+            "language_model.model.layers.1.mlp.up_proj.weight",
+        ] {
+            weights.insert(key.into(), ones(&[N, K]));
+        }
+        weights.insert(
+            "language_model.model.layers.1.post_attention_layernorm.weight".into(),
+            ones(&[K]),
+        );
+
+        // importance [1, 4, 9, 16] → scales = sqrt(imp)/sqrt(max*min) = [0.5, 1, 1.5, 2]
+        let importance: HashMap<String, Vec<f32>> = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.1.mlp.up_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let imatrix = ImatrixData {
+            importance,
+            chunk_count: 1,
+            chunk_size: 1,
+        };
+
+        let modified = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2).expect("awq");
+        assert_eq!(modified, 6, "gate + up + one norm per layer");
+
+        let expected_scales = [0.5f32, 1.0, 1.5, 2.0];
+        let expected_inv: Vec<f32> = expected_scales.iter().map(|s| 1.0 / s).collect();
+
+        // Sandwich layer: inverse lands on pre_feedforward_layernorm; the
+        // attention-output norm stays byte-identical.
+        let pre_ffn =
+            read(&weights["language_model.model.layers.0.pre_feedforward_layernorm.weight"]);
+        let post_attn =
+            read(&weights["language_model.model.layers.0.post_attention_layernorm.weight"]);
+        for j in 0..K as usize {
+            assert!(
+                (pre_ffn[j] - expected_inv[j]).abs() < 1e-5,
+                "layer 0 pre_feedforward_layernorm[{j}] = {} expected {}",
+                pre_ffn[j],
+                expected_inv[j]
+            );
+            assert!(
+                (post_attn[j] - 1.0).abs() < 1e-6,
+                "layer 0 post_attention_layernorm[{j}] must be untouched, got {}",
+                post_attn[j]
+            );
+        }
+
+        // Two-norm layer: unchanged behavior — inverse folds into
+        // post_attention_layernorm.
+        let qwen_norm =
+            read(&weights["language_model.model.layers.1.post_attention_layernorm.weight"]);
+        for j in 0..K as usize {
+            assert!(
+                (qwen_norm[j] - expected_inv[j]).abs() < 1e-5,
+                "layer 1 post_attention_layernorm[{j}] = {} expected {}",
+                qwen_norm[j],
+                expected_inv[j]
+            );
+        }
+
+        // Reparametrization invariant: gate columns × ffn-norm channels == 1.
+        let gate = read(&weights["language_model.model.layers.0.mlp.gate_proj.weight"]);
+        for j in 0..K as usize {
+            let prod = gate[j] * pre_ffn[j];
+            assert!(
+                (prod - 1.0).abs() < 1e-5,
+                "layer 0 gate[{j}] × pre_ffn_norm[{j}] = {prod}, fold must be balanced"
+            );
+        }
+    }
+
     /// Registry-consistency gate: for the exhaustive set of supported
     /// `model_type` strings (plus a non-convertible control), the four
     /// recipe-sourced asymmetry flags must reproduce EXACTLY the
@@ -5625,13 +5815,15 @@ mod tests {
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 
-            // sym8_supported == old sym8 allowlist (NOTE qwen3_5_moe excluded).
-            // gemma4_unified routes to Gemma4Recipe and supports sym8 like gemma4.
+            // sym8_supported allowlist: qwen3_5 (dense + MoE), lfm2/lfm2_moe,
+            // gemma4. gemma4_unified routes to Gemma4Recipe and supports sym8
+            // like gemma4. qwen3_5_moe dispatches sym8 on its non-expert
+            // sublayers (3-D stacked experts stay convert-forced affine-8).
             assert_eq!(
                 r.sym8_supported(),
                 matches!(
                     mt,
-                    "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
+                    "qwen3_5" | "qwen3_5_moe" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
                 ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );
@@ -5668,10 +5860,11 @@ mod tests {
         // unrecognized model_type's flags as false then errors at dispatch).
         assert!(recipe::recipe_for("not-a-real-model").is_none());
 
-        // qwen3_5 vs qwen3_5_moe sym8 asymmetry is the subtle case: same recipe
-        // family, opposite sym8 support.
+        // qwen3_5 and qwen3_5_moe share the recipe family and BOTH support
+        // sym8: the MoE loader dispatches sym8 on its non-expert sublayers,
+        // while per-expert switch_mlp tensors stay convert-forced affine-8.
         assert!(recipe::recipe_for("qwen3_5").unwrap().sym8_supported());
-        assert!(!recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
+        assert!(recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
     }
 
     /// Byte-faithfulness gate for `Gemma4Recipe::sanitize`. Builds a tiny
@@ -8346,6 +8539,189 @@ mod tests {
     }
 
     #[test]
+    fn sym8_group_coherence_covers_qwen35_moe_switch_and_shared_expert_groups() {
+        // qwen3_5_moe's loader builds the switch_mlp trio and the
+        // shared_expert trio all-or-none (`if let (Some, Some, Some)` in
+        // `qwen3_5_moe/persistence.rs`); a partial trio drops every member to
+        // the dense setters. One alignment-ineligible member must therefore
+        // force its whole trio dense. The router `.mlp.gate` and
+        // `.mlp.shared_expert_gate` resolve per tensor and must NOT be pulled
+        // dense by a sibling trio. Real MoE dims are 64-aligned, so only
+        // synthetic odd geometry exercises this.
+        let hidden = 64i64;
+        let odd = 24i64; // % 16 != 0 and % 64 != 0 → can never emit quantized
+
+        let w = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 (incoherent switch trio): gate/up experts are 3-D with
+        // K=64 (forced affine-8, would emit); down has K=24 → forced affine
+        // then alignment-skipped → the whole trio must stay dense. The
+        // router gate in the same layer is per-tensor and must still emit.
+        weights.insert("model.layers.0.mlp.gate.weight".into(), w(&[4, hidden]));
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, odd]),
+        );
+        // Layer 1 (incoherent shared_expert trio): gate/up are sym8-eligible
+        // (K=64), down has K=24 (sym8-ineligible → forced affine-8 →
+        // alignment-skipped) → the whole trio must stay dense. The
+        // shared-expert output gate is per-tensor and must still emit.
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.down_proj.weight".into(),
+            w(&[hidden, odd]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert_gate.weight".into(),
+            w(&[1, hidden]),
+        );
+        // Layer 2 (control): both trios fully 64-aligned → switch experts
+        // emit forced affine-8, shared_expert members emit sym8.
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.down_proj.weight".into(),
+            w(&[hidden, 32]),
+        );
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", false)
+            .expect("sym8 quantize with coherence pass must succeed");
+
+        // Incoherent trios: every member dense float, no sidecars, no
+        // overrides.
+        for base in [
+            "model.layers.0.mlp.switch_mlp.gate_proj",
+            "model.layers.0.mlp.switch_mlp.up_proj",
+            "model.layers.0.mlp.switch_mlp.down_proj",
+            "model.layers.1.mlp.shared_expert.gate_proj",
+            "model.layers.1.mlp.shared_expert.up_proj",
+            "model.layers.1.mlp.shared_expert.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("incoherent-trio member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Float32,
+                "{base} must stay dense float (whole-trio coherence)"
+            );
+            assert!(
+                !weights.contains_key(&format!("{base}.scales")),
+                "{base} must not gain a scales sidecar"
+            );
+            assert!(
+                !overrides.contains_key(base),
+                "{base} must not carry a per-layer override"
+            );
+        }
+
+        // Per-tensor gates next to the incoherent trios must still emit
+        // (forced affine-8 via `is_router_gate`) — proves the drop is
+        // trio-scoped and the gates are not table members.
+        for base in [
+            "model.layers.0.mlp.gate",
+            "model.layers.1.mlp.shared_expert_gate",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("gate weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} resolves per tensor and must still quantize affine-8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("affine gate under a sym8 default must carry an override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
+
+        // Control switch trio: forced affine-8 (packed Uint32 + override).
+        for base in [
+            "model.layers.2.mlp.switch_mlp.gate_proj",
+            "model.layers.2.mlp.switch_mlp.up_proj",
+            "model.layers.2.mlp.switch_mlp.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control switch member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} (aligned 3-D experts) must emit forced affine-8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("forced-affine expert must carry a per-layer override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
+
+        // Control shared_expert trio: genuine sym8 (int8 weight + f32
+        // scales, no override — sym8 IS the default here).
+        for base in [
+            "model.layers.2.mlp.shared_expert.gate_proj",
+            "model.layers.2.mlp.shared_expert.up_proj",
+            "model.layers.2.mlp.shared_expert.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control shared member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Int8,
+                "{base} (aligned 2-D shared expert) must quantize sym8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            assert!(
+                !overrides.contains_key(base),
+                "sym8-at-default member must not carry an override"
+            );
+        }
+    }
+
+    #[test]
     fn sym8_lfm2_embedding_stays_dense_bf16() {
         // Under a sym8 default with `embed_quantizable=true` (the lfm2 /
         // lfm2_moe convert call), the token embedding must emit NO quant
@@ -10119,7 +10495,7 @@ mod tests {
             "{lm_head_key} mode must be 'affine'"
         );
 
-        // embed_tokens: 2-bit affine, group_size=64
+        // embed_tokens: 2-bit affine, group_size=128
         let et_key = "language_model.model.embed_tokens";
         let et = quant.get(et_key).unwrap_or_else(|| {
             panic!("quantization block must contain per-layer override for {et_key}")
@@ -10127,8 +10503,8 @@ mod tests {
         assert_eq!(et["bits"].as_i64(), Some(2), "{et_key} bits must be 2");
         assert_eq!(
             et["group_size"].as_i64(),
-            Some(64),
-            "{et_key} group_size must be 64"
+            Some(128),
+            "{et_key} group_size must be 128"
         );
         assert_eq!(
             et["mode"].as_str(),
@@ -10295,5 +10671,175 @@ mod tests {
         eprintln!("vision_tower tensors are dense (no .scales) ✓");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Gemma-prequant conversions must write an HONEST top-level
+    /// `quantization` / `quantization_config` block. The importer repacks
+    /// every 2/4-bit module to MLX affine at group_size=128 (mode "affine",
+    /// bits per the E2B schedule) and records a complete per-layer override
+    /// for each — but the top-level values come from the `--quantize` CLI
+    /// defaults (group_size=64), which this path never uses. An external
+    /// mlx-lm-style loader that trusts the top-level default for any tensor
+    /// lacking an override would mis-dequantize at group 64.
+    ///
+    /// Fully synthetic (tiny tensors, no checkpoint needed): drives the real
+    /// `convert_model` pipeline end-to-end and asserts on the WRITTEN
+    /// config.json.
+    #[tokio::test]
+    async fn convert_model_gemma_prequant_top_level_block_is_honest() {
+        let base = std::env::temp_dir().join(format!(
+            "gemma_prequant_toplevel_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+
+        // config.json: gemma quant_method + the exact E2B module_quant_configs
+        // schedule `validate_e2b_qat_schedule` pins.
+        let config = serde_json::json!({
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "quant_method": "gemma",
+                "module_quant_configs": {
+                    "^lm_head$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                    "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                    "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                }
+            }
+        });
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .expect("write config.json");
+
+        // Synthetic source tensors in the wNa8o8 layout:
+        //  - 4-bit packed U8 `[out, in/2]` + per-row f32 scale `[out, 1]`
+        //  - 2-bit packed U8 `[out, in/4]` + per-row f32 scale
+        //  - I8 gate `[out, in]` + per-row f32 scale (dequants to dense bf16)
+        //  - float norm passthrough
+        // Two 4-bit modules vs one 2-bit module makes the modal bit-width an
+        // unambiguous 4, mirroring the real E2B checkpoint where 4-bit
+        // modules dominate.
+        let mut src: HashMap<String, MxArray> = HashMap::new();
+        let row_scales = [0.5f32, 0.25, 0.125, 0.0625];
+        for name in ["q_proj", "k_proj"] {
+            // 4-bit, in_features=128 → 64 packed bytes per row.
+            src.insert(
+                format!("model.language_model.layers.0.self_attn.{name}.weight"),
+                MxArray::from_uint8(&[0x88u8; 4 * 64], &[4, 64]).unwrap(),
+            );
+            src.insert(
+                format!("model.language_model.layers.0.self_attn.{name}.weight_scale"),
+                MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+            );
+        }
+        // 2-bit MLP linear (layer 20 ≥ 15), in_features=128 → 32 bytes per row.
+        src.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight".to_string(),
+            MxArray::from_uint8(&[0x66u8; 4 * 32], &[4, 32]).unwrap(),
+        );
+        src.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight_scale".to_string(),
+            MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+        );
+        // I8 per-layer gate → dense bf16 `.weight`, no `.scales`, no override.
+        src.insert(
+            "model.language_model.layers.0.per_layer_input_gate.weight".to_string(),
+            MxArray::from_int8(&[7i8; 4 * 16], &[4, 16]).unwrap(),
+        );
+        src.insert(
+            "model.language_model.layers.0.per_layer_input_gate.weight_scale".to_string(),
+            MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+        );
+        // Float passthrough.
+        src.insert(
+            "model.language_model.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[1.0f32; 16], &[16]).unwrap(),
+        );
+        crate::utils::safetensors::save_safetensors(
+            input.join("model.safetensors"),
+            &mut src,
+            None,
+        )
+        .expect("write synthetic model.safetensors");
+
+        let result = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4".to_string()),
+            quantize: None,
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .expect("synthetic gemma-prequant conversion must succeed");
+        assert!(result.num_tensors > 0);
+
+        let config_str = std::fs::read_to_string(output.join("config.json"))
+            .expect("output config.json must exist");
+        let out_config: serde_json::Value =
+            serde_json::from_str(&config_str).expect("output config.json must be valid JSON");
+        for block_key in ["quantization", "quantization_config"] {
+            let block = out_config.get(block_key).unwrap_or_else(|| {
+                panic!("output config.json must carry a top-level `{block_key}` block")
+            });
+            assert_eq!(
+                block["group_size"].as_i64(),
+                Some(128),
+                "top-level {block_key}.group_size must match the 128-group affine \
+                 sidecars the importer writes, got {:?}",
+                block["group_size"]
+            );
+            assert_eq!(
+                block["bits"].as_i64(),
+                Some(4),
+                "top-level {block_key}.bits must be the modal sidecar bit-width (4), got {:?}",
+                block["bits"]
+            );
+            assert_eq!(
+                block["mode"].as_str(),
+                Some("affine"),
+                "top-level {block_key}.mode must be 'affine', got {:?}",
+                block["mode"]
+            );
+            // Per-layer overrides keep their true (schedule) values.
+            assert_eq!(
+                block["language_model.model.layers.0.self_attn.q_proj"]["group_size"].as_i64(),
+                Some(128)
+            );
+            assert_eq!(
+                block["language_model.model.layers.0.self_attn.q_proj"]["bits"].as_i64(),
+                Some(4)
+            );
+            assert_eq!(
+                block["language_model.model.layers.20.mlp.down_proj"]["bits"].as_i64(),
+                Some(2)
+            );
+            // The I8-dequant gate is dense: it must NOT get an override entry.
+            assert!(
+                block
+                    .get("language_model.model.layers.0.per_layer_input_gate")
+                    .is_none(),
+                "I8-dequant modules are dense bf16 and must not carry an override"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

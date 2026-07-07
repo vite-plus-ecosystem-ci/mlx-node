@@ -8,7 +8,6 @@ use napi_derive::napi;
 
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
-use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup,
     ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
@@ -20,7 +19,6 @@ use crate::inference_trace::{
 };
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::profiling::PerformanceMetrics;
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -108,6 +106,7 @@ fn escape_gemma4_content(s: &str) -> String {
 
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
+use super::dspark::DsparkTap;
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -404,6 +403,27 @@ pub(crate) struct Gemma4Inner {
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// DSpark draft model for speculative decoding (`Gemma4LoadOptions::
+    /// draft_model_path`). Mutually exclusive with `paged_adapter`: the
+    /// load path hard-errors on an explicit `use_block_paged_cache: true`
+    /// conflict and forces the unset default to flat, so `dspark.is_some()`
+    /// implies `paged_adapter.is_none()`.
+    pub(crate) dspark: Option<super::dspark::DsparkDraftModel>,
+    /// Per-turn DSpark draft-context handoff: `dspark_chat_turn` builds the
+    /// draft's fused-context cache during its tapped prefill and stashes it
+    /// here; `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
+    /// stepper (the engine's `DsparkTurnSetup` carries only turn constants,
+    /// so prefill-derived state travels through this seam). Always `None`
+    /// outside a live `dspark_chat_turn`.
+    pub(crate) dspark_turn_state: Option<super::dspark_decode::DsparkTurnState>,
+    /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
+    /// computed once here in `Gemma4Inner::new` instead of re-derived
+    /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
+    /// decode-step call. Pure function of the immutable `config`, so it
+    /// never changes for the lifetime of this instance. Empty when
+    /// `paged_adapter` is `None`: every paged-only call site that reads it
+    /// errors out on a `None` adapter before consuming the value.
+    pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
@@ -471,6 +491,27 @@ pub struct Gemma4Model {
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// Snapshot of `Gemma4Inner::dspark.is_some()` captured at load time
+    /// (same mirroring pattern as `paged_active`): whether a DSpark draft
+    /// model was loaded via `Gemma4LoadOptions::draft_model_path`. Surfaced
+    /// through the `hasMtpWeights()` NAPI method (named for parity with the
+    /// Qwen3.5 surface) so server endpoints can branch without a
+    /// model-thread roundtrip. Stubs from `new(config)` always report
+    /// `false`.
+    pub(crate) dspark_active: bool,
+}
+
+/// Optional load-time settings for [`Gemma4Model::load`].
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct Gemma4LoadOptions {
+    /// Directory of a DSpark draft checkpoint (config.json +
+    /// model.safetensors) to load alongside the target model for
+    /// speculative decoding. DSpark runs only on the flat KV-cache path:
+    /// setting this while the model config explicitly enables
+    /// `use_block_paged_cache` is a hard load error, and an unset
+    /// `use_block_paged_cache` is forced to `false`.
+    pub draft_model_path: Option<String>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -971,6 +1012,27 @@ impl Gemma4Inner {
             None
         };
 
+        // Derive the per-layer paged-routing classification once here
+        // instead of on every paged prefill-chunk / decode-step call (see
+        // `compute_layer_kinds_from_kv_cache_specs`'s BTreeMap/BTreeSet
+        // grouping + sort). It's a pure function of `config`, which is
+        // immutable for the lifetime of this `Gemma4Inner`. Only meaningful
+        // when `paged_adapter` is `Some` — every caller first errors out on
+        // a `None` adapter before reading the result, so `Vec::new()` below
+        // is never read in that case. Guaranteed to succeed whenever
+        // `paged_adapter` built above, since that already validated a
+        // strictly stronger constraint (a single full-attention group) over
+        // the same specs.
+        let layer_kinds = if paged_adapter.is_some() {
+            compute_layer_kinds_from_kv_cache_specs(&config).map_err(|e| {
+                Error::from_reason(format!(
+                    "Gemma4Inner::new: failed to derive cached layer-kind routes: {e}"
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -990,6 +1052,9 @@ impl Gemma4Inner {
             cached_image_key: None,
             cached_audio_key: None,
             paged_adapter,
+            dspark: None,
+            dspark_turn_state: None,
+            layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
@@ -1024,17 +1089,17 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Build the per-layer routing list for the paged dispatch.
+    /// Return the per-layer routing list for the paged dispatch.
     ///
-    /// See [`compute_layer_kinds`] (free helper) for full semantics.
-    /// This wrapper is the on-`Gemma4Inner` entry point used by the
-    /// chat-session forward dispatch.
+    /// Cheap clone of `self.layer_kinds`, cached once in `Gemma4Inner::new`
+    /// instead of being re-derived (BTreeMap/BTreeSet grouping + a sort —
+    /// see [`compute_layer_kinds`] (free helper) and
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every call. It's a pure
+    /// function of the immutable `Gemma4Config`, so recomputing it from
+    /// scratch on every paged prefill-chunk / decode-step call was pure
+    /// waste.
     pub(crate) fn compute_layer_kinds(&self) -> Result<Vec<Gemma4LayerKind>> {
-        compute_layer_kinds_from_kv_cache_specs(&self.config).map_err(|e| {
-            Error::from_reason(format!(
-                "Gemma4 compute_layer_kinds: failed to derive KV routes: {e}"
-            ))
-        })
+        Ok(self.layer_kinds.clone())
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -4538,6 +4603,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
         // forward returns `[1, 1, vocab]`.
@@ -4573,6 +4639,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         Ok(())
     }
@@ -4912,6 +4979,20 @@ impl ChatBackend for Gemma4Inner {
         // channel segments itself). Defensive: pin `true` so the engine's
         // emitter gate can never suppress.
         p.include_reasoning = true;
+        // DSpark draft depth: with a draft model loaded, an unset
+        // `mtpDepth` runs full draft blocks (`block_size`, 7 on the v1
+        // checkpoint); an explicit value is clamped to `[1, block_size]`
+        // from the RAW config value — the engine's central clamp is
+        // `[1, 5]` (an MTP-head contract that does not apply to DSpark),
+        // so this family-local post-edit widens it without touching the
+        // shared clamp.
+        if let Some(draft) = self.dspark.as_ref() {
+            let block_size = draft.config.block_size;
+            p.mtp_depth = match config.mtp_depth {
+                Some(d) => (d.max(1) as usize).min(block_size),
+                None => block_size,
+            };
+        }
         p
     }
 
@@ -5173,6 +5254,7 @@ impl ChatBackend for Gemma4Inner {
                 &self.final_norm,
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?;
         }
         eval_gemma4_caches(
@@ -5201,6 +5283,7 @@ impl ChatBackend for Gemma4Inner {
                 self.embed_weight_t.as_ref(),
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?
         };
         logits.squeeze(Some(&[1]))
@@ -5364,11 +5447,11 @@ impl ChatBackend for Gemma4Inner {
         }
     }
 
-    fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
-        // No-op: gemma4 has no MTP heads (acceptance fields stay None) and
-        // its metrics carry no `profile_phases`. The default would only add
-        // profiling-gated extras; keep the payload byte-stable instead.
-    }
+    // `augment_performance` deliberately NOT overridden: the default
+    // (`profiler.fill_mtp_acceptance`) fills the `mtp_*` acceptance fields
+    // after a DSpark turn (and copies `profile_phases` when profiling is
+    // enabled). AR turns record no MTP cycle, so their acceptance fields
+    // stay `None` as before.
 
     fn has_live_session(&self) -> bool {
         // Requires an initialized session: a non-empty
@@ -5386,6 +5469,24 @@ impl ChatBackend for Gemma4Inner {
         // paged engine, which drives the adapter lifecycle via
         // [`PagedBackend`] and reuses the shared `run_decode_loop`.
         Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    }
+
+    /// DSpark speculative-decode whole-turn path. Dispatches only when the
+    /// request opted in (`enableMtp`), a draft model is loaded, the flat KV
+    /// path is active (no paged adapter — enforced at load, re-checked here
+    /// defensively), and the turn is text-only (image/audio turns were
+    /// already routed to `vision_turn` by the session core; re-checked
+    /// defensively). Everything else falls through to the generic AR flow.
+    fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        if !(args.params.enable_mtp
+            && self.dspark.is_some()
+            && self.paged_adapter.is_none()
+            && args.images.is_empty()
+            && args.audio.is_empty())
+        {
+            return None;
+        }
+        Some(self.dspark_chat_turn(args))
     }
 
     fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
@@ -5485,6 +5586,7 @@ impl Gemma4Model {
             initialized: false,
             paged_active: false,
             _cache_limit_guard: None,
+            dspark_active: false,
         }
     }
 
@@ -5515,10 +5617,61 @@ impl Gemma4Model {
         self.model_id as u32
     }
 
+    /// Whether a DSpark draft model is loaded on this instance (via
+    /// `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
+    /// decode whole-turn path.
+    ///
+    /// Note: this only reports draft availability. Whether speculative
+    /// decoding actually runs on a given call also requires the per-request
+    /// `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+    /// surface, but it reports an external DSpark draft model, not
+    /// in-checkpoint MTP heads. Stubs from `new(config)` always return
+    /// `false`.
+    #[napi]
+    pub fn has_mtp_weights(&self) -> bool {
+        self.dspark_active
+    }
+
     /// Load a Gemma4 model from a directory.
     #[napi]
-    pub async fn load(model_path: String) -> Result<Gemma4Model> {
-        Self::load_from_dir(&model_path).await
+    pub async fn load(
+        model_path: String,
+        options: Option<Gemma4LoadOptions>,
+    ) -> Result<Gemma4Model> {
+        Self::load_from_dir(&model_path, options).await
+    }
+
+    /// Test-only entry point that dispatches `ChatCmd::StreamSessionStart`
+    /// and returns the raw mpsc receiver the model thread writes into, so a
+    /// pure-Rust integration test can exercise the streaming path without a
+    /// NAPI host (same pattern as `Qwen3_5Model::chat_stream_session_start_for_test`).
+    #[doc(hidden)]
+    pub fn chat_stream_session_start_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        thread.send(ChatCmd::StreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
     }
 }
 
@@ -5723,7 +5876,11 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 ///
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
-fn forward_body(
+///
+/// When `tap` is provided, the residual-stream hidden of each tapped layer
+/// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
+/// `layer_ids` order; the compute graph is otherwise unchanged.
+pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
     inputs_embeds: Option<MxArray>,
     embedding: &Embedding,
@@ -5733,7 +5890,22 @@ fn forward_body(
     ple: Option<&PleComponents>,
     per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
+    if let Some(t) = tap.as_deref() {
+        let mut previous: Option<usize> = None;
+        for &id in t.layer_ids {
+            if id >= layers.len() || previous.is_some_and(|prev| id <= prev) {
+                return Err(Error::from_reason(format!(
+                    "forward_body: tap layer_ids {:?} must be strictly ascending decoder indices below {}",
+                    t.layer_ids,
+                    layers.len()
+                )));
+            }
+            previous = Some(id);
+        }
+    }
+
     // Step 1: Embedding (or use pre-computed embeddings)
     let mut h = if let Some(embeds) = inputs_embeds {
         embeds
@@ -5884,6 +6056,15 @@ fn forward_body(
                 shared_kv.insert(i, (keys, values));
             }
         }
+
+        // Residual-stream hidden of layer i (post residual add, pre
+        // final-norm — HF `hidden_states[i + 1]`), captured for both the
+        // regular and the KV-shared branch.
+        if let Some(t) = tap.as_deref_mut()
+            && t.layer_ids.contains(&i)
+        {
+            t.captured.push(h.clone());
+        }
     }
 
     // Final norm
@@ -5893,7 +6074,7 @@ fn forward_body(
 /// Full forward pass: transformer body + lm_head + logit softcapping.
 ///
 /// Used for the final prefill chunk and for each decode step.
-fn forward_inner(
+pub(crate) fn forward_inner(
     input_ids: &MxArray,
     embedding: &Embedding,
     layers: &[Gemma4DecoderLayer],
@@ -5903,6 +6084,7 @@ fn forward_inner(
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
     let h = forward_body(
         Some(input_ids),
@@ -5914,6 +6096,7 @@ fn forward_inner(
         ple,
         None,
         config,
+        tap,
     )?;
 
     crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &h, None);
@@ -5947,9 +6130,58 @@ fn forward_inner(
     }
 }
 
+/// Run the target over a `[1, T]` verify block at the current cache offset,
+/// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
+///
+/// This is exactly the existing T>1-at-offset forward (`forward_inner`, with
+/// the same masks/rope the chunked prefill uses). It does not sample and
+/// touches no history bookkeeping; caches advance by T. Callers pair it with
+/// `snapshot_before_verify` / `commit_after_verify` for rollback.
+pub(crate) fn dspark_verify_forward(
+    block_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+    tap: &mut DsparkTap<'_>,
+) -> Result<MxArray> {
+    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
+        return Err(Error::from_reason(format!(
+            "dspark_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
+            block_ids.shape()?.as_ref()
+        )));
+    }
+    forward_inner(
+        block_ids,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embed_weight_t,
+        ple,
+        config,
+        Some(tap),
+    )
+}
+
+/// Shared-slot mask for `snapshot_before_verify`, index-aligned with the
+/// per-layer caches vec: entry i is true iff decoder layer i is KV-shared.
+/// Shared layers read their anchor layer's cache; their own vec entry is
+/// never written by a forward pass.
+pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
+    (0..config.num_hidden_layers as usize)
+        .map(|i| config.is_kv_shared_layer(i))
+        .collect()
+}
+
 /// Compute PLE (per-layer embeddings) from input_ids.
 /// Returns shape [B, T, num_layers, ple_dim].
-fn compute_ple(
+pub(crate) fn compute_ple(
     input_ids: &MxArray,
     h: &MxArray,
     ple: &PleComponents,
@@ -6214,7 +6446,7 @@ fn gemma4_default_paged_cache_memory_mb(
 /// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
 /// which can GPU-timeout with very large graphs. Using 512 keeps individual
 /// command buffers under Metal's timeout limit.
-const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
+pub(crate) const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
@@ -6629,7 +6861,7 @@ fn gemma4_paged_prefill_body_chunk_plan_inner(
 
 /// Evaluate all Gemma4 cache arrays to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
+pub(crate) fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
     let mut arrays: Vec<&MxArray> = Vec::new();
     for cache in caches {
         cache.collect_cache_arrays(&mut arrays);
@@ -6672,6 +6904,7 @@ fn prefill_body_gemma4(
     final_norm: &RMSNorm,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
 
@@ -6717,6 +6950,7 @@ fn prefill_body_gemma4(
             ple,
             chunk_ple.as_ref(),
             config,
+            tap.as_deref_mut(),
         )?;
         eval_gemma4_caches(caches)?;
         crate::array::clear_cache();
@@ -6741,6 +6975,7 @@ fn prefill_body_gemma4(
             ple,
             remaining_ple.as_ref(),
             config,
+            tap,
         )?;
     }
 
@@ -8884,6 +9119,158 @@ mod tests {
         }
     }
 
+    /// Element-wise comparison for `Gemma4LayerKind`, which intentionally
+    /// does not derive `PartialEq` (mirrors `Lfm2LayerKind`, which doesn't
+    /// either — this codebase's existing tests compare these routing enums
+    /// via `matches!`/`match`, not `assert_eq!`).
+    fn layer_kind_matches(a: &super::Gemma4LayerKind, b: &super::Gemma4LayerKind) -> bool {
+        use super::Gemma4LayerKind::*;
+        match (a, b) {
+            (Sliding, Sliding) => true,
+            (GlobalPaged { paged_idx: x }, GlobalPaged { paged_idx: y }) => x == y,
+            (
+                SharedOnGlobal {
+                    anchor_paged_idx: x,
+                },
+                SharedOnGlobal {
+                    anchor_paged_idx: y,
+                },
+            ) => x == y,
+            (
+                SharedOnSliding {
+                    anchor_layer_idx: x,
+                },
+                SharedOnSliding {
+                    anchor_layer_idx: y,
+                },
+            ) => x == y,
+            _ => false,
+        }
+    }
+
+    /// `Gemma4Inner::new` must cache `layer_kinds` once instead of
+    /// re-deriving it (BTreeMap/BTreeSet grouping + a sort, see
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every paged
+    /// prefill-chunk / decode-step call. The cached field must always equal
+    /// a fresh from-scratch computation over the same config — covers
+    /// all-global, hybrid sliding+global, and KV-shared layouts (mirrors
+    /// the three `test_compute_layer_kinds_*` cases above).
+    #[test]
+    fn test_gemma4_inner_caches_layer_kinds_matching_fresh_compute() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+
+        let all_global = super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec!["full_attention".to_string(); 4],
+            ..paged_tiny_config(Some(true))
+        };
+
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let hybrid = super::Gemma4Config {
+            num_hidden_layers: 10,
+            layer_types: (0..10).map(|i| cycle[i % 5].clone()).collect(),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let shared_layer_types: Vec<String> = (0..8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        let kv_shared = super::Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types: shared_layer_types,
+            num_kv_shared_layers: Some(4),
+            ..paged_tiny_config(Some(true))
+        };
+
+        for cfg in [all_global, hybrid, kv_shared] {
+            let expected = super::compute_layer_kinds_from_kv_cache_specs(&cfg)
+                .expect("fresh layer-kind computation must succeed for a valid paged config");
+            let inner = match super::Gemma4Inner::new(cfg) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("No Metal device found") {
+                        eprintln!("skipping (no Metal device): {msg}");
+                        return;
+                    }
+                    panic!("unexpected Gemma4Inner::new failure: {msg}");
+                }
+            };
+            assert!(
+                inner.paged_adapter.is_some(),
+                "test configs force use_block_paged_cache=true"
+            );
+            assert_eq!(
+                inner.layer_kinds.len(),
+                expected.len(),
+                "cached layer_kinds length must match a fresh compute"
+            );
+            for (i, (got, want)) in inner.layer_kinds.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    layer_kind_matches(got, want),
+                    "layer {i}: cached layer_kinds diverged from fresh compute: \
+                     got {got:?}, want {want:?}"
+                );
+            }
+        }
+    }
+
+    /// Manual timing probe (not a correctness gate — `#[ignore]`d so it
+    /// never runs in CI). Measures the per-call cost this task eliminates:
+    /// re-deriving the routing table from scratch (BTreeMap/BTreeSet + sort)
+    /// vs. the cached `Vec::clone`. Pure CPU, no GPU/model weights, immune
+    /// to thermal throttling. Run with:
+    /// `cargo test -p mlx-core --release --lib -- --ignored --nocapture \
+    ///  bench_layer_kinds_manual`
+    #[test]
+    #[ignore]
+    fn bench_layer_kinds_manual() {
+        // Scaled to ~48 layers with a realistic 5:1 sliding:global cycle
+        // and KV-sharing, so the BTreeMap/BTreeSet grouping + sort has a
+        // realistic amount of work to do.
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 48,
+            layer_types: (0..48).map(|i| cycle[i % 5].clone()).collect(),
+            num_kv_shared_layers: Some(8),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let n: u32 = 200_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                super::compute_layer_kinds_from_kv_cache_specs(std::hint::black_box(&cfg)).unwrap(),
+            );
+        }
+        eprintln!("recompute: {:?}/call", start.elapsed() / n);
+
+        let cached = super::compute_layer_kinds_from_kv_cache_specs(&cfg).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(std::hint::black_box(&cached).clone());
+        }
+        eprintln!("cached clone: {:?}/call", start.elapsed() / n);
+    }
+
     #[test]
     fn test_compute_layer_kv_cache_specs_group_full_sliding_and_shared_aliases() {
         let layer_types: Vec<String> = (0..8)
@@ -9214,6 +9601,280 @@ mod tool_delta_marker_tests {
         assert_eq!(
             occurrences, 1,
             "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod dspark_tap_tests {
+    //! Tap purity: threading a `DsparkTap` through the Gemma4 forward
+    //! paths must leave the compute graph byte-identical to a tap-less
+    //! run, while capturing the residual-stream hiddens of the tapped
+    //! layers. Runs a tiny random-weight Gemma4 (4 layers, hybrid
+    //! sliding/global types, one KV-shared layer) through the REAL
+    //! `forward_body` / `forward_inner` / `dspark_verify_forward` paths.
+
+    use super::*;
+    use crate::models::gemma4::dspark::DsparkTap;
+
+    fn tiny_config() -> Gemma4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+        }))
+        .expect("tiny Gemma4 config must deserialize")
+    }
+
+    fn tiny_model(config: &Gemma4Config) -> (Embedding, Vec<Gemma4DecoderLayer>, RMSNorm) {
+        let embedding =
+            Embedding::new(config.vocab_size as u32, config.hidden_size as u32).unwrap();
+        let layers: Vec<Gemma4DecoderLayer> = (0..config.num_hidden_layers as usize)
+            .map(|i| Gemma4DecoderLayer::new(config, i).unwrap())
+            .collect();
+        let final_norm =
+            RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps)).unwrap();
+        (embedding, layers, final_norm)
+    }
+
+    fn assert_bitwise_eq(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        assert_eq!(
+            a.shape().unwrap().to_vec(),
+            b.shape().unwrap().to_vec(),
+            "{ctx}: shape"
+        );
+        let a_bits: Vec<u32> = a
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let b_bits: Vec<u32> = b
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(a_bits, b_bits, "{ctx}: bits");
+    }
+
+    #[test]
+    fn dspark_tap_purity_and_verify_forward() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+
+        // 6-token prefill then a 3-token verify block: the block runs
+        // T>1 at offset 6, which also crosses the sliding window (6+3 > 8)
+        // so the windowed-mask path is exercised.
+        let prefill_ids = MxArray::from_int32(&[3, 9, 17, 25, 33, 41], &[1, 6]).unwrap();
+        let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
+
+        // Pass A: no tap.
+        let mut caches_a = init_caches_for_config(&config);
+        let hidden_a = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        let logits_a = forward_inner(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+
+        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1),
+        // with the real snapshot → verify → commit flow around the verify.
+        let layer_ids = [0usize, 2, 3];
+        let shared_slots = dspark_shared_slot_mask(&config);
+        assert_eq!(
+            shared_slots,
+            vec![false, false, false, true],
+            "config-derived shared-slot mask"
+        );
+        let mut caches_b = init_caches_for_config(&config);
+        let mut prefill_tap = DsparkTap::new(&layer_ids);
+        let hidden_b = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            None,
+            None,
+            &config,
+            Some(&mut prefill_tap),
+        )
+        .unwrap();
+        let rollback = super::super::layer_cache::snapshot_before_verify(
+            &caches_b,
+            block_ids.shape_at(1).unwrap() as usize,
+            &shared_slots,
+        )
+        .unwrap();
+        let mut verify_tap = DsparkTap::new(&layer_ids);
+        let logits_b = dspark_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            &mut verify_tap,
+        )
+        .unwrap();
+
+        // Tap must not perturb the compute graph.
+        assert_bitwise_eq(&hidden_a, &hidden_b, "prefill hidden");
+        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
+        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 64]);
+
+        // One [B, T, hidden] capture per tapped layer, per forward call.
+        assert_eq!(prefill_tap.captured.len(), layer_ids.len());
+        for arr in &prefill_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 6, 32]);
+        }
+        assert_eq!(verify_tap.captured.len(), layer_ids.len());
+        for arr in &verify_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 3, 32]);
+        }
+
+        // Different layers must yield different hiddens (real per-layer
+        // captures, not one array pushed repeatedly).
+        let first = verify_tap.captured[0].to_float32().unwrap().to_vec();
+        let second = verify_tap.captured[1].to_float32().unwrap().to_vec();
+        assert_ne!(first, second, "captures must differ across layers");
+
+        // Caches advance by T on both passes; the KV-shared layer's own
+        // vec entry is never written (it reads its anchor's cache).
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
+            assert_eq!(caches_a[idx].get_offset(), 9, "cache {idx} tapless offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched"
+        );
+
+        // Partial-keep commit on the real model: active caches land at
+        // prefill + keep, the shared slot stays untouched.
+        super::super::layer_cache::commit_after_verify(&mut caches_b, &rollback, 1).unwrap();
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched after commit"
+        );
+    }
+
+    #[test]
+    fn dspark_tap_rejects_unsorted_or_out_of_range_layer_ids() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let ids = MxArray::from_int32(&[3, 9], &[1, 2]).unwrap();
+
+        for bad in [vec![2usize, 0], vec![1, 1], vec![7]] {
+            let mut caches = init_caches_for_config(&config);
+            let mut tap = DsparkTap::new(&bad);
+            let result = forward_body(
+                Some(&ids),
+                None,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                None,
+                None,
+                &config,
+                Some(&mut tap),
+            );
+            assert!(result.is_err(), "layer_ids {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dspark_verify_forward_rejects_bad_block_shape() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let layer_ids = [0usize];
+
+        // Batch > 1 is rejected.
+        let batch2 = MxArray::from_int32(&[1, 2], &[2, 1]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &batch2,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
+        );
+
+        // 1-D input is rejected.
+        let flat = MxArray::from_int32(&[1, 2], &[2]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &flat,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
         );
     }
 }

@@ -55,6 +55,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 - Multi-turn `ChatSession` with live KV cache reuse
 - Streaming generation via `sendStream()`
 - Tool calling and chat templates
+- Speculative decoding: Qwen3.5 MTP heads, Gemma4 DSpark draft models ([docs](docs/models.md#speculative-decoding-gemma4--dspark))
 
 </td>
 <td width="33%" valign="top">
@@ -120,6 +121,15 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 | macOS · Apple Silicon (M1–M5)    | Metal   | ✅ Fully supported (inference · training · VLM) |
 | Linux · aarch64 / glibc · NVIDIA | CUDA    | 🧪 Experimental — inference preview             |
 
+> **macOS version floor:** the prebuilt `darwin-arm64` binaries published to npm are
+> built with an explicit macOS 26.0 deployment floor (MSL 4) — they load on every
+> macOS 26 release and do not load on macOS 15 or older, so **macOS 26+ is required
+> for the prebuilt binaries**. They also carry MLX's NAX kernels (M5-class GPUs),
+> which activate only at runtime on macOS 26.2+ — on 26.0/26.1 the same binary runs
+> the standard kernels. Building from source works on macOS ≥ 14 (MLX's floor); the
+> deployment floor then defaults to the build host's macOS version, and can be pinned
+> explicitly with `MACOSX_DEPLOYMENT_TARGET`.
+
 ### NVIDIA CUDA (experimental preview)
 
 MLX-Node runs on NVIDIA GPUs through MLX's CUDA backend. This is an early
@@ -151,6 +161,7 @@ MLX_QWEN35_FORCE_EAGER=1 MLX_QWEN35_PAGED_OVERRIDE=0 \
 ### Prerequisites
 
 - macOS with Apple Silicon (M1–M5) and Metal — fully supported
+  - macOS 26+ for the prebuilt npm binaries; macOS ≥ 14 to build from source (see [Platform Support](#platform-support))
 - Node.js 18+
 - Rust 1.90
 

@@ -22,7 +22,8 @@ use crate::inference_trace::{
 use crate::model_thread::ResponseTx;
 use crate::models::qwen3_5::model::{
     VisionCache, VisionCacheInner, async_eval_layer_caches, compute_image_token_counts_per_image,
-    eval_layer_caches, inject_image_placeholders, vlm_prepare_vision_features,
+    eval_layer_caches, inject_image_placeholders, partition_prefill_chunks,
+    vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -34,7 +35,6 @@ use super::mtp::Qwen3_5MoeMTPModule;
 use super::persistence;
 use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
-use crate::array::mask::create_causal_mask;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::{
@@ -279,7 +279,7 @@ pub(crate) struct Qwen35MoeInner {
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
-    /// consumed by [`ChatBackend::begin_decode`]'s compiled/eager
+    /// consumed by [`ChatBackend::begin_decode`]'s
     /// profiler relabel, which must pick the `moe_chat_*` vs
     /// `moe_chat_stream_*` label family (`TurnSetup` does not carry
     /// streaming-ness). Whole-turn override paths (vision/paged/MTP)
@@ -1308,9 +1308,12 @@ impl Qwen35MoeInner {
         if eager_mtp {
             // Pure-Rust eager MoE MTP — the propose/verify whole-turn loop is
             // engine-owned (`engine::run_mtp_turn`) and drives the
-            // `MoeMtpStepper` (`MtpBackend::begin_mtp_decode`). Cycle-history
-            // v1: no prompt-prefix seed, so the `prompt_hidden*` setup fields
-            // are `None`/`0`. The `profiler.set_label("moe_mtp_eager")` relabel
+            // `MoeMtpStepper` (`MtpBackend::begin_mtp_decode`). Committed-
+            // history v2 activates within-turn (persistent drafter cache
+            // across cycles) when its opt-in flag is on; the prompt-prefix seed
+            // itself stays inert here because this call site has no MoE
+            // hidden-emitting prefill yet, so `prompt_hidden`/`prompt_hidden_ids`
+            // stay `None`. The `profiler.set_label("moe_mtp_eager")` relabel
             // moved into `MoeMtpStepper::profiler_relabel`.
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
@@ -2393,11 +2396,13 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
-        // Pure-Rust paged prefill: writes K/V into the adapter pool via
-        // `update_keys_values` per layer (Metal kernel dispatch — direct
-        // buffer mutation, NOT MLX graph) and populates the GDN linear
-        // caches in `Qwen3_5LayerCache::Linear(ArraysCache)`. Both are
-        // exactly what the C++ compiled paged decode reads as inputs.
+        // Pure-Rust paged prefill: writes K/V into the adapter pool per
+        // layer via `update_keys_values_native` (graph-native `PagedKVWrite`
+        // primitive — the default; the synchronous raw-Metal
+        // `update_keys_values` is the error/opt-out fallback) and populates
+        // the GDN linear caches in `Qwen3_5LayerCache::Linear(ArraysCache)`.
+        // Both are exactly what the pure-Rust paged decode steps
+        // (`paged_forward::run_paged_decode_step`) read as inputs.
         let last_logits = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
@@ -2514,8 +2519,9 @@ impl Qwen35MoeInner {
 
     /// Block-paged streaming variant for MoE — mirrors dense
     /// `paged_turn_stream_core`. See [`Self::paged_turn_sync_core`]
-    /// for the C++ compiled paged dispatch rationale; the streaming path
-    /// uses the same lock acquisition + fall-back semantics.
+    /// for the paged dispatch rationale (pure-Rust paged prefill + decode
+    /// against the adapter pool); the streaming path uses the same
+    /// adapter lifecycle + prefix-reuse semantics.
     #[allow(clippy::too_many_arguments)]
     fn paged_turn_stream_core(
         &mut self,
@@ -3768,7 +3774,9 @@ impl Qwen35MoeInner {
         if eager_mtp {
             // Delta-continuation eager MoE MTP — same engine-owned
             // `run_mtp_turn` loop + `MoeMtpStepper` as the fresh-prefill sync
-            // site (cycle-history v1: no prompt-prefix seed).
+            // site (committed-history v2 within-turn when its opt-in flag is on;
+            // prompt-prefix seed inert here — see the `MoeMtpStepper` struct
+            // doc).
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
 
@@ -4044,7 +4052,9 @@ impl Qwen35MoeInner {
         if eager_mtp {
             // Streaming delta-continuation eager MoE MTP — same engine-owned
             // `run_mtp_turn` loop + `MoeMtpStepper` + `StreamingCtx` as the
-            // fresh-prefill stream site (cycle-history v1: no prompt seed).
+            // fresh-prefill stream site (committed-history v2 within-turn when
+            // its opt-in flag is on; prompt-prefix seed inert here — see the
+            // `MoeMtpStepper` struct doc).
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
 
@@ -4590,6 +4600,16 @@ impl Qwen35MoeInner {
         })?;
         if let serde_json::Value::Object(ref mut map) = config_value {
             map.insert("model_type".to_string(), serde_json::json!("qwen3_5_moe"));
+            // `parse_config` reads the MTP layer count ONLY from the
+            // HF-convention keys `mtp_num_hidden_layers` /
+            // `num_nextn_predict_layers`; the serde field name
+            // `n_mtp_layers` is ignored on load. Without this, a saved MTP
+            // checkpoint reloads with `n_mtp_layers = 0` and its head is
+            // silently dropped.
+            map.insert(
+                "mtp_num_hidden_layers".to_string(),
+                serde_json::json!(self.config.n_mtp_layers),
+            );
         }
 
         let weights_json = serde_json::json!({
@@ -5985,8 +6005,8 @@ impl Qwen35MoeInner {
     /// [`Self::vision_mtp_whole_turn_stream_core`], delta streaming →
     /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
     /// every MoE-path subtlety the generic flow does not model: VLM
-    /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
-    /// AR), the paged-always-wins dispatch (including the
+    /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back
+    /// to AR when ineligible), the paged-always-wins dispatch (including the
     /// paged-text-only rejection for image turns — unlike dense, MoE
     /// has NO `mtp_takes_dense_path` exception: its paged early-return
     /// runs before any MTP consideration on every path).
@@ -6828,22 +6848,60 @@ impl ChatBackend for Qwen35MoeInner {
     }
 }
 
+/// Opt-in gate for the MoE MTP committed-history v2 path. Default OFF: the
+/// drafter cache retention policy is an unvalidated perf change (v2 adds
+/// per-cycle commit work whose accept-rate payoff is unmeasured), so it ships
+/// behind this flag until a same-checkpoint A/B confirms the win. When off,
+/// `MoeMtpStepper::use_committed` is `false` at every site and the stepper is
+/// byte-for-byte the prior cycle-history v1. Read once on first call and
+/// cached; subsequent reads hit the `OnceLock` fast path.
+fn moe_mtp_committed_history_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default(
+            "MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY",
+            false,
+        )
+    })
+}
+
 /// Per-turn MTP propose/verify stepper for the MoE family's FLAT eager path
 /// that [`crate::engine::mtp_turn::run_mtp_turn`] drives.
 ///
-/// CYCLE-HISTORY v1: the drafter cache is reset fresh by [`Self::begin_cycle`]
-/// every cycle and [`Self::commit_mtp`] is a no-op, so the stepper carries no
-/// persistent committed prefix and no committed-length cursor — the simpler
-/// policy the MoE eager MTP path has always run. FLAT-ONLY: the main forward,
-/// verify, and rollback all act on `inner.caches`; there is no paged routing,
-/// adapter, or `MtpStepMode` here.
+/// COMMITTED-HISTORY v2 (mirrors dense's `DenseMtpStepper`): when
+/// `use_committed` holds, [`Self::begin_cycle`] only truncates the prior
+/// cycle's speculative draft tail back to `committed_len` (never rebuilding a
+/// fresh cache) and [`Self::commit_mtp`] appends each cycle's newly committed
+/// tokens' exact K/V, so the drafter's cache persists across cycles within a
+/// turn. `use_committed` is opt-in: it requires the
+/// `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag AND
+/// `setup.prompt_hidden_position_base == 0`. With the flag off (the default)
+/// `use_committed` is `false`, so this stepper falls back to CYCLE-HISTORY v1
+/// (fresh drafter cache each cycle, no-op commit) — byte-for-byte the prior
+/// behavior. The prompt-prefix seed in [`MtpBackend::begin_mtp_decode`]
+/// mirrors dense's byte-for-byte but is currently INERT: no MoE call site
+/// populates a real `prompt_hidden`/`prompt_hidden_ids` yet (there is no MoE
+/// hidden-emitting prefill), so even with the flag on, cycle 1 of every turn
+/// still starts the drafter from an empty cache — only cycles 2+ within the
+/// SAME turn benefit today. FLAT-ONLY: the main forward, verify, and rollback
+/// all act on `inner.caches`; there is no paged routing, adapter, or
+/// `MtpStepMode` here.
 pub(crate) struct MoeMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
     /// `flat_mtp_caches_desynced` latch.
     inner: &'a mut Qwen35MoeInner,
-    /// Drafter K/V caches, reset fresh each cycle by [`Self::begin_cycle`]
-    /// (cycle-history v1).
+    /// Drafter K/V caches. v2 committed-history mode (`use_committed`) holds
+    /// the persistent committed prefix; v1 cycle-history mode (the flag-off
+    /// default, or the `position_base != 0` fallback) is reset fresh by
+    /// [`Self::begin_cycle`].
     mtp_caches: Vec<Qwen3_5LayerCache>,
+    /// Eager analogue of dense's committed-length cursor: committed tokens
+    /// whose exact K/V live in `mtp_caches`.
+    committed_len: i32,
+    /// Committed-history active iff the opt-in flag is on AND the prompt tail's
+    /// hiddens start at absolute position 0 — mirrors
+    /// `DenseMtpStepper::use_committed`.
+    use_committed: bool,
     /// Pre-verify snapshot of the main caches, taken in
     /// [`Self::snapshot_main_linear`], consumed by [`Self::rollback`].
     snap: Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
@@ -6873,7 +6931,7 @@ impl MtpStepper for MoeMtpStepper<'_> {
     }
 
     fn committed_history_active(&self) -> bool {
-        false
+        self.use_committed
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
@@ -7080,23 +7138,95 @@ impl MtpStepper for MoeMtpStepper<'_> {
         Ok(())
     }
 
-    // Cycle-history v1: no committed-history commit.
+    // Committed-history commit. Mirrors `DenseMtpStepper::commit_mtp`.
+    //
+    // v1 (`!use_committed`): no-op.
+    //
+    // v2 (`use_committed`): append the M newly committed tokens' EXACT K/V to
+    // the persistent MTP cache via one multi-token drafter forward.
     fn commit_mtp(
         &mut self,
-        _anchor: mtp_decode::MtpCommitAnchor,
-        _seed_hidden: &MxArray,
-        _verify_hiddens: &MxArray,
-        _committed_ids: &[u32],
+        anchor: mtp_decode::MtpCommitAnchor,
+        seed_hidden: &MxArray,
+        verify_hiddens: &MxArray,
+        committed_ids: &[u32],
         _k_accepted: usize,
-        _emb: &MxArray,
+        emb: &MxArray,
     ) -> Result<()> {
+        if !self.use_committed {
+            return Ok(());
+        }
+        let m = committed_ids.len();
+        if m == 0 {
+            return Ok(());
+        }
+        let hidden_dim = verify_hiddens.shape_at(2)?;
+
+        // Assemble hidden_seq [1, M, hidden] per anchor.
+        let hidden_seq = match anchor {
+            mtp_decode::MtpCommitAnchor::IncludeAnchor => {
+                // seed_hidden ++ verify_hiddens[:, 0..M-1, :].
+                let vh_prefix =
+                    verify_hiddens.slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
+                MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
+            }
+            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
+                // verify_hiddens[:, 0..M, :].
+                verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
+            }
+        };
+
+        // Gather the M committed-token input embeddings → [1, M, hidden].
+        let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
+        let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
+        let gathered = emb.take(&ids_arr, 0)?;
+        let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
+
+        // Drop this cycle's draft K/V (written past committed_len by the draft
+        // steps), then write the exact committed K/V via one multi-token
+        // forward.
+        let inner = &mut *self.inner;
+        let mtp = inner.mtp.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "eager MoE MTP commit_mtp: inner.mtp is None despite \
+                 has_mtp_weights() gate",
+            )
+        })?;
+        let caches = &mut self.mtp_caches;
+        for c in caches.iter_mut() {
+            if let Some(kv) = c.as_kv_cache_mut() {
+                kv.trim(self.committed_len);
+            }
+        }
+        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
+        self.committed_len += m as i32;
         Ok(())
     }
 
-    // Cycle-history v1: reset the drafter cache to a fresh cache each cycle
-    // (the `chained_anchor` re-anchor is dense committed-history only).
-    fn begin_cycle(&mut self, _chained_anchor: bool) {
-        self.mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&self.config);
+    // Re-anchor the drafter cache at the start of each cycle. Mirrors
+    // `DenseMtpStepper::begin_cycle`.
+    //
+    // v1 (`!use_committed`): reset to a fresh cache.
+    //
+    // v2 (`use_committed`): the cache is PERSISTENT; truncate the prior
+    // cycle's draft tail back to the re-anchor target. `chained_anchor`
+    // cycles anchor one slot earlier (`committed_len - 1`); Step-A cycles at
+    // `committed_len`.
+    fn begin_cycle(&mut self, chained_anchor: bool) {
+        if !self.use_committed {
+            self.mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&self.config);
+            return;
+        }
+        let target = if chained_anchor {
+            (self.committed_len - 1).max(0)
+        } else {
+            self.committed_len
+        };
+        for c in self.mtp_caches.iter_mut() {
+            if let Some(kv) = c.as_kv_cache_mut() {
+                kv.trim(target);
+            }
+        }
     }
 
     // Bound the lazy graph: materialize the token plus the main GDN/full-attn
@@ -7139,17 +7269,27 @@ impl MtpBackend for Qwen35MoeInner {
         Self: 'a;
 
     fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
-        // Cycle-history v1 ignores the prompt-prefix seed (the dense
-        // committed-history v2 prompt commit has no analog here).
-        let _ = setup;
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let config = self.config.clone();
-        let mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&config);
         let fa_idx = self.fa_idx;
-        Ok(MoeMtpStepper {
+
+        // Committed-history is opt-in (default off) and only correct when the
+        // prompt tail's hiddens start at absolute position 0 (the eager
+        // drafter derives RoPE purely from the local cache offset) — mirrors
+        // `DenseMtpStepper::begin_mtp_decode`'s gate, plus the
+        // `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag. No MoE call site
+        // populates a real `prompt_hidden_position_base` yet (see the struct
+        // doc), so the position gate is always satisfied today; the flag is
+        // what makes this `true`.
+        let use_committed =
+            moe_mtp_committed_history_enabled() && setup.prompt_hidden_position_base == 0;
+
+        let mut stepper = MoeMtpStepper {
             inner: self,
-            mtp_caches,
+            mtp_caches: Qwen3_5MoeMTPModule::fresh_caches(&config),
+            committed_len: 0,
+            use_committed,
             snap: None,
             tape: Vec::new(),
             replay_err: None,
@@ -7158,7 +7298,65 @@ impl MtpBackend for Qwen35MoeInner {
             embedding_weight_t,
             config,
             fa_idx,
-        })
+        };
+
+        // Prompt-prefix seed (v2 committed-history only). Mirrors
+        // `DenseMtpStepper::begin_mtp_decode`'s prompt-prefix seed block
+        // byte-for-byte. Currently INERT: no MoE call site populates
+        // `setup.prompt_hidden` / `setup.prompt_hidden_ids` yet (there is no
+        // MoE hidden-emitting prefill), so this block never runs until a
+        // follow-up wires that capture through — see the struct doc on
+        // [`MoeMtpStepper`].
+        if use_committed
+            && let (Some(ph), Some(ph_ids)) = (setup.prompt_hidden, setup.prompt_hidden_ids)
+            && !ph_ids.is_empty()
+        {
+            let prompt_len = ph_ids.len();
+            let hidden_dim = ph.shape_at(2)?;
+            let hidden_len = ph.shape_at(1)? as usize;
+            if hidden_len != prompt_len {
+                return Err(Error::from_reason(format!(
+                    "eager MoE MTP prompt-seed: prompt_hidden length {hidden_len} \
+                     does not match prompt_hidden_ids length {prompt_len}"
+                )));
+            }
+            // The first sampled token `y` is supplied by the engine via the
+            // setup so the prompt seed can commit `[prompt_ids[1..], y]`.
+            let y_id = setup.first_sampled_token;
+
+            // Committed run = [prompt_ids[1..prompt_len], y] (length P).
+            let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
+            committed_ids.extend(ph_ids[1..prompt_len].iter().map(|&v| v as i32));
+            committed_ids.push(y_id as i32);
+
+            let chunk_sizes = partition_prefill_chunks(prompt_len);
+            let mut cursor: usize = 0;
+            for &chunk in &chunk_sizes {
+                let chunk_i64 = chunk as i64;
+                let start = cursor as i64;
+                // hidden_seq = prompt_hidden[:, cursor..cursor+chunk, :].
+                let hidden_seq = ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
+                // emb_seq = gather embedding rows for the chunk's ids.
+                let ids_arr =
+                    MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
+                let gathered = stepper.embedding_weight.take(&ids_arr, 0)?;
+                let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
+
+                let inner = &mut *stepper.inner;
+                let mtp = inner.mtp.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "eager MoE MTP prompt-seed: inner.mtp is None despite \
+                         has_mtp_weights() gate",
+                    )
+                })?;
+                let caches = &mut stepper.mtp_caches;
+                let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
+                stepper.committed_len += chunk as i32;
+                cursor += chunk;
+            }
+        }
+
+        Ok(stepper)
     }
 }
 
@@ -7424,39 +7622,26 @@ crate::models::chat_napi::chat_napi_surface! {
 /// This is the shared eager-MTP primitive: it advances `caches` (the flat
 /// per-layer caches: `Linear` GDN slots + `FullAttention` KV slots) by `T`
 /// and returns the full per-position hidden, exactly mirroring the dense
-/// `forward_pre_norm_inner`. Linear (GDN) layers run mask-free; full-attention
-/// layers get a causal mask sized from the `fa_idx` cache offset.
+/// `forward_pre_norm_inner`. No explicit mask is ever built: `Linear` (GDN)
+/// layers run mask-free, and full-attention layers pass `mask: None` too, so
+/// `Qwen3_5Attention::forward` picks its fused "causal" SDPA kernel whenever
+/// `seq_len > 1` — covering both prefill and the `[1, K+1]` eager-MTP verify
+/// shape this helper backs.
 fn forward_pre_norm_inner(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    fa_idx: usize,
+    _fa_idx: usize,
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
 
-    let seq_len = hidden_states.shape_at(1)?;
-    let fa_mask = {
-        let has_cache = caches.is_some();
-        if seq_len <= 1 && has_cache {
-            None
-        } else {
-            let offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
-            Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
-        }
-    };
-
     let num_layers = layers.len();
     for i in 0..num_layers {
-        let mask = if layers[i].is_linear() {
-            None
-        } else {
-            fa_mask.as_ref()
-        };
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, mask, cache, None, true)?;
+        h = layers[i].forward(&h, None, cache, None, true)?;
     }
     Ok(h)
 }
@@ -7466,29 +7651,19 @@ fn forward_pre_norm_inner(
 /// each GDN (`Linear`) layer writes `Some(GdnLayerTape)` into its slot and
 /// full-attention layers leave it `None` — the exact indexing the rollback
 /// replay relies on. The forward output is byte-identical to the non-tape
-/// variant (the tape is a side-channel clone of the kernel inputs).
+/// variant (the tape is a side-channel clone of the kernel inputs). No
+/// explicit mask is built here either — see `forward_pre_norm_inner`.
 fn forward_pre_norm_inner_with_tape(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    fa_idx: usize,
+    _fa_idx: usize,
     tape: &mut [Option<super::gated_delta_net::GdnLayerTape>],
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
-
-    let seq_len = hidden_states.shape_at(1)?;
-    let fa_mask = {
-        let has_cache = caches.is_some();
-        if seq_len <= 1 && has_cache {
-            None
-        } else {
-            let offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
-            Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
-        }
-    };
 
     let num_layers = layers.len();
     debug_assert_eq!(
@@ -7497,14 +7672,9 @@ fn forward_pre_norm_inner_with_tape(
         "forward_pre_norm_inner_with_tape: tape length must equal layer count"
     );
     for i in 0..num_layers {
-        let mask = if layers[i].is_linear() {
-            None
-        } else {
-            fa_mask.as_ref()
-        };
         let cache = caches.as_mut().map(|c| &mut c[i]);
         let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
-        h = layers[i].forward_with_tape(&h, mask, cache, None, true, Some(&mut slot))?;
+        h = layers[i].forward_with_tape(&h, None, cache, None, true, Some(&mut slot))?;
         tape[i] = slot;
     }
     Ok(h)
@@ -7572,36 +7742,25 @@ fn forward_inner(
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    fa_idx: usize,
+    _fa_idx: usize,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
 
-    let seq_len = hidden_states.shape_at(1)?;
-    let fa_mask = {
-        let has_cache = caches.is_some();
-        if seq_len <= 1 && has_cache {
-            None
-        } else {
-            let offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
-            Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
-        }
-    };
-
-    // SSM mask is always None — mlx-vlm never creates one for ArraysCache.
-    // An all-ones mask is a no-op that adds unnecessary graph nodes and Metal overhead.
-
+    // No explicit mask is ever built. Full-attention layers pass `mask:
+    // None`, so `Qwen3_5Attention::forward` picks its fused "causal" SDPA
+    // kernel whenever `seq_len > 1` (prefill and the `[1, K+1]` eager-MTP
+    // verify shape alike) instead of a materialized boolean-mask array.
+    // Linear (GDN) layers already ran mask-free — mlx-vlm never creates one
+    // for `ArraysCache`, and an all-ones mask would just be a no-op that
+    // adds graph nodes and Metal overhead. Mirrors the dense
+    // `forward_pre_norm_inner`.
     let num_layers = layers.len();
     for i in 0..num_layers {
-        let mask = if layers[i].is_linear() {
-            None
-        } else {
-            fa_mask.as_ref()
-        };
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, mask, cache, None, true)?;
+        h = layers[i].forward(&h, None, cache, None, true)?;
     }
 
     let h = final_norm.forward(&h)?;
@@ -7968,5 +8127,174 @@ mod paged_construction_tests {
             "Qwen35MoeInner::new with use_block_paged_cache=true must succeed on Metal host",
         );
         assert!(inner.paged_adapter.is_some());
+    }
+}
+
+#[cfg(test)]
+mod mask_free_full_attention_parity_tests {
+    //! Locks in that `forward_pre_norm_inner`'s mask-free full-attention
+    //! forward (the shared attention module's fused "causal" SDPA fast
+    //! path, selected whenever `mask` is `None` and `seq_len > 1`) is
+    //! numerically transparent versus the explicit `create_causal_mask`
+    //! array it replaced, for a PRIMED cache (nonzero KV offset) — the
+    //! exact shape of the eager-MTP verify call (`[1, K+1]` ids over an
+    //! already-decoded prefix). Mirrors
+    //! `causal_attention_matches_explicit_offset_mask_when_kv_is_longer` in
+    //! `crate::array::attention::tests`, one layer stack up.
+
+    use super::*;
+    use crate::array::mask::create_causal_mask;
+    use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+
+    fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
+        Qwen3_5MoeConfig {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 8,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: Some(64),
+            paged_block_size: Some(16),
+            use_block_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    /// Pre-fix mask construction, kept here ONLY as a reference oracle —
+    /// byte-for-byte the code this fix deletes from `forward_pre_norm_inner`.
+    /// Builds an explicit causal mask sized from `caches[fa_idx]`'s offset
+    /// and hands it to every full-attention layer.
+    fn forward_with_explicit_causal_mask(
+        input_ids: &MxArray,
+        embedding_weight: &MxArray,
+        layers: &mut [DecoderLayer],
+        caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+        fa_idx: usize,
+    ) -> Result<MxArray> {
+        let embedding = Embedding::from_weight(embedding_weight)?;
+        let hidden_states = embedding.forward(input_ids)?;
+        let mut h = hidden_states.clone();
+
+        let seq_len = hidden_states.shape_at(1)?;
+        let fa_mask = {
+            let has_cache = caches.is_some();
+            if seq_len <= 1 && has_cache {
+                None
+            } else {
+                let offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
+                Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
+            }
+        };
+
+        let num_layers = layers.len();
+        for i in 0..num_layers {
+            let mask = if layers[i].is_linear() {
+                None
+            } else {
+                fa_mask.as_ref()
+            };
+            let cache = caches.as_mut().map(|c| &mut c[i]);
+            h = layers[i].forward(&h, mask, cache, None, true)?;
+        }
+        Ok(h)
+    }
+
+    #[test]
+    fn mask_free_forward_matches_explicit_offset_mask_after_priming() {
+        let cfg = tiny_moe_cfg();
+        let mut layers = (0..cfg.num_layers as usize)
+            .map(|i| DecoderLayer::new(&cfg, i))
+            .collect::<Result<Vec<_>>>()
+            .expect("layer construction must succeed");
+        let embedding = Embedding::new(cfg.vocab_size as u32, cfg.hidden_size as u32)
+            .expect("embedding construction must succeed");
+        let embedding_weight = embedding.weight();
+
+        let fa_idx = (0..cfg.num_layers as usize)
+            .find(|&i| !cfg.is_linear_layer(i))
+            .expect("tiny_moe_cfg must contain at least one full-attention layer");
+
+        let mut caches_old = Some(fresh_moe_layer_caches(&cfg));
+        let mut caches_new = Some(fresh_moe_layer_caches(&cfg));
+
+        // Prime both cache sets identically with a few single-token decode
+        // steps so the eventual multi-token forward runs against a nonzero
+        // KV offset — an empty cache is the degenerate offset=0 case both
+        // code paths already handled identically, so it wouldn't exercise
+        // the fix.
+        for tok in [5u32, 9, 13] {
+            let ids = MxArray::from_uint32(&[tok], &[1, 1]).expect("prime ids");
+            forward_pre_norm_inner(
+                &ids,
+                &embedding_weight,
+                &mut layers,
+                &mut caches_old,
+                fa_idx,
+            )
+            .expect("priming forward (old-path cache) must succeed");
+            forward_pre_norm_inner(
+                &ids,
+                &embedding_weight,
+                &mut layers,
+                &mut caches_new,
+                fa_idx,
+            )
+            .expect("priming forward (new-path cache) must succeed");
+        }
+
+        // The eager-MTP verify shape: `[1, K+1]` ids over the primed prefix.
+        let verify_ids = MxArray::from_uint32(&[21u32, 22, 23, 24], &[1, 4]).expect("verify ids");
+
+        let old_out = forward_with_explicit_causal_mask(
+            &verify_ids,
+            &embedding_weight,
+            &mut layers,
+            &mut caches_old,
+            fa_idx,
+        )
+        .expect("explicit-mask forward must succeed");
+        let new_out = forward_pre_norm_inner(
+            &verify_ids,
+            &embedding_weight,
+            &mut layers,
+            &mut caches_new,
+            fa_idx,
+        )
+        .expect("mask-free forward must succeed");
+
+        let old_vals = old_out.to_float32().expect("old output to_float32");
+        let new_vals = new_out.to_float32().expect("new output to_float32");
+        assert_eq!(old_vals.len(), new_vals.len());
+        for (idx, (a, b)) in old_vals.iter().zip(new_vals.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= 1e-4,
+                "mask-free forward diverged from explicit-mask forward at {idx}: {a} vs {b} (diff {diff})"
+            );
+        }
     }
 }
