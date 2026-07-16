@@ -58,7 +58,7 @@ export { memoryStats } from '@mlx-node/core';
 export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMetrics } from '@mlx-node/core';
 
 // Streaming chat API
-export type { ChatStreamFinal, ChatStreamEvent } from './stream.js';
+export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream.js';
 // Internal: exported for testing the callback-to-AsyncGenerator bridge
 // Not part of the public API — may change without notice.
 // `_runChatStream` is the generic adapter used by every model wrapper
@@ -68,7 +68,7 @@ export type { ChatStreamFinal, ChatStreamEvent } from './stream.js';
 // subclass from its native class; the VLM package reuses it to build
 // `QianfanOCRModel`.
 export { _runChatStream, makeStreamingModel } from './stream.js';
-export type { StreamingModel } from './stream.js';
+export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance, StreamingModel } from './stream.js';
 // Cross-model chat session wrapper (see chat-session.ts for design notes).
 // `SessionCapableModel` is the structural interface matched by every
 // generative model wrapper and used as the upper-bound for
@@ -87,10 +87,15 @@ export {
 } from './models/qwen3-configs.js';
 
 // Model loading
-export { loadModel, loadSession, detectModelType, type ModelType } from './models/model-loader.js';
-
-// Interfaces
-export type { TrainableModel, LoadableModel } from './interfaces.js';
+export {
+  loadModel,
+  loadSession,
+  detectModelType,
+  type LoadableModel,
+  type TrainableModel,
+  type ModelType,
+  type LoadModelOptions,
+} from './models/model-loader.js';
 
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs.js';
 

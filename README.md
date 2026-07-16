@@ -31,15 +31,16 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ## Why MLX-Node?
 
-|     | Feature                       | Description                                                                                |
-| :-: | :---------------------------- | :----------------------------------------------------------------------------------------- |
-| ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion         |
-| 🧪  | **Experimental CUDA**         | NVIDIA GPU inference via MLX's CUDA backend — Qwen3.6 on GB10 / DGX Spark (preview, eager) |
-| 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO)  |
-| 🤖  | **Qwen Models**               | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling           |
-| 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                        |
-| 🚫  | **Zero Python Dependency**    | Pure Rust/TypeScript implementation — no Python runtime required                           |
-| 📊  | **TypedArray-First API**      | Zero-copy operations using native JavaScript typed arrays                                  |
+|     | Feature                       | Description                                                                                      |
+| :-: | :---------------------------- | :----------------------------------------------------------------------------------------------- |
+| ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion               |
+| 🧪  | **Experimental CUDA**         | NVIDIA GPU inference via MLX's CUDA backend — Qwen3.6 on GB10 / DGX Spark (preview, eager)       |
+| 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO)        |
+| 🤖  | **Qwen Models**               | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling                 |
+| 🧑‍💻  | **Local Coding Agent**        | `mlx agent` — the first all-in-one local coding agent: pi-based, fully offline, permission-gated |
+| 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                              |
+| 🚫  | **Zero Python Dependency**    | Pure Rust/TypeScript implementation — no Python runtime required                                 |
+| 📊  | **TypedArray-First API**      | Zero-copy operations using native JavaScript typed arrays                                        |
 
 ---
 
@@ -55,6 +56,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 - Multi-turn `ChatSession` with live KV cache reuse
 - Streaming generation via `sendStream()`
 - Tool calling and chat templates
+- Speculative decoding: Qwen3.5 MTP heads, Gemma4 DSpark draft models ([docs](docs/models.md#speculative-decoding-gemma4--dspark))
 
 </td>
 <td width="33%" valign="top">
@@ -120,6 +122,15 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 | macOS · Apple Silicon (M1–M5)    | Metal   | ✅ Fully supported (inference · training · VLM) |
 | Linux · aarch64 / glibc · NVIDIA | CUDA    | 🧪 Experimental — inference preview             |
 
+> **macOS version floor:** the prebuilt `darwin-arm64` binaries published to npm are
+> built with an explicit macOS 26.0 deployment floor (MSL 4) — they load on every
+> macOS 26 release and do not load on macOS 15 or older, so **macOS 26+ is required
+> for the prebuilt binaries**. They also carry MLX's NAX kernels (M5-class GPUs),
+> which activate only at runtime on macOS 26.2+ — on 26.0/26.1 the same binary runs
+> the standard kernels. Building from source works on macOS ≥ 14 (MLX's floor); the
+> deployment floor then defaults to the build host's macOS version, and can be pinned
+> explicitly with `MACOSX_DEPLOYMENT_TARGET`.
+
 ### NVIDIA CUDA (experimental preview)
 
 MLX-Node runs on NVIDIA GPUs through MLX's CUDA backend. This is an early
@@ -151,6 +162,7 @@ MLX_QWEN35_FORCE_EAGER=1 MLX_QWEN35_PAGED_OVERRIDE=0 \
 ### Prerequisites
 
 - macOS with Apple Silicon (M1–M5) and Metal — fully supported
+  - macOS 26+ for the prebuilt npm binaries; macOS ≥ 14 to build from source (see [Platform Support](#platform-support))
 - Node.js 18+
 - Rust 1.90
 
@@ -406,13 +418,13 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 
 ### Package Overview
 
-| Package                             | Purpose                    | Use For                                          |
-| :---------------------------------- | :------------------------- | :----------------------------------------------- |
-| [`@mlx-node/lm`](./packages/lm)     | Model loading & inference  | Loading models, generating text, model configs   |
-| [`@mlx-node/trl`](./packages/trl)   | Training & optimization    | GRPO training, custom rewards, optimizers        |
-| [`@mlx-node/core`](./packages/core) | Native bindings (internal) | Low-level operations (usually import via lm/trl) |
-| [`@mlx-node/cli`](./packages/cli)   | CLI                        | Download models, quantize weights                |
-| [`@mlx-node/vlm`](./packages/vlm)   | Vision-language models     | PaddleOCR-VL, document processing                |
+| Package                             | Purpose                    | Use For                                            |
+| :---------------------------------- | :------------------------- | :------------------------------------------------- |
+| [`@mlx-node/lm`](./packages/lm)     | Model loading & inference  | Loading models, generating text, model configs     |
+| [`@mlx-node/trl`](./packages/trl)   | Training & optimization    | GRPO training, custom rewards, optimizers          |
+| [`@mlx-node/core`](./packages/core) | Native bindings (internal) | Low-level operations (usually import via lm/trl)   |
+| [`@mlx-node/cli`](./packages/cli)   | CLI                        | Download models, quantize weights, run `mlx agent` |
+| [`@mlx-node/vlm`](./packages/vlm)   | Vision-language models     | PaddleOCR-VL, document processing                  |
 
 ### Optimizations
 

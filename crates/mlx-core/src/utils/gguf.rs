@@ -1102,6 +1102,22 @@ fn fixup_qwen35_linear_attn(
     Ok(())
 }
 
+/// GGUF has no HuggingFace `model_type`, so require both a known llama.cpp
+/// Qwen3.5 architecture tag and the characteristic mixed full-attention/GDN
+/// tensor shape before enabling the official Unsloth MXFP map. `qwen3` is kept
+/// for older Qwen3.5 writers; ordinary Qwen3 fails the weight-shape check.
+fn is_qwen35_hybrid_gguf(
+    metadata: &HashMap<String, GgufMetaValue>,
+    weight_keys: &[String],
+) -> bool {
+    let is_qwen35_arch = metadata
+        .get("general.architecture")
+        .and_then(|value| value.as_str())
+        .is_some_and(|arch| matches!(arch, "qwen35" | "qwen35moe" | "qwen3"));
+
+    is_qwen35_arch && crate::convert::has_qwen35_hybrid_weight_shape(weight_keys)
+}
+
 // ── Config Extraction ───────────────────────────────────────────────────────
 
 /// Extract HuggingFace-compatible config.json fields from GGUF metadata
@@ -1249,8 +1265,12 @@ pub struct GgufConversionOptions {
     pub vlm_key_prefix: Option<bool>,
 
     /// Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-    /// When true, applies after the recipe predicate: any 8-bit affine decision
-    /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+    /// When true, applies after the recipe predicate: eligible 8-bit affine
+    /// decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+    /// affine-only loaders (lm_head, embed_tokens, router.proj,
+    /// embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+    /// and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+    /// in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 }
@@ -1277,6 +1297,35 @@ pub async fn convert_gguf_to_safetensors(
             "GGUF file not found: {}",
             input_path.display()
         )));
+    }
+
+    // The nvidia recipe is documented + validated only for qwen3_5 /
+    // qwen3_5_moe and is a data-free port with a fixed format map. Reject an
+    // unsupported model type + the flags that would silently alter or
+    // contradict the map BEFORE the imatrix AWQ pre-scaling (below) can rewrite
+    // weights and BEFORE the recipe predicate is built/wrapped with
+    // `apply_mxfp_upgrade`. Shares one validator with the safetensors entry
+    // point (`convert_model_inner`) so both paths reject the same combinations
+    // with identical messages.
+    //
+    // The GGUF path has no HF `model_type` in scope here: `GgufConversionOptions`
+    // carries none, the CLI never forwards `--model-type` to it, and the arch is
+    // only inferred from GGUF metadata later (as e.g. `qwen3`, never the exact
+    // `qwen3_5`/`qwen3_5_moe`). Passing `None` therefore rejects nvidia-on-GGUF
+    // via the model-type gate — the correct outcome, since the recipe is a
+    // faithful full-precision→mxfp port and re-quantizing an already-lossy GGUF
+    // was never a supported path.
+    if options.quant_recipe.as_deref() == Some("nvidia") {
+        crate::convert::validate_nvidia_recipe_options(
+            None,  // config_family: no HF model_type in GGUF scope → rejected
+            None,  // requested_model_type: CLI never forwards --model-type here
+            false, // is_moe: unused once config_family None rejects upfront
+            options.imatrix_path.as_deref(),
+            options.quant_mxfp.unwrap_or(false),
+            options.quant_bits,
+            options.quant_group_size,
+        )
+        .map_err(Error::from_reason)?;
     }
 
     // Serialize all conversions process-wide before touching MLX's default
@@ -1480,17 +1529,30 @@ pub async fn convert_gguf_to_safetensors(
             } else {
                 quant_group_size
             };
-            let predicate = crate::convert::build_predicate_for_recipe(
+            // Mirror the SafeTensors selector: verified Qwen hybrids use the
+            // official class map for both translated MXFP and DGX NVFP4;
+            // plain affine and ambiguous/non-Qwen inputs retain Dynamic 2.0.
+            let is_qwen35_hybrid = is_qwen35_hybrid_gguf(&gguf.metadata, &weight_keys);
+            let official_unsloth_kind = crate::convert::select_official_unsloth_recipe(
                 recipe,
-                &weight_keys,
-                quant_bits,
-                recipe_gs,
-            )
-            .map_err(Error::from_reason)?;
+                quant_mxfp,
+                &quant_mode_str,
+                is_qwen35_hybrid,
+            );
+            let predicate = match official_unsloth_kind {
+                Some(kind) => crate::convert::build_official_unsloth_recipe(&weight_keys, kind),
+                None => crate::convert::build_predicate_for_recipe(
+                    recipe,
+                    &weight_keys,
+                    quant_bits,
+                    recipe_gs,
+                )
+                .map_err(Error::from_reason)?,
+            };
             let predicate: Box<dyn Fn(&str) -> crate::convert::QuantDecision + Send + Sync> =
-                if quant_mxfp {
+                if quant_mxfp && official_unsloth_kind.is_none() {
                     crate::convert::apply_mxfp_upgrade(predicate, quant_bits)
-                } else if quant_mode_str == "nvfp4" {
+                } else if quant_mode_str == "nvfp4" && official_unsloth_kind.is_none() {
                     // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions
                     // to NVFP4 (group_size=16). Mutually exclusive with
                     // quant_mxfp, since --q-mxfp requires --q-mode affine.
@@ -1969,6 +2031,72 @@ mod tests {
             gguf_name_to_hf("blk.0.ssm_a"),
             "model.layers.0.linear_attn.A_log"
         );
+    }
+
+    fn qwen35_hybrid_test_keys() -> Vec<String> {
+        [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.1.linear_attn.in_proj_qkv.weight",
+            "model.layers.1.linear_attn.in_proj_z.weight",
+            "model.layers.1.linear_attn.out_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn official_unsloth_gguf_gate_requires_qwen35_arch_and_hybrid_shape() {
+        let keys = qwen35_hybrid_test_keys();
+        for arch in ["qwen35", "qwen35moe", "qwen3"] {
+            let metadata = HashMap::from([(
+                "general.architecture".to_string(),
+                GgufMetaValue::String(arch.to_string()),
+            )]);
+            let is_qwen35_hybrid = is_qwen35_hybrid_gguf(&metadata, &keys);
+            assert!(
+                is_qwen35_hybrid,
+                "{arch} plus the hybrid shape must select the official map"
+            );
+            assert_eq!(
+                crate::convert::select_official_unsloth_recipe(
+                    "unsloth",
+                    true,
+                    "affine",
+                    is_qwen35_hybrid,
+                ),
+                Some(crate::convert::OfficialUnslothRecipeKind::Mxfp)
+            );
+            assert_eq!(
+                crate::convert::select_official_unsloth_recipe(
+                    "unsloth",
+                    false,
+                    "nvfp4",
+                    is_qwen35_hybrid,
+                ),
+                Some(crate::convert::OfficialUnslothRecipeKind::Nvfp4)
+            );
+        }
+
+        for arch in ["gemma", "llama", "qwen3next"] {
+            let metadata = HashMap::from([(
+                "general.architecture".to_string(),
+                GgufMetaValue::String(arch.to_string()),
+            )]);
+            assert!(
+                !is_qwen35_hybrid_gguf(&metadata, &keys),
+                "non-Qwen3.5 arch {arch} must preserve the legacy upgrader"
+            );
+        }
+
+        let metadata = HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("qwen35".to_string()),
+        )]);
+        assert!(!is_qwen35_hybrid_gguf(
+            &metadata,
+            &["model.layers.0.self_attn.q_proj.weight".to_string()]
+        ));
     }
 
     #[test]

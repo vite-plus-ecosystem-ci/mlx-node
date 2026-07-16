@@ -922,8 +922,12 @@ pub(crate) mod recipe {
         }
 
         fn sym8_supported(&self) -> bool {
-            // Dense qwen3_5 has a sym8 dispatch; qwen3_5_moe does not.
-            !self.is_moe
+            // Both dense qwen3_5 and qwen3_5_moe dispatch sym8. The MoE loader
+            // covers its non-expert sublayers (attention, GDN, shared-expert
+            // MLP body); 3-D stacked switch_mlp experts are forced to an
+            // affine-8 per-layer override by `sym8_eligible`, so the emitted
+            // checkpoint always loads back.
+            true
         }
 
         fn has_mtp(&self) -> MtpPolicy {
@@ -1548,7 +1552,7 @@ pub struct ConversionOptions {
     pub quant_group_size: Option<i32>,
 
     /// Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-    /// "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+    /// "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
     /// implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
     pub quant_mode: Option<String>,
 
@@ -1561,8 +1565,12 @@ pub struct ConversionOptions {
     pub imatrix_path: Option<String>,
 
     /// Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-    /// When true, applies after the recipe predicate: any 8-bit affine decision
-    /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+    /// When true, applies after the recipe predicate: eligible 8-bit affine
+    /// decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+    /// affine-only loaders (lm_head, embed_tokens, router.proj,
+    /// embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+    /// and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+    /// in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 
@@ -1778,20 +1786,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     .to_string(),
             ));
         }
-        // sym8 v1 dispatch exists in the dense qwen3_5, lfm2/lfm2_moe, and
-        // gemma4 loaders (2D linears only — 3D stacked experts are auto-forced
-        // to affine-8 below). qwen3_5_moe still rejects sym8 up front (its
-        // per-expert SwitchMLP/gather path has no sym8 dispatch), so allowing
-        // it here would emit checkpoints this package cannot load back.
+        // sym8 dispatch exists in the qwen3_5 (dense + MoE non-expert
+        // sublayers), lfm2/lfm2_moe, and gemma4 loaders (2D linears only —
+        // 3D stacked experts are auto-forced to affine-8 below, so
+        // qwen3_5_moe's per-expert SwitchMLP/gather path never sees sym8).
         let sym8_supported = model_type
             .as_deref()
             .and_then(recipe::recipe_for)
             .is_some_and(|r| r.sym8_supported());
         if !sym8_supported {
             return Err(Error::from_reason(format!(
-                "sym8 is currently supported for model types qwen3_5 (dense), \
-                 lfm2, lfm2_moe, and gemma4 only (got {:?}); other families' \
-                 loaders have no sym8 dispatch",
+                "sym8 is currently supported for model types qwen3_5, \
+                 qwen3_5_moe, lfm2, lfm2_moe, and gemma4 only (got {:?}); \
+                 other families' loaders have no sym8 dispatch",
                 model_type.as_deref()
             )));
         }
@@ -1843,6 +1850,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             "mixed_4_6",
             "qwen3_5",
             "unsloth",
+            "nvidia",
         ];
         if !valid.contains(&recipe.as_str()) {
             return Err(Error::from_reason(format!(
@@ -1875,6 +1883,156 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    // Read + parse config.json up front (pure file I/O, no MLX) so the nvidia
+    // recipe can fail-closed BEFORE we acquire the convert mutex or switch
+    // MLX's default device: `CpuConvertGuard::enter_cpu` calls MLX FFI, which
+    // can abort in a headless/degraded MLX environment. The parsed config is
+    // reused for the conversion proper below.
+    let config_path = input_dir.join("config.json");
+    if !config_path.exists() {
+        return Err(Error::from_reason(format!(
+            "config.json not found in input directory: {}",
+            input_dir.display()
+        )));
+    }
+    let config_data = fs::read_to_string(&config_path)?;
+    let config: serde_json::Value = serde_json::from_str(&config_data)?;
+
+    // The nvidia recipe is documented + validated only for qwen3_5 /
+    // qwen3_5_moe / dense gemma4 / gemma4_unified. Gate on the INPUT
+    // config.json's own model shape (ground truth), NOT the caller-supplied
+    // --model-type: the CLI forwards an explicit `-m` verbatim (skipping config
+    // auto-detect), so `-m qwen3_5` on a real gemma4/lfm2 directory would
+    // otherwise reach the wrong sanitizer + the generic nvidia predicate and
+    // emit an invalid checkpoint. Three model-shape reads feed the gate:
+    //   - config_family: the config's own model_type, or a gemma4_unified alias
+    //     derived from an architecture-only unified config (no model_type but
+    //     `architectures: ["Gemma4Unified*"]`), which the CLI canonicalizes;
+    //   - requested_model_type: the --model-type the sanitizer will dispatch on
+    //     (moved into `model_type` above) — must agree with config_family;
+    //   - is_moe: `enable_moe_block` resolved via the loader's own
+    //     `get_config_bool` (nested `text_config` first, then root) — gemma4
+    //     nvidia is dense-only.
+    // It is also a data-free fixed-format map: no imatrix, ignores --q-mxfp
+    // (emits mxfp4/mxfp8 directly), pins bits=4/group_size=32 for its float
+    // tensors — reject flags that would silently alter or contradict the map,
+    // but allow a bare `-q --q-recipe nvidia`. The GGUF entry point
+    // (`convert_gguf_to_safetensors`) has no config.json and rejects nvidia
+    // wholesale via a `None` model_type.
+    if quant_recipe.as_deref() == Some("nvidia") {
+        let config_family = config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                // Architecture-only unified config: no model_type, but the
+                // architectures list identifies a gemma4_unified checkpoint.
+                config
+                    .get("architectures")
+                    .and_then(|v| v.as_array())
+                    .filter(|arches| {
+                        arches
+                            .iter()
+                            .any(|a| a.as_str().is_some_and(|s| s.starts_with("Gemma4Unified")))
+                    })
+                    .map(|_| "gemma4_unified")
+            });
+        // Resolve `enable_moe_block` EXACTLY as the gemma4 loader does
+        // (`get_config_bool`: nested `text_config` first, then root) so the
+        // gate's dense/MoE view can never disagree with how the model loads —
+        // real gemma configs carry the flag under `text_config`, not the root.
+        let is_moe = crate::engine::persistence::get_config_bool(
+            &config,
+            config.get("text_config"),
+            &["enable_moe_block"],
+            false,
+        );
+        validate_nvidia_recipe_options(
+            config_family,
+            model_type.as_deref(),
+            is_moe,
+            imatrix_path.as_deref(),
+            quant_mxfp,
+            options.quant_bits,
+            options.quant_group_size,
+        )
+        .map_err(Error::from_reason)?;
+    }
+
+    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
+    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
+    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
+    // than re-quantizing. Detected from the config; the runtime never reads
+    // Google's native quant metadata.
+    //
+    // Split the detection by ROLE (WB-2) — a single alias-robust predicate would
+    // let a gemma4_unified QAT reach the E2B importer, which DROPS AUDIO:
+    //   - is_gemma_qat_family: the gemma FAMILY (gemma4 / gemma4_text /
+    //     gemma4_unified all collapse via `nvidia_recipe_family`). Used ONLY for
+    //     the pre-import already-quantized REJECT, so an aliased
+    //     `-m gemma4_unified` on a gemma-QAT source can't slip past that reject
+    //     into the generic quantizer.
+    //   - is_gemma_e2b_import: EXACT `model_type == "gemma4"`. The importer
+    //     hardcodes E2B's language schedule and DROPS AUDIO, so it must never run
+    //     for the unified alias (which carries audio). Honors the documented CLI
+    //     contract in packages/cli/src/commands/convert.ts (the exact-"gemma4"
+    //     gate must NOT match unified). Real E2B is model_type "gemma4",
+    //     unaffected.
+    // These guards are pure config reads (no MLX ops), evaluated BEFORE the
+    // convert mutex + `CpuConvertGuard::enter_cpu()` below, so an invalid
+    // already-quantized, unified, or non-E2B gemma-QAT source is rejected without
+    // acquiring the process-wide lock or touching MLX — keeping the rejection
+    // hermetic in headless/degraded environments (no SIGABRT from MLX init).
+    let is_gemma_qat_source = config
+        .get("quantization_config")
+        .and_then(|qc| qc.get("quant_method"))
+        .and_then(|m| m.as_str())
+        == Some("gemma");
+    let is_gemma_qat_family =
+        nvidia_recipe_family(model_type.as_deref()) == Some("gemma4") && is_gemma_qat_source;
+    let is_gemma_e2b_import = model_type.as_deref() == Some("gemma4") && is_gemma_qat_source;
+    if is_gemma_qat_family
+        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
+    {
+        return Err(Error::from_reason(
+            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
+             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
+             to MLX affine)"
+                .to_string(),
+        ));
+    }
+    // A positively-unified gemma-QAT is unsupported by the E2B importer (which is
+    // EXACT-"gemma4" only, drops audio, and pins E2B's language schedule). With no
+    // quant flags it escapes the already-quantized family reject above AND misses
+    // `is_gemma_e2b_import` (exact match), so without this it would fall through to
+    // the generic quantizer and silently mis-repack the already-quantized weights.
+    // Reject it explicitly (still hermetic — pure config read). `is_unified` is
+    // computed from the config exactly as `models/gemma4/persistence.rs`
+    // (model_type == "gemma4_unified" || architectures[0] == unified arch).
+    if is_gemma_qat_source {
+        let is_unified = config.get("model_type").and_then(|v| v.as_str())
+            == Some("gemma4_unified")
+            || config
+                .get("architectures")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                == Some("Gemma4UnifiedForConditionalGeneration");
+        if is_unified {
+            return Err(Error::from_reason(
+                "unified gemma QAT is not supported by the E2B prequantized importer \
+                 (it drops audio and hardcodes E2B's language schedule); convert the \
+                 E2B gemma-QAT checkpoint instead"
+                    .to_string(),
+            ));
+        }
+    }
+    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
+    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
+    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
+    if is_gemma_e2b_import {
+        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
+    }
+
     // Serialize all conversions process-wide before touching MLX's default
     // device + stream — see `convert_mutex` and `CpuConvertGuard` docs for
     // the race this avoids.
@@ -1892,15 +2050,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // restores the prior default device + stream when convert_model returns.
     let _stream_guard = CpuConvertGuard::enter_cpu();
 
-    // Check for required files
-    let config_path = input_dir.join("config.json");
-    if !config_path.exists() {
-        return Err(Error::from_reason(format!(
-            "config.json not found in input directory: {}",
-            input_dir.display()
-        )));
-    }
-
     info!("Loading model from: {}", input_dir.display());
     info!("Target dtype: {}", target_dtype);
 
@@ -1913,41 +2062,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         ))
     })?;
 
-    // Load config to check for tied embeddings
-    let config_data = fs::read_to_string(&config_path)?;
-    let config: serde_json::Value = serde_json::from_str(&config_data)?;
     let tie_word_embeddings = config["tie_word_embeddings"].as_bool().unwrap_or(false);
 
     if tie_word_embeddings && verbose {
         info!("Model uses tied embeddings - will skip lm_head.weight");
-    }
-
-    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
-    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
-    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
-    // than re-quantizing. Detected from the config; the runtime never reads
-    // Google's native quant metadata.
-    let is_gemma_prequantized = model_type.as_deref() == Some("gemma4")
-        && config
-            .get("quantization_config")
-            .and_then(|qc| qc.get("quant_method"))
-            .and_then(|m| m.as_str())
-            == Some("gemma");
-    if is_gemma_prequantized
-        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
-    {
-        return Err(Error::from_reason(
-            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
-             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
-             to MLX affine)"
-                .to_string(),
-        ));
-    }
-    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
-    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
-    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
-    if is_gemma_prequantized {
-        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
     }
 
     // Load tensors - handle both single file and sharded models
@@ -2135,7 +2253,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
 
     let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
-    let converted_tensors = if is_gemma_prequantized {
+    let converted_tensors = if is_gemma_e2b_import {
         let dtype = match target_dtype.as_str() {
             "float32" | "f32" => DType::Float32,
             "float16" | "f16" => DType::Float16,
@@ -2294,7 +2412,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             },
             None => converted_tensors,
         }
-    }; // end is_gemma_prequantized else branch
+    }; // end is_gemma_e2b_import else branch
 
     // Apply AWQ pre-scaling if imatrix provided
     let mut converted_tensors = converted_tensors;
@@ -2314,11 +2432,26 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Apply quantization if requested
     let mut per_layer_overrides: HashMap<String, serde_json::Value> =
         gemma_pre_overrides.unwrap_or_default();
-    // Effective mode/group_size recorded in config.json. The no-recipe path
-    // updates these when --q-mxfp upgrades the global mode to mxfp4/mxfp8 so
-    // downstream loaders dispatch to the correct builder.
+    // Effective mode/group_size/bits recorded in config.json. The no-recipe
+    // path updates mode/group_size when --q-mxfp upgrades the global mode to
+    // mxfp4/mxfp8 so downstream loaders dispatch to the correct builder.
     let mut quant_mode_effective = quant_mode.clone();
     let mut quant_group_size_effective = quant_group_size;
+    let mut quant_bits_effective = quant_bits;
+    // The gemma-prequant path never runs the quantize block below (--quantize
+    // is rejected up front), so the effective values would otherwise stay at
+    // the generic CLI defaults (affine / 4-bit / group 64) — dishonest: every
+    // sidecar the importer emits is a 128-group affine repack. External
+    // loaders that trust the top-level default for tensors without a
+    // per-layer override would mis-dequantize, so derive the top-level block
+    // from the importer's own override map instead.
+    if is_gemma_e2b_import {
+        let (bits, group_size, mode) =
+            crate::convert_gemma_import::top_level_quant_metadata(&per_layer_overrides)?;
+        quant_bits_effective = bits;
+        quant_group_size_effective = group_size;
+        quant_mode_effective = mode;
+    }
     // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
     // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
     // lookup + quantized tied-head matmul), so the embedding table can be
@@ -2416,18 +2549,35 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             } else {
                 quant_group_size
             };
-            let predicate = build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
-                .map_err(Error::from_reason)?;
-            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = if quant_mxfp {
-                apply_mxfp_upgrade(predicate, quant_bits)
-            } else if quant_mode == "nvfp4" {
-                // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions to
-                // NVFP4 (group_size=16). Mutually exclusive with quant_mxfp,
-                // since --q-mxfp requires --q-mode affine.
-                apply_nvfp4_upgrade(predicate)
-            } else {
-                predicate
+            // Verified Qwen hybrids use Unsloth's official float class map:
+            // `--q-mxfp` translates FP8/NVFP4 to MXFP8/MXFP4, while
+            // `--q-mode nvfp4` preserves NVFP4 for the low FFN class and uses
+            // MXFP8 for the high class. This is not a mechanical rewrite of
+            // the legacy Dynamic 2.0 affine decisions.
+            // The official map is Qwen3.5/Qwen3.6-hybrid-specific. Gate on the
+            // input config (ground truth), the requested sanitizer family, and
+            // the sanitized weight shape. If any of those are unavailable or
+            // disagree, preserve the legacy family-agnostic upgrade wrappers.
+            let is_qwen35_hybrid =
+                is_qwen35_hybrid_checkpoint(&config, model_type.as_deref(), &weight_keys);
+            let official_unsloth_kind =
+                select_official_unsloth_recipe(recipe, quant_mxfp, &quant_mode, is_qwen35_hybrid);
+            let predicate = match official_unsloth_kind {
+                Some(kind) => build_official_unsloth_recipe(&weight_keys, kind),
+                None => build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
+                    .map_err(Error::from_reason)?,
             };
+            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+                if quant_mxfp && official_unsloth_kind.is_none() {
+                    apply_mxfp_upgrade(predicate, quant_bits)
+                } else if quant_mode == "nvfp4" && official_unsloth_kind.is_none() {
+                    // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions to
+                    // NVFP4 (group_size=16). Mutually exclusive with quant_mxfp,
+                    // since --q-mxfp requires --q-mode affine.
+                    apply_nvfp4_upgrade(predicate)
+                } else {
+                    predicate
+                };
             // `--q-mtp split` (alias `drafter`) keeps the MTP head BF16 by
             // contract: the head is extracted into a standalone `mtp-drafter/`
             // directory below, and the on-disk drafter must NOT carry `.scales`
@@ -2654,7 +2804,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let mut output_config = config.clone();
 
     // Inject quantization metadata if quantized
-    if do_quantize || is_gemma_prequantized {
+    if do_quantize || is_gemma_e2b_import {
         // sym8 has NO quant group (one f32 scale per output channel), so the
         // top-level group_size is written as `null` — the loader must dispatch
         // on mode=="sym8" and never read group_size for sym8 layers. Per-layer
@@ -2667,7 +2817,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         };
         let mut quant_obj = serde_json::json!({
             "group_size": group_size_value,
-            "bits": quant_bits,
+            "bits": quant_bits_effective,
             "mode": quant_mode_effective,
         });
         if let Some(obj) = quant_obj.as_object_mut() {
@@ -2792,6 +2942,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         "generation_config.json",
         // VLM-specific files
         "preprocessor_config.json",
+        "video_preprocessor_config.json",
         "processor_config.json",
         "viterbi_calibration.json",
     ];
@@ -3389,7 +3540,14 @@ fn is_router_gate(key: &str) -> bool {
 ///
 /// These keys load through affine-only `Linear::load_quantized` /
 /// `Embedding::load_quantized` helpers:
-/// - `lm_head`: dense Qwen3.5's lm_head loader hardcodes affine dequant.
+/// - `lm_head`: kept here to protect the affine-only tied/dense head loaders in
+///   families like Gemma4. Dense Qwen3.5's own `lm_head` is now mode-aware
+///   (`LinearProj`, post-PR#85) and can load mxfp4/mxfp8/nvfp4, but this guard
+///   matches key strings family-agnostically and stays conservative — the
+///   `--q-mxfp` upgrade path must not silently emit MXFP `lm_head` weights for
+///   a family whose head loader still hardcodes affine dequant. (The `nvidia`
+///   recipe emits its `lm_head` mxfp4 decision directly, bypassing this guard,
+///   because it runs with `--q-mxfp` off and no upgrade wrapper.)
 /// - `router.proj`: Gemma4's MoE router uses affine-only `Linear`.
 /// - `embed_tokens` (and `embed_tokens_per_layer`): Gemma4 / others route
 ///   quantized embeddings through `Embedding::load_quantized`.
@@ -3405,6 +3563,38 @@ fn is_affine_only_key(key: &str) -> bool {
         || key.contains("router.proj")
         || key.contains("embed_tokens")
         || key.contains("embedding_projection")
+}
+
+/// Check if a key is one of the four attention/GDN projections that the
+/// `unsloth` / `qwen3_5` recipes deliberately pin to 8-bit **affine**
+/// (`self_attn.o_proj`, `linear_attn.out_proj`, `linear_attn.in_proj_a`,
+/// `linear_attn.in_proj_b`).
+///
+/// These are quantized (not left bf16) so that AR (M=1) and MTP-verify (M>=2)
+/// both route through the M-invariant `quantized_matmul` / `qmv` kernel, giving
+/// T=0 MTP<->AR bit-exactness: a bf16 `matmul` dispatches `gemv` at M=1 but a
+/// split-K `steel_matmul` at M>=2, whose different reduction order flips argmax
+/// on near-ties. 8-bit *affine* specifically keeps the worst-KLD tensor
+/// (`out_proj`, KLD ~6.0) and `o_proj` (~1.5) near bf16 — MXFP8's E8M0
+/// power-of-two scales have ~10x the round-trip error of affine 8-bit (the same
+/// reason router gates are protected).
+///
+/// Used by `apply_mxfp_upgrade` ONLY, to skip the 8-bit -> mxfp8 upgrade. It
+/// must NOT be added to `is_affine_only_key`: that helper is also consulted by
+/// the uniform / no-recipe path (`quantize_weights_inner`), and listing these
+/// keys there would wrongly stop a uniform `--q-mode mxfp8` from upgrading
+/// `o_proj`. The nvfp4 path needs no equivalent guard — `apply_nvfp4_upgrade`
+/// has no 8-bit arm, so it already passes these `Custom { bits: 8, .. }`
+/// decisions through unchanged.
+///
+/// Mirrors the exact substrings the recipes match (`build_qwen35_recipe` /
+/// `build_unsloth_recipe`) so it covers precisely the pinned keys and does NOT
+/// catch `q/k/v_proj`, `in_proj_qkv`, or `in_proj_z` (6-bit, must upgrade).
+fn is_bitexact_affine_proj(key: &str) -> bool {
+    key.contains("self_attn.o_proj")
+        || key.contains("linear_attn.out_proj")
+        || key.contains("linear_attn.in_proj_a.")
+        || key.contains("linear_attn.in_proj_b.")
 }
 
 // ── Per-Layer Quantization Recipes ──────────────────────────────────────────
@@ -3796,6 +3986,349 @@ pub(crate) fn build_unsloth_recipe(
     })
 }
 
+/// Collapse Qwen3.5 wrapper/text aliases to the converter's two sanitizer
+/// families. Qwen3.6 checkpoints intentionally use the same Qwen3.5 model
+/// families and loaders in this repository.
+fn qwen35_recipe_family(model_type: Option<&str>) -> Option<&'static str> {
+    match model_type {
+        Some("qwen3_5") | Some("qwen3_5_text") => Some("qwen3_5"),
+        Some("qwen3_5_moe") | Some("qwen3_5_moe_text") => Some("qwen3_5_moe"),
+        _ => None,
+    }
+}
+
+/// Require the characteristic hybrid Qwen3.5/Qwen3.6 tensor shape rather than
+/// trusting a caller-supplied model type alone. Both dense and MoE variants mix
+/// full attention with GatedDeltaNet layers; older Qwen3 and unrelated families
+/// do not have this combination.
+pub(crate) fn has_qwen35_hybrid_weight_shape(weight_keys: &[String]) -> bool {
+    let has_full_attention = weight_keys
+        .iter()
+        .any(|key| key.contains("self_attn.q_proj") && key.ends_with(".weight"));
+    let has_gdn_qkv = weight_keys
+        .iter()
+        .any(|key| key.contains("linear_attn.in_proj_qkv") && key.ends_with(".weight"));
+    let has_gdn_z = weight_keys
+        .iter()
+        .any(|key| key.contains("linear_attn.in_proj_z") && key.ends_with(".weight"));
+    let has_gdn_out = weight_keys
+        .iter()
+        .any(|key| key.contains("linear_attn.out_proj") && key.ends_with(".weight"));
+
+    has_full_attention && has_gdn_qkv && has_gdn_z && has_gdn_out
+}
+
+/// Verify a SafeTensors checkpoint from independent sources of truth: its own
+/// config family, the sanitizer family requested by the caller, and its
+/// sanitized tensor shape. Nested `text_config.model_type` supports VLM wrapper
+/// configs whose root model type is not itself the text family.
+fn is_qwen35_hybrid_checkpoint(
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> bool {
+    let config_family = qwen35_recipe_family(
+        config.get("model_type").and_then(|value| value.as_str()),
+    )
+    .or_else(|| {
+        qwen35_recipe_family(
+            config
+                .get("text_config")
+                .and_then(|value| value.get("model_type"))
+                .and_then(|value| value.as_str()),
+        )
+    });
+    let requested_family = qwen35_recipe_family(requested_model_type);
+
+    config_family.is_some()
+        && requested_family == config_family
+        && has_qwen35_hybrid_weight_shape(weight_keys)
+}
+
+/// Which official Unsloth float class map to emit. The two variants differ only
+/// in the early-FFN low format; their MXFP8 and BF16 tensor classes are shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfficialUnslothRecipeKind {
+    /// Translate the official NVFP4 class to MLX MXFP4 (4/32).
+    Mxfp,
+    /// Preserve the official DGX NVFP4 class (4/16).
+    Nvfp4,
+}
+
+/// Select an official class map only for a verified Qwen3.5/Qwen3.6 hybrid
+/// checkpoint. Plain affine and non-Qwen/ambiguous inputs continue through the
+/// legacy Dynamic 2.0 predicate and its existing upgrade wrappers.
+pub(crate) fn select_official_unsloth_recipe(
+    recipe: &str,
+    quant_mxfp: bool,
+    quant_mode: &str,
+    is_qwen35_hybrid: bool,
+) -> Option<OfficialUnslothRecipeKind> {
+    if recipe != "unsloth" || !is_qwen35_hybrid {
+        return None;
+    }
+    if quant_mxfp {
+        Some(OfficialUnslothRecipeKind::Mxfp)
+    } else if quant_mode == "nvfp4" {
+        Some(OfficialUnslothRecipeKind::Nvfp4)
+    } else {
+        None
+    }
+}
+
+/// Build the official Unsloth float class map for Qwen3.5 hybrid models.
+///
+/// Selected for verified Qwen hybrids under either `--q-mxfp` (early FFNs use
+/// MXFP4) or `--q-mode nvfp4` (early FFNs use NVFP4). The existing
+/// [`build_unsloth_recipe`] remains unchanged for plain affine and as the safe
+/// fallback for non-Qwen/ambiguous inputs. AWQ pre-scaling is unchanged.
+///
+/// The language-model depth is inferred from the weight keys. FFNs in the final
+/// eight transformer layers use MXFP8; earlier FFNs use the selected MXFP4 or
+/// NVFP4 low format. Attention, GDN qkv/z/out, and lm_head use MXFP8 at every
+/// depth. Embeddings, router gates, split GDN a/b, vision, MTP, norms, and
+/// recurrent parameters remain BF16.
+pub(crate) fn build_official_unsloth_recipe(
+    weight_keys: &[String],
+    kind: OfficialUnslothRecipeKind,
+) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
+    // Side modules can have their own `layers.N` namespace. Excluding them keeps
+    // a VLM/MTP layer index from shifting the language model's final-eight cut.
+    let num_layers = weight_keys
+        .iter()
+        .filter(|key| {
+            !is_mtp_key(key)
+                && !key.contains("vision_tower")
+                && !key.contains("visual.")
+                && !key.contains("vision_embedder")
+        })
+        .filter_map(|key| extract_layer_index(key))
+        .max()
+        .map(|max_layer| max_layer + 1)
+        .unwrap_or(0);
+    let final_eight_start = num_layers.saturating_sub(8);
+
+    Box::new(move |key: &str| -> QuantDecision {
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+        let mxfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 32,
+            mode: "mxfp4".to_string(),
+        };
+        let nvfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 16,
+            mode: "nvfp4".to_string(),
+        };
+        let low_ffn = || match kind {
+            OfficialUnslothRecipeKind::Mxfp => mxfp4(),
+            OfficialUnslothRecipeKind::Nvfp4 => nvfp4(),
+        };
+
+        // Fail closed for side modules and embeddings, even when a nested key
+        // contains a projection name that would otherwise match below.
+        if is_mtp_key(key)
+            || key.contains("vision_tower")
+            || key.contains("visual.")
+            || key.contains("vision_embedder")
+            || key.contains("embed_tokens")
+            || key.contains("embedding.")
+        {
+            return QuantDecision::Skip;
+        }
+
+        // should_quantize() excludes lm_head family-wide, but Qwen3.5's head is
+        // mode-aware and the official MXFP map explicitly assigns it MXFP8.
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return mxfp8();
+        }
+
+        if !should_quantize(key, /* embed_quantizable */ false) {
+            return QuantDecision::Skip;
+        }
+
+        // Official map: routers and GDN low-rank a/b remain BF16.
+        if is_router_gate(key)
+            || key.contains("linear_attn.in_proj_a.")
+            || key.contains("linear_attn.in_proj_b.")
+        {
+            return QuantDecision::Skip;
+        }
+
+        let is_attention = key.contains("self_attn.q_proj")
+            || key.contains("self_attn.k_proj")
+            || key.contains("self_attn.v_proj")
+            || key.contains("self_attn.o_proj");
+        let is_gdn = key.contains("linear_attn.in_proj_qkv")
+            || key.contains("linear_attn.in_proj_z")
+            || key.contains("linear_attn.out_proj");
+        if is_attention || is_gdn {
+            return mxfp8();
+        }
+
+        // Covers dense MLPs, stacked routed experts (`switch_mlp`), raw expert
+        // spellings, and shared experts after either HF or GGUF sanitization.
+        let is_ffn = key.contains(".mlp.")
+            && (key.contains("gate_proj") || key.contains("up_proj") || key.contains("down_proj"));
+        if is_ffn {
+            return match extract_layer_index(key) {
+                Some(layer) if layer >= final_eight_start => mxfp8(),
+                Some(_) => low_ffn(),
+                None => QuantDecision::Skip,
+            };
+        }
+
+        QuantDecision::Skip
+    })
+}
+
+/// Build the "nvidia" quantization recipe for Qwen3.5/3.6 hybrid models.
+///
+/// A data-free port of NVIDIA modelopt's `w4a16_nvfp4-fp8_attn-kv_fp8_cast`
+/// PTQ recipe, with **MXFP4 substituted for NVFP4** as the 4-bit float format.
+/// NVIDIA ships a single `quant_cfg` shared by the dense (`qwen3_5`) and MoE
+/// (`qwen3_5_moe`) wrappers, so this one closure covers both families — the
+/// hybrid attention/GDN wildcards apply identically.
+///
+/// ## Why this is a faithful, data-free port
+///
+/// - modelopt's MXFP4 weight quantizer is exactly MLX's: dynamic per-block
+///   absmax, E2M1 values, block size 32, E8M0 scales, and **uncalibrated**
+///   (modelopt does not calibrate the weight quantizer). `mlx_quantize(mode =
+///   "mxfp4")` implements the same algorithm, so no calibration data is needed
+///   to reproduce the weight quantization.
+/// - modelopt's calibration only sets FP8 **activation** amax for the
+///   attention / GDN tensors. mlx-node keeps activations and the KV cache in
+///   bf16 (A16 > A8), so there is nothing to port from the calibration set —
+///   the recipe is data-free: no imatrix, no AWQ pre-scaling.
+///
+/// ## Per-tensor format map
+///
+/// | Tensor class | Format | NVIDIA original |
+/// |---|---|---|
+/// | FFN `gate_proj`/`up_proj`/`down_proj` (dense `.mlp.*`, MoE `switch_mlp.*` experts, `shared_expert.*`) | mxfp4 4/32 | MXFP4 W4A16 |
+/// | `lm_head` | mxfp4 4/32 | MXFP4 |
+/// | attention `self_attn.{q,k,v,o}_proj` | mxfp8 8/32 | FP8 W+A |
+/// | GDN `linear_attn.in_proj_qkv`/`in_proj_z`/`out_proj` | mxfp8 8/32 | FP8 W+A |
+/// | GDN split low-rank `linear_attn.in_proj_a`/`in_proj_b` | affine 8/64 | bf16 (deviation) |
+/// | router gates (`is_router_gate`) | affine 8/64 | bf16 (deviation) |
+/// | embeddings, norms, conv1d, `A_log`/`dt_bias`, vision, MTP, `in_proj_ba` | Skip (bf16) | disabled |
+///
+/// mxfp8 (8-bit, block 32, E8M0 scales) is the nearest MLX format to modelopt's
+/// per-tensor FP8, with finer per-group block scales.
+///
+/// ## Two conservative deviations from the NVIDIA original (bf16 → affine 8/64)
+///
+/// - **`linear_attn.in_proj_a`/`in_proj_b`**: quantized as 8-bit affine rather
+///   than left bf16 so they route through MLX's row-independent `qmv` kernel,
+///   preserving T=0 MTP↔AR bit-exactness (a bf16 `matmul` dispatches `gemv` at
+///   M=1 but a split-K `steel_matmul` at M>=2 — the differing reduction order
+///   flips argmax on near-ties). Both a AND b must match: the loader concats
+///   them into `in_proj_ba`. Tiny tensors, so the size cost is negligible.
+/// - **Router gates**: 8-bit affine, never a float format. MXFP8's coarse E8M0
+///   per-group scales have ~10x the round-trip error of affine 8-bit on the
+///   small-magnitude gate weights; that much routing noise flips top-K expert
+///   selection and produces gibberish. Matches every shipped MoE artifact and
+///   Python mlx-lm's `qwen3_5.py` gate pinning.
+///
+/// ## Contract
+///
+/// The builder takes NO bits/group_size args — it is a fixed format map. It
+/// runs under top-level `--q-mode affine` (the recipe gate accepts affine or
+/// nvfp4 and never inspects per-layer modes), so every mxfp4/mxfp8 decision and
+/// every affine-with-non-default-bits decision differs from the top-level
+/// {bits, group_size, mode} and is emitted as an explicit per-layer override;
+/// `Skip` tensors stay bf16. Branch order is load-bearing: `is_mtp_key` →
+/// `lm_head` (before `should_quantize`, which excludes it) → `should_quantize`
+/// → `is_router_gate` → `in_proj_a`/`in_proj_b` → mxfp8 attention/GDN group →
+/// mxfp4 FFN group → Skip.
+pub(crate) fn build_nvidia_recipe() -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
+    Box::new(move |key: &str| -> QuantDecision {
+        // MTP head stays bf16 (before lm_head so `.mtp.*.lm_head`-shaped keys
+        // are not caught by the lm_head branch). `should_quantize` also excludes
+        // MTP, but check first so intent is explicit.
+        if is_mtp_key(key) {
+            return QuantDecision::Skip;
+        }
+
+        // lm_head → mxfp4, handled BEFORE should_quantize (which always skips
+        // lm_head). Loads via the mode-aware LinearProj head loader (post-PR#85).
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            };
+        }
+
+        // Everything else non-quantizable (embeddings, norms, conv1d,
+        // A_log/dt_bias, vision, fused in_proj_ba) → bf16.
+        if !should_quantize(key, /* embed_quantizable */ false) {
+            return QuantDecision::Skip;
+        }
+
+        // Router gates → 8-bit affine (mxfp8 destroys top-K routing precision).
+        if is_router_gate(key) {
+            return QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
+        }
+
+        // Split low-rank GDN projections (`in_proj_a`/`in_proj_b`) → 8-bit
+        // affine for T=0 MTP↔AR bit-exactness. Must come before the mxfp8 group
+        // so they are not swept up as generic GDN projections.
+        if key.contains("linear_attn.in_proj_a.") || key.contains("linear_attn.in_proj_b.") {
+            return QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
+        }
+
+        // Attention (q/k/v/o) and the large GDN projections → mxfp8. o_proj is
+        // included via `self_attn.`; `in_proj_a`/`in_proj_b` were already routed
+        // to affine above, and `in_proj_ba` was excluded by should_quantize.
+        if key.contains("self_attn.")
+            || key.contains("linear_attn.in_proj_qkv")
+            || key.contains("linear_attn.in_proj_z")
+            || key.contains("linear_attn.out_proj")
+        {
+            return QuantDecision::Custom {
+                bits: 8,
+                group_size: 32,
+                mode: "mxfp8".to_string(),
+            };
+        }
+
+        // FFN gate/up/down → mxfp4. Covers dense `.mlp.gate_proj`, MoE experts
+        // (`.mlp.switch_mlp.gate_proj`), and the shared expert
+        // (`.mlp.shared_expert.gate_proj`). Sanitize splits/stacks all experts
+        // into the `switch_mlp.*` form BEFORE the predicate runs (convert.rs
+        // Step 3, ~:600-758), so no fused `experts.gate_up_proj` reaches here;
+        // were it to, it would still match via the `up_proj` substring. The
+        // router gate (`.mlp.gate`) and `shared_expert_gate` were handled above
+        // and lack the `_proj` suffix, so they are not swept in here.
+        if key.contains(".mlp.")
+            && (key.contains("gate_proj") || key.contains("up_proj") || key.contains("down_proj"))
+        {
+            return QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            };
+        }
+
+        // Anything unmatched → bf16.
+        QuantDecision::Skip
+    })
+}
+
 /// Build a quantization predicate for the openai/privacy-filter checkpoint.
 ///
 /// Privacy-filter is a small MoE classifier (8 layers, 33-class head) shipped
@@ -3874,6 +4407,14 @@ pub(crate) fn build_privacy_filter_predicate(
 ///   top-K expert selection and produces gibberish output. Python mlx-lm's
 ///   `quant_predicate` in `qwen3_5.py` hardcodes these gates to
 ///   `{group_size: 64, bits: 8}` affine for exactly this reason.
+/// - Recipe-pinned attention/GDN projections (`self_attn.o_proj`,
+///   `linear_attn.out_proj`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`):
+///   the `unsloth` / `qwen3_5` recipes pin these to 8-bit affine so AR (M=1)
+///   and MTP-verify (M>=2) both route through the M-invariant `qmv` kernel for
+///   T=0 MTP<->AR bit-exactness. Like the router gates their loader IS
+///   mode-aware, but MXFP8's E8M0 power-of-two scales have ~10x the round-trip
+///   error of affine 8-bit, pushing the worst-KLD `out_proj` (~6.0) and
+///   `o_proj` (~1.5) off bf16. See `is_bitexact_affine_proj`.
 ///
 /// MXFP tensors at any of these keys would be silently misinterpreted at
 /// load time or destroy routing precision. Supporting MXFP on these keys
@@ -3891,14 +4432,32 @@ pub(crate) fn apply_mxfp_upgrade(
         if is_affine_only_key(key) {
             return original;
         }
-        // Router gates and shared_expert_gate: ALWAYS force 8-bit affine,
-        // regardless of what the inner predicate returned. MXFP8's coarse
-        // E8M0 scales destroy top-K routing precision. We do not preserve
-        // `Skip` here either: a recipe that wants to keep gates at full
-        // precision would not have a meaningful interaction with `--q-mxfp`
-        // since the loader has no path to load an unquantized gate when
-        // every other weight is quantized. Forcing affine 8-bit matches
-        // Python mlx-lm's `quant_predicate` in `qwen3_5.py`.
+        // Recipe-pinned 8-bit affine attention/GDN projections
+        // (o_proj / out_proj / in_proj_a / in_proj_b). The unsloth / qwen3_5
+        // recipes emit Custom{8, gs64, affine} here so AR (M=1) and MTP-verify
+        // (M>=2) both route through the M-invariant qmv kernel for T=0
+        // MTP<->AR bit-exactness, and 8-bit *affine* (not mxfp8's coarse E8M0
+        // scales) keeps the worst-KLD out_proj near bf16. Preserve THAT pinned
+        // decision from the mxfp8 upgrade — but ONLY when the recipe actually
+        // pinned it to 8-bit affine. `apply_mxfp_upgrade` wraps every recipe,
+        // and generic `mixed_*` recipes give these keys low-bit decisions
+        // (e.g. mixed_4_6 -> 4-bit affine o_proj) that must still upgrade
+        // normally (4-bit -> mxfp4); gating on the pinned decision — not the
+        // key alone — keeps those working. A `Skip` (MTP-layer keys) falls
+        // through to the main match's `Skip => Skip` arm, so it is still kept.
+        if is_bitexact_affine_proj(key)
+            && matches!(&original, QuantDecision::Custom { bits: 8, mode, .. } if mode == "affine")
+        {
+            return original;
+        }
+        // Router gates and shared_expert_gate: force 8-bit affine (group_size
+        // 64), but PRESERVE an explicit `Skip` from the inner predicate. MXFP8's
+        // coarse E8M0 scales destroy top-K routing precision, so any non-Skip
+        // gate decision (Default or Custom) is rewritten to affine 8-bit —
+        // matching Python mlx-lm's `quant_predicate` in `qwen3_5.py`
+        // (`{group_size: 64, bits: 8}`). A recipe that returns `Skip` for a gate
+        // (keep it dense/bf16) is honored as-is. Mirrors the Skip-preserving
+        // gate branch in `apply_nvfp4_upgrade`.
         if is_router_gate(key) {
             match original {
                 QuantDecision::Skip => return QuantDecision::Skip,
@@ -3985,6 +4544,171 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
         return Err(format!(
             "--q-mode nvfp4 + --q-recipe is currently supported only for 'unsloth' and 'qwen3_5' recipes (got '{}'). Other recipes lack tensor-class exclusions for NVFP4-sensitive layers (e.g. linear_attn.out_proj).",
             recipe
+        ));
+    }
+    Ok(())
+}
+
+/// Collapse an exact HuggingFace `model_type` string to the nvidia recipe's
+/// coarse *family* (the unit `recipe_for` actually dispatches on), or `None`
+/// when the type is unsupported by this recipe.
+///
+/// `gemma4`, `gemma4_unified`, and `gemma4_text` all map to the single
+/// `"gemma4"` family. `recipe_for` resolves `gemma4` / `gemma4_unified` to the
+/// same `Gemma4Recipe`, and `gemma4_text` is the text-only dense alias for that
+/// same family: the loader recognizes `gemma4_text` as a plain dense gemma4 root
+/// `model_type`, and the CLI collapses a `gemma4_text` config to `--model-type
+/// gemma4` before it reaches the sanitizer. A config declaring any of the three
+/// and a `--model-type` declaring another therefore AGREE. `lfm2` / `qwen3` /
+/// `None` remain unsupported by this recipe.
+fn nvidia_recipe_family(model_type: Option<&str>) -> Option<&'static str> {
+    match model_type {
+        Some("qwen3_5") => Some("qwen3_5"),
+        Some("qwen3_5_moe") => Some("qwen3_5_moe"),
+        Some("gemma4") | Some("gemma4_unified") | Some("gemma4_text") => Some("gemma4"),
+        _ => None, // incl. lfm2, qwen3, None, etc.
+    }
+}
+
+/// Validate `--q-recipe nvidia`: the input config's model type, the requested
+/// `--model-type` family, dense-vs-MoE, and the flags passed alongside it.
+///
+/// The nvidia recipe is a data-free port of NVIDIA modelopt's Qwen3.5/3.6
+/// *hybrid* recipe. The SAME fixed mxfp4/mxfp8 class-map is now also applied to
+/// dense `gemma4` / `gemma4_unified`, whose standard attention + MLP key names
+/// fall out of the same predicate: attention `self_attn.{q,k,v,o}_proj` →
+/// mxfp8, MLP `.mlp.{gate,up,down}_proj` → mxfp4, and norms / `embed_tokens` /
+/// `vision_embedder.*` (plus the tied gemma4 head) stay bf16. This is the same
+/// data-free format map generalized to gemma4's standard attention — NOT a port
+/// of an official NVIDIA *gemma* recipe. The recipe is documented + validated
+/// for these four model types (`qwen3_5` / `qwen3_5_moe` / `gemma4` /
+/// `gemma4_unified`). Its per-layer map (`build_nvidia_recipe`) is a pure
+/// key-pattern predicate with no model-family awareness, so applying it to any
+/// OTHER family (or to a `None`/omitted model type) would emit mxfp4/mxfp8
+/// per-layer metadata on generic substrings (`lm_head`, `self_attn`, `.mlp.*`)
+/// that those loaders were never designed for — producing an unloadable or
+/// numerically invalid checkpoint instead of failing upfront.
+///
+/// The gate has three model-shape parts, checked before the flag guards:
+/// 1. **Supported family** — the INPUT config's own `config_family` must
+///    collapse (via `nvidia_recipe_family`) to one of the four supported types;
+///    reject any other family or a `None`/omitted type first.
+/// 2. **Dense-only gemma4** — `build_nvidia_recipe` maps FFN via `.mlp.` +
+///    `{gate,up,down}_proj`. A gemma4 MoE checkpoint (`enable_moe_block: true`,
+///    e.g. 26B-A4B) sanitizes its experts to `experts.switch_glu.*` keys that
+///    have NO `.mlp.` infix, so they fall through to bf16 (unlike qwen MoE,
+///    whose experts normalize to `.mlp.switch_mlp.*`). Reject gemma4 MoE.
+/// 3. **Config/`--model-type` family agreement** — the recipe sanitizes with
+///    `--model-type` (the caller's `-m`), but the gate reads the config's own
+///    type; if they name different families the wrong sanitizer runs and emits
+///    a corrupt checkpoint, so the requested family must match the config
+///    family (`gemma4`/`gemma4_unified` collapse together and agree).
+///
+/// It also has a fixed format map: it reads no imatrix, ignores `--q-mxfp` (it
+/// emits mxfp4/mxfp8 directly), and pins bits=4/group_size=32 for its float
+/// tensors. Reject flags that would silently alter or contradict that map, but
+/// allow a bare `-q --q-recipe nvidia` (no explicit bits/group_size) to pass.
+///
+/// Shared by the safetensors (`convert_model_inner`) and GGUF
+/// (`convert_gguf_to_safetensors`) entry points so both reject the same
+/// forbidden combinations with identical messages. The GGUF path has no HF
+/// `model_type` in scope (its arch is inferred from GGUF metadata as e.g.
+/// `qwen3`, never the exact `qwen3_5`/`qwen3_5_moe`), so it passes `None` and
+/// nvidia-on-GGUF is rejected wholesale by the model-type gate — correct, since
+/// the recipe is a faithful full-precision→mxfp port and re-quantizing an
+/// already-lossy GGUF was never a supported path. Without the flag guards an
+/// imatrix would trigger AWQ pre-scaling and `--q-mxfp` would re-upgrade the
+/// recipe's affine-8/64 in_proj_a/in_proj_b decisions to mxfp8, breaking the
+/// intended T=0 MTP↔AR bit-exactness. `config_family` is the input config's own
+/// type (or a call-site-resolved gemma4_unified alias), `requested_model_type`
+/// is `options.model_type` (the family the sanitizer will use); both are `Some`
+/// only when present. `quant_bits` / `quant_group_size` are `Some` only when the
+/// caller passed them explicitly; `None` means "use the recipe default" and
+/// always passes the flag checks.
+pub(crate) fn validate_nvidia_recipe_options(
+    config_family: Option<&str>,
+    requested_model_type: Option<&str>,
+    is_moe: bool,
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_bits: Option<i32>,
+    quant_group_size: Option<i32>,
+) -> std::result::Result<(), String> {
+    // 1. The INPUT config's own model_type (ground truth) must be a supported
+    //    nvidia family. Reject any other family or a None/omitted type first.
+    let Some(fam) = nvidia_recipe_family(config_family) else {
+        return Err(format!(
+            "--q-recipe nvidia is only supported for model types qwen3_5 / qwen3_5_moe / \
+             gemma4 / gemma4_unified (got {}). It applies a fixed data-free mxfp4/mxfp8 \
+             class-map (attention → mxfp8, MLP → mxfp4, norms/embeds/vision → bf16); other \
+             families need their own recipe.",
+            match config_family {
+                Some(mt) => format!("'{mt}'"),
+                None => "none".to_string(),
+            }
+        ));
+    };
+    // 2. gemma4 nvidia is dense-only: a MoE gemma4 checkpoint's expert keys
+    //    (`experts.switch_glu.*`) have no `.mlp.` infix, so they fall through to
+    //    bf16 under `build_nvidia_recipe`. Reject upfront.
+    if fam == "gemma4" && is_moe {
+        return Err(
+            "--q-recipe nvidia supports only dense gemma4 (its fixed class-map keys FFN via \
+             `.mlp.{gate,up,down}_proj`); this checkpoint has enable_moe_block=true (MoE, e.g. \
+             26B-A4B), whose experts sanitize to `experts.switch_glu.*` keys with no `.mlp.` \
+             infix and would fall through to bf16. Not supported."
+                .to_string(),
+        );
+    }
+    // 3. The recipe sanitizes with --model-type but the gate read the config's
+    //    own type; they must name the same family or the wrong sanitizer runs.
+    let req = nvidia_recipe_family(requested_model_type);
+    if req != Some(fam) {
+        return Err(format!(
+            "--model-type {requested} selects a different model family than the input config \
+             ({config}); --q-recipe nvidia sanitizes with --model-type, so it must match the \
+             config family. Omit --model-type or pass the matching family.",
+            requested = match requested_model_type {
+                Some(mt) => format!("'{mt}'"),
+                None => "none".to_string(),
+            },
+            config = match config_family {
+                Some(mt) => format!("'{mt}'"),
+                None => "none".to_string(),
+            },
+        ));
+    }
+    if imatrix_path.is_some() {
+        return Err(
+            "nvidia recipe is a data-free port and does not accept --imatrix-path: \
+             an imatrix would trigger AWQ pre-scaling that silently alters weights, \
+             breaking the faithful modelopt format map"
+                .to_string(),
+        );
+    }
+    if quant_mxfp {
+        return Err(
+            "nvidia recipe already emits mxfp4/mxfp8 per-layer; --q-mxfp is redundant \
+             and would try to re-upgrade an already-mxfp map. Drop --q-mxfp (the recipe \
+             runs under --q-mode affine)."
+                .to_string(),
+        );
+    }
+    if let Some(bits) = quant_bits
+        && bits != 4
+    {
+        return Err(format!(
+            "nvidia recipe is a fixed format map (its float tensors are pinned to \
+             bits=4); it ignores --q-bits. Got --q-bits {bits}; omit it."
+        ));
+    }
+    if let Some(group_size) = quant_group_size
+        && group_size != 32
+    {
+        return Err(format!(
+            "nvidia recipe is a fixed format map (its float tensors are pinned to \
+             group_size=32); it ignores --q-group-size. Got --q-group-size \
+             {group_size}; omit it."
         ));
     }
     Ok(())
@@ -4090,7 +4814,7 @@ pub(crate) fn apply_nvfp4_upgrade(
 }
 
 /// Build a recipe predicate from a recipe name. Returns error for unknown recipes.
-/// Supports: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
+/// Supports: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth, nvidia
 pub(crate) fn build_predicate_for_recipe(
     recipe: &str,
     weight_keys: &[String],
@@ -4103,8 +4827,10 @@ pub(crate) fn build_predicate_for_recipe(
         }
         "qwen3_5" => Ok(build_qwen35_recipe(default_bits, default_group_size)),
         "unsloth" => Ok(build_unsloth_recipe(default_bits, default_group_size)),
+        // The nvidia recipe is a fixed format map (no bits/group_size args).
+        "nvidia" => Ok(build_nvidia_recipe()),
         _ => Err(format!(
-            "Unknown quantization recipe: '{recipe}'. Available: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth"
+            "Unknown quantization recipe: '{recipe}'. Available: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth, nvidia"
         )),
     }
 }
@@ -4419,8 +5145,9 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 /// Identify the CO-QUANTIZED group a weight base key (key minus `.weight`)
 /// belongs to, returning the full canonical member base list. Returns `None`
 /// for keys whose loaders resolve quantization per tensor (attention
-/// projections, GDN, embeddings, gemma4 MoE `experts.*`, qwen3_5_moe — the
-/// latter has no sym8 dispatch and fails loud up front on any sym8 config).
+/// projections, GDN, embeddings, gemma4 MoE `experts.*`, and qwen3_5_moe's
+/// router `.mlp.gate` / `.mlp.shared_expert_gate` — each of the latter builds
+/// through its own `try_build_ql` call with an independent dense fallback).
 ///
 /// These are the groups whose loaders are strict all-or-none:
 /// - dense MLP `{root}.mlp.{gate,up,down}_proj` — gemma4 (`gemma4/
@@ -4436,11 +5163,28 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 /// - lfm2 MoE quartet: router `{root}.feed_forward.gate` + 3D stacked
 ///   `{root}.feed_forward.switch_mlp.{gate,up,down}_proj` —
 ///   `moe_layer_is_quantized` couples all four (`moe_proj_bases`).
+/// - qwen3_5_moe switch_mlp trio `{root}.mlp.switch_mlp.{gate,up,down}_proj`
+///   AND shared_expert trio `{root}.mlp.shared_expert.{gate,up,down}_proj` —
+///   `qwen3_5_moe/persistence.rs` builds each trio all-or-none (`if let
+///   (Some(..), Some(..), Some(..))`); a partial trio drops ALL THREE members
+///   to the dense setters, where `ensure_dense_weight_floating` rejects the
+///   quantized members' packed non-float weights (matching the dense qwen3_5
+///   fallbacks). Reachable since qwen3_5_moe gained sym8 dispatch
+///   for its non-expert sublayers (the old blanket fail-loud-on-any-sym8-
+///   config guard is gone): under a sym8 default, 3-D switch_mlp experts and
+///   2-D members with `K % 16 != 0` are both forced to affine-8
+///   (`sym8_eligible`; a sym8 override reaching `try_build_qsl` fails loud at
+///   load), and a forced-affine member that ALSO fails the affine
+///   `K % group_size` alignment would silently stay dense next to quantized
+///   siblings without this table.
 ///
 /// `strip_suffix` is an exact tail match, so the tables cannot cross-match:
 /// `…switch_mlp.gate_proj` never strips as `.mlp.gate_proj` (the char before
-/// `mlp` is `_`, not `.`) and `…feed_forward.gate_proj` never strips as
-/// `.feed_forward.gate`.
+/// `mlp` is `_`, not `.`), `…feed_forward.gate_proj` never strips as
+/// `.feed_forward.gate`, qwen's `.mlp.switch_mlp.*` suffixes never match
+/// lfm2's `.feed_forward.switch_mlp.*` (different parent segment, both ways),
+/// and `….mlp.shared_expert.gate_proj` ends in `expert.gate_proj`, which no
+/// other table's suffix matches.
 fn coquant_group_members(base: &str) -> Option<Vec<String>> {
     const LFM2_MOE: [&str; 4] = [
         ".feed_forward.gate",
@@ -4453,8 +5197,24 @@ fn coquant_group_members(base: &str) -> Option<Vec<String>> {
         ".feed_forward.up_proj",
         ".feed_forward.down_proj",
     ];
+    const QWEN35_MOE_SWITCH: [&str; 3] = [
+        ".mlp.switch_mlp.gate_proj",
+        ".mlp.switch_mlp.up_proj",
+        ".mlp.switch_mlp.down_proj",
+    ];
+    const QWEN35_MOE_SHARED_EXPERT: [&str; 3] = [
+        ".mlp.shared_expert.gate_proj",
+        ".mlp.shared_expert.up_proj",
+        ".mlp.shared_expert.down_proj",
+    ];
     const DENSE_MLP: [&str; 3] = [".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"];
-    for table in [&LFM2_MOE[..], &LFM2_FFN[..], &DENSE_MLP[..]] {
+    for table in [
+        &LFM2_MOE[..],
+        &LFM2_FFN[..],
+        &QWEN35_MOE_SWITCH[..],
+        &QWEN35_MOE_SHARED_EXPERT[..],
+        &DENSE_MLP[..],
+    ] {
         for suffix in table {
             if let Some(root) = base.strip_suffix(suffix) {
                 return Some(table.iter().map(|s| format!("{root}{s}")).collect());
@@ -5008,8 +5768,8 @@ fn quantize_weights_inner(
 ///
 /// Returns the per-layer override map produced by `quantize_weights_inner`.
 /// The no-recipe path still emits non-default entries for special keys —
-/// e.g. router gates are upgraded to mxfp8 under a global MXFP mode, and
-/// `lm_head` / `router.proj` are forced back to affine — so callers MUST
+/// e.g. router gates are forced to 8-bit affine (regardless of the top-level
+/// MXFP mode), like `lm_head` / `router.proj` — so callers MUST
 /// thread the returned map into `config.json["quantization"]` for the
 /// loader to dispatch correctly.
 fn quantize_weights(
@@ -5168,7 +5928,18 @@ pub(crate) fn apply_awq_prescaling(
         // ── Group A: norm → gate_proj + up_proj ──
         let gate_key = format!("{prefix}.mlp.gate_proj.weight");
         let up_key = format!("{prefix}.mlp.up_proj.weight");
-        let norm_key = format!("{prefix}.post_attention_layernorm.weight");
+        // The inverse scale must land on the norm whose output the MLP reads.
+        // gemma4 sandwich layers feed the MLP from pre_feedforward_layernorm;
+        // their post_attention_layernorm normalizes the attention output into
+        // the residual, so folding 1/s there rescales the attention branch and
+        // leaves gate/up columns uncompensated. Two-norm families (qwen3_5,
+        // lfm2) have no pre_feedforward_layernorm and keep the classic target.
+        let sandwich_norm_key = format!("{prefix}.pre_feedforward_layernorm.weight");
+        let norm_key = if weights.contains_key(&sandwich_norm_key) {
+            sandwich_norm_key
+        } else {
+            format!("{prefix}.post_attention_layernorm.weight")
+        };
 
         if let Some(scales) = compute_group_a_scales(imatrix, &gate_key, &up_key, ratio)? {
             // gate_proj.weight *= scales (broadcast over columns: [out, in] * [1, in])
@@ -5588,6 +6359,133 @@ mod tests {
         );
     }
 
+    /// Group A must fold the inverse MLP scale into the norm whose output the
+    /// MLP actually consumes. In gemma4's 4-norm sandwich layer that is
+    /// `pre_feedforward_layernorm`; `post_attention_layernorm` there normalizes
+    /// the attention output into the residual stream, so dividing it by the MLP
+    /// scales corrupts the attention branch while leaving gate/up columns
+    /// uncompensated. Two-norm families (qwen3_5, lfm2) have no
+    /// pre_feedforward_layernorm and must keep folding into
+    /// post_attention_layernorm.
+    #[test]
+    fn awq_group_a_targets_sandwich_ffn_norm() {
+        use crate::utils::imatrix::ImatrixData;
+
+        const K: i64 = 4;
+        const N: i64 = 2;
+
+        let ones = |shape: &[i64]| {
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            MxArray::from_float32(&vec![1.0f32; numel], shape).expect("from_float32")
+        };
+        let read = |w: &MxArray| w.to_float32().expect("to_float32");
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 — gemma4-style sandwich layer (has pre_feedforward_layernorm).
+        for key in [
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            "language_model.model.layers.0.mlp.up_proj.weight",
+        ] {
+            weights.insert(key.into(), ones(&[N, K]));
+        }
+        weights.insert(
+            "language_model.model.layers.0.post_attention_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.pre_feedforward_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        // Layer 1 — qwen-style two-norm layer (no pre_feedforward_layernorm).
+        for key in [
+            "language_model.model.layers.1.mlp.gate_proj.weight",
+            "language_model.model.layers.1.mlp.up_proj.weight",
+        ] {
+            weights.insert(key.into(), ones(&[N, K]));
+        }
+        weights.insert(
+            "language_model.model.layers.1.post_attention_layernorm.weight".into(),
+            ones(&[K]),
+        );
+
+        // importance [1, 4, 9, 16] → scales = sqrt(imp)/sqrt(max*min) = [0.5, 1, 1.5, 2]
+        let importance: HashMap<String, Vec<f32>> = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.1.mlp.up_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let imatrix = ImatrixData {
+            importance,
+            chunk_count: 1,
+            chunk_size: 1,
+        };
+
+        let modified = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2).expect("awq");
+        assert_eq!(modified, 6, "gate + up + one norm per layer");
+
+        let expected_scales = [0.5f32, 1.0, 1.5, 2.0];
+        let expected_inv: Vec<f32> = expected_scales.iter().map(|s| 1.0 / s).collect();
+
+        // Sandwich layer: inverse lands on pre_feedforward_layernorm; the
+        // attention-output norm stays byte-identical.
+        let pre_ffn =
+            read(&weights["language_model.model.layers.0.pre_feedforward_layernorm.weight"]);
+        let post_attn =
+            read(&weights["language_model.model.layers.0.post_attention_layernorm.weight"]);
+        for j in 0..K as usize {
+            assert!(
+                (pre_ffn[j] - expected_inv[j]).abs() < 1e-5,
+                "layer 0 pre_feedforward_layernorm[{j}] = {} expected {}",
+                pre_ffn[j],
+                expected_inv[j]
+            );
+            assert!(
+                (post_attn[j] - 1.0).abs() < 1e-6,
+                "layer 0 post_attention_layernorm[{j}] must be untouched, got {}",
+                post_attn[j]
+            );
+        }
+
+        // Two-norm layer: unchanged behavior — inverse folds into
+        // post_attention_layernorm.
+        let qwen_norm =
+            read(&weights["language_model.model.layers.1.post_attention_layernorm.weight"]);
+        for j in 0..K as usize {
+            assert!(
+                (qwen_norm[j] - expected_inv[j]).abs() < 1e-5,
+                "layer 1 post_attention_layernorm[{j}] = {} expected {}",
+                qwen_norm[j],
+                expected_inv[j]
+            );
+        }
+
+        // Reparametrization invariant: gate columns × ffn-norm channels == 1.
+        let gate = read(&weights["language_model.model.layers.0.mlp.gate_proj.weight"]);
+        for j in 0..K as usize {
+            let prod = gate[j] * pre_ffn[j];
+            assert!(
+                (prod - 1.0).abs() < 1e-5,
+                "layer 0 gate[{j}] × pre_ffn_norm[{j}] = {prod}, fold must be balanced"
+            );
+        }
+    }
+
     /// Registry-consistency gate: for the exhaustive set of supported
     /// `model_type` strings (plus a non-convertible control), the four
     /// recipe-sourced asymmetry flags must reproduce EXACTLY the
@@ -5625,13 +6523,15 @@ mod tests {
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 
-            // sym8_supported == old sym8 allowlist (NOTE qwen3_5_moe excluded).
-            // gemma4_unified routes to Gemma4Recipe and supports sym8 like gemma4.
+            // sym8_supported allowlist: qwen3_5 (dense + MoE), lfm2/lfm2_moe,
+            // gemma4. gemma4_unified routes to Gemma4Recipe and supports sym8
+            // like gemma4. qwen3_5_moe dispatches sym8 on its non-expert
+            // sublayers (3-D stacked experts stay convert-forced affine-8).
             assert_eq!(
                 r.sym8_supported(),
                 matches!(
                     mt,
-                    "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
+                    "qwen3_5" | "qwen3_5_moe" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
                 ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );
@@ -5668,10 +6568,11 @@ mod tests {
         // unrecognized model_type's flags as false then errors at dispatch).
         assert!(recipe::recipe_for("not-a-real-model").is_none());
 
-        // qwen3_5 vs qwen3_5_moe sym8 asymmetry is the subtle case: same recipe
-        // family, opposite sym8 support.
+        // qwen3_5 and qwen3_5_moe share the recipe family and BOTH support
+        // sym8: the MoE loader dispatches sym8 on its non-expert sublayers,
+        // while per-expert switch_mlp tensors stay convert-forced affine-8.
         assert!(recipe::recipe_for("qwen3_5").unwrap().sym8_supported());
-        assert!(!recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
+        assert!(recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
     }
 
     /// Byte-faithfulness gate for `Gemma4Recipe::sanitize`. Builds a tiny
@@ -6300,6 +7201,120 @@ mod tests {
     }
 
     #[test]
+    fn apply_mxfp_upgrade_preserves_bitexact_affine_projections() {
+        // The unsloth / qwen3_5 recipes pin o_proj / out_proj / in_proj_a /
+        // in_proj_b to 8-bit affine so AR (M=1) and MTP-verify (M>=2) both route
+        // through the M-invariant qmv kernel (T=0 MTP<->AR bit-exactness), and
+        // 8-bit *affine* keeps the worst-KLD out_proj near bf16. `--q-mxfp` must
+        // NOT degrade these to mxfp8. q_proj / gate_proj prove the guard is not
+        // over-broad and still upgrade normally.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = Box::new(|key: &str| {
+            if key.contains("self_attn.o_proj")
+                || key.contains("linear_attn.out_proj")
+                || key.contains("linear_attn.in_proj_a.")
+                || key.contains("linear_attn.in_proj_b.")
+            {
+                // MTP-layer o_proj is left bf16 by the recipe (Skip).
+                if key.contains("mtp") {
+                    QuantDecision::Skip
+                } else {
+                    QuantDecision::Custom {
+                        bits: 8,
+                        group_size: 64,
+                        mode: "affine".to_string(),
+                    }
+                }
+            } else if key.contains("q_proj") {
+                QuantDecision::Custom {
+                    bits: 6,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                }
+            } else {
+                QuantDecision::Default
+            }
+        });
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+
+        // The four recipe-pinned projections stay Custom{8, 64, affine}.
+        for key in [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+            "model.layers.0.linear_attn.in_proj_a.weight",
+            "model.layers.0.linear_attn.in_proj_b.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 8,
+                    group_size: 64,
+                    mode: "affine".to_string(),
+                },
+                "{key} must stay 8-bit affine, not upgrade to mxfp8"
+            );
+        }
+
+        // An MTP-layer o_proj the recipe Skips stays Skip (not force-quantized).
+        assert_eq!(
+            wrapped("model.mtp.layers.0.self_attn.o_proj.weight"),
+            QuantDecision::Skip,
+            "MTP o_proj Skip must be preserved"
+        );
+
+        // Control: the guard is not over-broad. q_proj (6-bit) passes through
+        // unchanged and gate_proj (Default, default_bits=4) upgrades to mxfp4.
+        assert_eq!(
+            wrapped("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 6,
+                group_size: 64,
+                mode: "affine".to_string(),
+            },
+            "q_proj must not be caught by the o_proj guard"
+        );
+        assert_eq!(
+            wrapped("model.layers.0.mlp.gate_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_promotes_non_pinned_low_bit_projections() {
+        // The bitexact guard must protect ONLY the recipe-PINNED 8-bit affine
+        // decision (qwen3_5 / unsloth). Under a generic `mixed_*` recipe these
+        // same keys get low-bit decisions (e.g. mixed_4_6 -> 4-bit affine
+        // o_proj) which must still upgrade to mxfp4 — otherwise --q-mxfp is a
+        // silent no-op for them on mixed recipes.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+        for key in [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+            "model.layers.0.linear_attn.in_proj_a.weight",
+            "model.layers.0.linear_attn.in_proj_b.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 32,
+                    mode: "mxfp4".to_string(),
+                },
+                "{key}: non-pinned 4-bit affine (mixed_* recipe) must upgrade to mxfp4"
+            );
+        }
+    }
+
+    #[test]
     fn apply_mxfp_upgrade_preserves_lm_head_8bit_decision() {
         // Dense Qwen3.5 lm_head loader is affine-only (Linear::load_quantized
         // hardcodes "affine"); the unsloth recipe emits an 8-bit affine
@@ -6718,8 +7733,345 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_recipe_options_rejects_imatrix() {
+        // Matching qwen3_5 config+requested so the model-shape gate passes and
+        // the imatrix flag guard is what fires.
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            Some("/path/to.imatrix"),
+            false,
+            None,
+            None,
+        )
+        .expect_err("nvidia recipe must reject --imatrix-path");
+        assert!(
+            err.contains("does not accept --imatrix-path"),
+            "error must mention imatrix rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_mxfp() {
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            true,
+            None,
+            None,
+        )
+        .expect_err("nvidia recipe must reject --q-mxfp");
+        assert!(
+            err.contains("--q-mxfp is redundant"),
+            "error must mention --q-mxfp redundancy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_non_default_bits() {
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            Some(8),
+            None,
+        )
+        .expect_err("nvidia recipe must reject --q-bits != 4");
+        assert!(
+            err.contains("bits=4"),
+            "error must mention pinned bits=4, got: {err}"
+        );
+        assert!(
+            err.contains("Got --q-bits 8"),
+            "error must echo the offending value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_non_default_group_size() {
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            Some(64),
+        )
+        .expect_err("nvidia recipe must reject --q-group-size != 32");
+        assert!(
+            err.contains("group_size=32"),
+            "error must mention pinned group_size=32, got: {err}"
+        );
+        assert!(
+            err.contains("Got --q-group-size 64"),
+            "error must echo the offending value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_bare() {
+        validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("bare --q-recipe nvidia (no explicit flags) must be accepted");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_explicit_matching_defaults() {
+        // Explicit-but-matching bits=4 / group_size=32 contradict nothing and
+        // must pass: the guard only rejects values that would alter the map.
+        validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            Some(4),
+            Some(32),
+        )
+        .expect("explicit bits=4 group_size=32 must be accepted");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_supported_families() {
+        // The recipe is documented + validated for exactly these four families
+        // (qwen3_5 / qwen3_5_moe + dense gemma4 / gemma4_unified, whose standard
+        // attention + MLP keys fall out of the same data-free class-map). A bare
+        // invocation (no aux flags), config family == requested family, must pass.
+        validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("qwen3_5 must be accepted");
+        validate_nvidia_recipe_options(
+            Some("qwen3_5_moe"),
+            Some("qwen3_5_moe"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("qwen3_5_moe must be accepted");
+        validate_nvidia_recipe_options(
+            Some("gemma4"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4 must be accepted");
+        validate_nvidia_recipe_options(
+            Some("gemma4_unified"),
+            Some("gemma4_unified"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_unified must be accepted");
+        // gemma4 and gemma4_unified collapse to the same family, so a config of
+        // one and a --model-type of the other AGREE (recipe_for is identical).
+        validate_nvidia_recipe_options(
+            Some("gemma4_unified"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_unified config + gemma4 --model-type must agree (same family)");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_gemma4_text_alias() {
+        // `gemma4_text` is the text-only dense alias of the gemma4 family: the
+        // loader recognizes it as a plain dense gemma4 root model_type and the
+        // CLI collapses a `gemma4_text` config to `--model-type gemma4` before
+        // the sanitizer runs. The gate reads the config's OWN type
+        // (gemma4_text) while the sanitizer dispatches on the collapsed
+        // `gemma4`, so a gemma4_text config with a requested gemma4 (or
+        // gemma4_unified) must be ACCEPTED, not rejected as unsupported.
+        validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_text config + gemma4 --model-type must be accepted (same family)");
+        validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4_unified"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_text config + gemma4_unified --model-type must agree (same family)");
+
+        // The dense-only guard still holds: a gemma4_text config with
+        // enable_moe_block is MoE and must be rejected (its experts sanitize to
+        // `experts.switch_glu.*` keys that fall through to bf16).
+        let moe_err = validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4"),
+            true,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("a gemma4_text MoE checkpoint must still be rejected");
+        assert!(
+            moe_err.contains("only dense gemma4"),
+            "error must mention the dense-only gemma4 limit, got: {moe_err}"
+        );
+
+        // Family-agreement still holds: gemma4_text config + qwen3_5
+        // --model-type names a different family and must be rejected.
+        let mismatch_err = validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("gemma4_text config + qwen3_5 --model-type must be rejected");
+        assert!(
+            mismatch_err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {mismatch_err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_unsupported_model_types() {
+        // Other families' loaders were never designed for the nvidia recipe's
+        // mxfp4/mxfp8 per-layer map — reject upfront. `qwen3` != `qwen3_5`, so it
+        // stays unsupported. The model-type gate fires before the aux-flag
+        // checks, so it holds even with otherwise-valid (bare) flags. Pass the
+        // unsupported type as BOTH config and requested.
+        for mt in ["lfm2", "lfm2_moe", "qwen3"] {
+            let err =
+                validate_nvidia_recipe_options(Some(mt), Some(mt), false, None, false, None, None)
+                    .expect_err("nvidia recipe must reject an unsupported model type");
+            assert!(
+                err.contains("only supported for model types"),
+                "error must name the supported model types, got: {err}"
+            );
+            assert!(
+                err.contains(&format!("'{mt}'")),
+                "error must echo the offending model type {mt}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_omitted_model_type() {
+        // `None` = no `--model-type` (safetensors auto-detect fell through) or
+        // the GGUF entry point (which has no HF model_type in scope). Both must
+        // fail upfront rather than run the generic-substring predicate.
+        let err = validate_nvidia_recipe_options(None, None, false, None, false, None, None)
+            .expect_err("nvidia recipe must reject an omitted model type");
+        assert!(
+            err.contains("only supported for model types"),
+            "error must name the supported model types, got: {err}"
+        );
+        assert!(
+            err.contains("got none"),
+            "error must report the omitted model type as 'none', got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_gemma4_moe() {
+        // The nvidia class-map keys FFN via `.mlp.{gate,up,down}_proj`. A gemma4
+        // MoE checkpoint (enable_moe_block=true, e.g. 26B-A4B) sanitizes its
+        // experts to `experts.switch_glu.*` keys with no `.mlp.` infix, so they
+        // fall through to bf16. Reject it as dense-only (config == requested so
+        // the family gate passes and the dense-only guard is what fires).
+        let err = validate_nvidia_recipe_options(
+            Some("gemma4"),
+            Some("gemma4"),
+            true,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("nvidia recipe must reject a gemma4 MoE checkpoint");
+        assert!(
+            err.contains("only dense gemma4"),
+            "error must mention the dense-only gemma4 limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_family_mismatch() {
+        // The recipe sanitizes with --model-type but the gate reads the config's
+        // own type; if they name different families the wrong sanitizer runs and
+        // emits a corrupt checkpoint. Reject both directions.
+        let err = validate_nvidia_recipe_options(
+            Some("gemma4"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("gemma4 config + qwen3_5 --model-type must be rejected");
+        assert!(
+            err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {err}"
+        );
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("qwen3_5 config + gemma4 --model-type must be rejected");
+        assert!(
+            err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {err}"
+        );
+    }
+
+    #[test]
     fn nvfp4_recipe_rejects_all_mixed_variants() {
-        for recipe in ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"] {
+        // `nvidia` joins the mixed_* recipes as an nvfp4-incompatible recipe:
+        // it is an MXFP4 format map with no NVFP4 tensor-class exclusions.
+        for recipe in ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6", "nvidia"] {
             assert!(
                 validate_nvfp4_recipe(recipe).is_err(),
                 "{recipe} must be rejected under --q-mode nvfp4"
@@ -8346,6 +9698,189 @@ mod tests {
     }
 
     #[test]
+    fn sym8_group_coherence_covers_qwen35_moe_switch_and_shared_expert_groups() {
+        // qwen3_5_moe's loader builds the switch_mlp trio and the
+        // shared_expert trio all-or-none (`if let (Some, Some, Some)` in
+        // `qwen3_5_moe/persistence.rs`); a partial trio drops every member to
+        // the dense setters. One alignment-ineligible member must therefore
+        // force its whole trio dense. The router `.mlp.gate` and
+        // `.mlp.shared_expert_gate` resolve per tensor and must NOT be pulled
+        // dense by a sibling trio. Real MoE dims are 64-aligned, so only
+        // synthetic odd geometry exercises this.
+        let hidden = 64i64;
+        let odd = 24i64; // % 16 != 0 and % 64 != 0 → can never emit quantized
+
+        let w = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 (incoherent switch trio): gate/up experts are 3-D with
+        // K=64 (forced affine-8, would emit); down has K=24 → forced affine
+        // then alignment-skipped → the whole trio must stay dense. The
+        // router gate in the same layer is per-tensor and must still emit.
+        weights.insert("model.layers.0.mlp.gate.weight".into(), w(&[4, hidden]));
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, odd]),
+        );
+        // Layer 1 (incoherent shared_expert trio): gate/up are sym8-eligible
+        // (K=64), down has K=24 (sym8-ineligible → forced affine-8 →
+        // alignment-skipped) → the whole trio must stay dense. The
+        // shared-expert output gate is per-tensor and must still emit.
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.down_proj.weight".into(),
+            w(&[hidden, odd]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert_gate.weight".into(),
+            w(&[1, hidden]),
+        );
+        // Layer 2 (control): both trios fully 64-aligned → switch experts
+        // emit forced affine-8, shared_expert members emit sym8.
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.down_proj.weight".into(),
+            w(&[hidden, 32]),
+        );
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", false)
+            .expect("sym8 quantize with coherence pass must succeed");
+
+        // Incoherent trios: every member dense float, no sidecars, no
+        // overrides.
+        for base in [
+            "model.layers.0.mlp.switch_mlp.gate_proj",
+            "model.layers.0.mlp.switch_mlp.up_proj",
+            "model.layers.0.mlp.switch_mlp.down_proj",
+            "model.layers.1.mlp.shared_expert.gate_proj",
+            "model.layers.1.mlp.shared_expert.up_proj",
+            "model.layers.1.mlp.shared_expert.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("incoherent-trio member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Float32,
+                "{base} must stay dense float (whole-trio coherence)"
+            );
+            assert!(
+                !weights.contains_key(&format!("{base}.scales")),
+                "{base} must not gain a scales sidecar"
+            );
+            assert!(
+                !overrides.contains_key(base),
+                "{base} must not carry a per-layer override"
+            );
+        }
+
+        // Per-tensor gates next to the incoherent trios must still emit
+        // (forced affine-8 via `is_router_gate`) — proves the drop is
+        // trio-scoped and the gates are not table members.
+        for base in [
+            "model.layers.0.mlp.gate",
+            "model.layers.1.mlp.shared_expert_gate",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("gate weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} resolves per tensor and must still quantize affine-8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("affine gate under a sym8 default must carry an override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
+
+        // Control switch trio: forced affine-8 (packed Uint32 + override).
+        for base in [
+            "model.layers.2.mlp.switch_mlp.gate_proj",
+            "model.layers.2.mlp.switch_mlp.up_proj",
+            "model.layers.2.mlp.switch_mlp.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control switch member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} (aligned 3-D experts) must emit forced affine-8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("forced-affine expert must carry a per-layer override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
+
+        // Control shared_expert trio: genuine sym8 (int8 weight + f32
+        // scales, no override — sym8 IS the default here).
+        for base in [
+            "model.layers.2.mlp.shared_expert.gate_proj",
+            "model.layers.2.mlp.shared_expert.up_proj",
+            "model.layers.2.mlp.shared_expert.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control shared member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Int8,
+                "{base} (aligned 2-D shared expert) must quantize sym8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            assert!(
+                !overrides.contains_key(base),
+                "sym8-at-default member must not carry an override"
+            );
+        }
+    }
+
+    #[test]
     fn sym8_lfm2_embedding_stays_dense_bf16() {
         // Under a sym8 default with `embed_quantizable=true` (the lfm2 /
         // lfm2_moe convert call), the token embedding must emit NO quant
@@ -9624,6 +11159,501 @@ mod tests {
         );
     }
 
+    // ── official Unsloth MXFP/NVFP4 recipes ─────────────────────────
+
+    #[test]
+    fn official_unsloth_selector_is_exact() {
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", true, "affine", true),
+            Some(OfficialUnslothRecipeKind::Mxfp)
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "nvfp4", true),
+            Some(OfficialUnslothRecipeKind::Nvfp4)
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "affine", true),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", true, "affine", false),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "nvfp4", false),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("qwen3_5", true, "affine", true),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("nvidia", true, "affine", true),
+            None
+        );
+    }
+
+    fn qwen35_hybrid_test_keys() -> Vec<String> {
+        [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.model.layers.1.mlp.gate_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn unsloth_mxfp_family_gate_accepts_dense_moe_and_vlm_wrappers() {
+        let keys = qwen35_hybrid_test_keys();
+        for (config, requested) in [
+            (serde_json::json!({ "model_type": "qwen3_5" }), "qwen3_5"),
+            (
+                serde_json::json!({
+                    "model_type": "qwen3_5_moe",
+                    "text_config": { "model_type": "qwen3_5_moe_text" }
+                }),
+                "qwen3_5_moe",
+            ),
+            (
+                serde_json::json!({
+                    "model_type": "qwen3_5_vl",
+                    "text_config": { "model_type": "qwen3_5_text" }
+                }),
+                "qwen3_5",
+            ),
+        ] {
+            assert!(
+                is_qwen35_hybrid_checkpoint(&config, Some(requested), &keys),
+                "config={config}, requested={requested} must select the official map"
+            );
+        }
+    }
+
+    #[test]
+    fn unsloth_mxfp_family_gate_fails_closed_on_non_qwen_mismatch_or_missing_shape() {
+        let keys = qwen35_hybrid_test_keys();
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "gemma4" }),
+            Some("gemma4"),
+            &keys,
+        ));
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "qwen3_5" }),
+            Some("gemma4"),
+            &keys,
+        ));
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "qwen3_5" }),
+            None,
+            &keys,
+        ));
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "qwen3_5" }),
+            Some("qwen3_5"),
+            &["model.layers.0.self_attn.q_proj.weight".to_string()],
+        ));
+    }
+
+    #[test]
+    fn non_qwen_unsloth_mxfp_preserves_legacy_affine_only_head() {
+        let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "gemma4" }),
+            Some("gemma4"),
+            &qwen35_hybrid_test_keys(),
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", true, "affine", is_qwen35_hybrid),
+            None
+        );
+
+        // This is the fallback used by both conversion entry points. In
+        // particular, Gemma4's affine-only lm_head must never become MXFP8.
+        let predicate = apply_mxfp_upgrade(build_unsloth_recipe(4, 64), 4);
+        assert_eq!(
+            predicate("language_model.lm_head.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unsloth_mxfp_recipe_maps_40_layer_dense_and_vlm_keys() {
+        let weight_keys = [
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            "language_model.model.layers.31.mlp.down_proj.weight",
+            "language_model.model.layers.32.mlp.gate_proj.weight",
+            "language_model.model.layers.39.mlp.down_proj.weight",
+            // Side-module depth must not alter the 40-layer LM boundary.
+            "language_model.model.mtp.layers.99.mlp.gate_proj.weight",
+            "vision_tower.layers.99.self_attn.q_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Mxfp);
+
+        let mxfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 32,
+            mode: "mxfp4".to_string(),
+        };
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            for layer in [0, 31] {
+                let key = format!("language_model.model.layers.{layer}.mlp.{suffix}.weight");
+                assert_eq!(predicate(&key), mxfp4(), "{key} must be mxfp4");
+            }
+            for layer in [32, 39] {
+                let key = format!("language_model.model.layers.{layer}.mlp.{suffix}.weight");
+                assert_eq!(predicate(&key), mxfp8(), "{key} must be mxfp8");
+            }
+        }
+
+        for key in [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.self_attn.k_proj.weight",
+            "language_model.model.layers.0.self_attn.v_proj.weight",
+            "language_model.model.layers.0.self_attn.o_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.lm_head.weight",
+        ] {
+            assert_eq!(predicate(key), mxfp8(), "{key} must be mxfp8");
+        }
+
+        for key in [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_a.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+            "language_model.model.layers.0.mlp.gate.weight",
+            "language_model.model.layers.0.input_layernorm.weight",
+            "language_model.model.layers.1.linear_attn.A_log",
+            "language_model.model.layers.1.linear_attn.dt_bias",
+            "language_model.model.mtp.layers.99.self_attn.q_proj.weight",
+            "vision_tower.layers.99.self_attn.q_proj.weight",
+            "visual.blocks.0.mlp.gate_proj.weight",
+        ] {
+            assert_eq!(predicate(key), QuantDecision::Skip, "{key} must stay bf16");
+        }
+    }
+
+    #[test]
+    fn unsloth_mxfp_recipe_maps_routed_and_shared_experts() {
+        let weight_keys = [
+            "language_model.model.layers.31.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.32.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.39.mlp.shared_expert.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Mxfp);
+
+        for family in ["switch_mlp", "experts", "shared_expert"] {
+            for suffix in ["gate_proj", "up_proj", "down_proj"] {
+                let early = format!("language_model.model.layers.31.mlp.{family}.{suffix}.weight");
+                assert_eq!(
+                    predicate(&early),
+                    QuantDecision::Custom {
+                        bits: 4,
+                        group_size: 32,
+                        mode: "mxfp4".to_string(),
+                    },
+                    "{early} must be mxfp4"
+                );
+                let late = format!("language_model.model.layers.32.mlp.{family}.{suffix}.weight");
+                assert_eq!(
+                    predicate(&late),
+                    QuantDecision::Custom {
+                        bits: 8,
+                        group_size: 32,
+                        mode: "mxfp8".to_string(),
+                    },
+                    "{late} must be mxfp8"
+                );
+            }
+        }
+
+        for key in [
+            "language_model.model.layers.32.mlp.gate.weight",
+            "language_model.model.layers.32.mlp.shared_expert_gate.weight",
+        ] {
+            assert_eq!(predicate(key), QuantDecision::Skip, "{key} must stay bf16");
+        }
+    }
+
+    #[test]
+    fn unsloth_nvfp4_recipe_uses_official_dgx_classes_and_invariants() {
+        let weight_keys = [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.model.layers.31.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.32.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.39.mlp.shared_expert.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Nvfp4);
+
+        let nvfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 16,
+            mode: "nvfp4".to_string(),
+        };
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+
+        for family in ["switch_mlp", "experts", "shared_expert"] {
+            for suffix in ["gate_proj", "up_proj", "down_proj"] {
+                let early = format!("language_model.model.layers.31.mlp.{family}.{suffix}.weight");
+                assert_eq!(predicate(&early), nvfp4(), "{early} must be nvfp4 4/16");
+                let late = format!("language_model.model.layers.32.mlp.{family}.{suffix}.weight");
+                assert_eq!(predicate(&late), mxfp8(), "{late} must be mxfp8 8/32");
+            }
+        }
+
+        for key in [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.self_attn.k_proj.weight",
+            "language_model.model.layers.0.self_attn.v_proj.weight",
+            "language_model.model.layers.0.self_attn.o_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.lm_head.weight",
+        ] {
+            assert_eq!(predicate(key), mxfp8(), "{key} must be mxfp8 8/32");
+        }
+
+        for key in [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_a.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+            "language_model.model.layers.0.mlp.gate.weight",
+            "language_model.model.layers.0.input_layernorm.weight",
+            "language_model.model.layers.1.linear_attn.A_log",
+            "language_model.model.mtp.layers.0.self_attn.q_proj.weight",
+            "vision_tower.layers.0.self_attn.q_proj.weight",
+        ] {
+            assert_eq!(predicate(key), QuantDecision::Skip, "{key} must stay bf16");
+        }
+    }
+
+    #[test]
+    fn unsloth_plain_affine_predicate_remains_legacy_dynamic_map() {
+        let predicate = build_predicate_for_recipe("unsloth", &[], 4, 64)
+            .expect("legacy unsloth predicate must dispatch");
+        assert_eq!(
+            predicate("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 6,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        assert_eq!(
+            predicate("model.layers.0.linear_attn.in_proj_a.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn non_qwen_unsloth_nvfp4_fallback_remains_legacy_dynamic_map() {
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "nvfp4", false),
+            None
+        );
+        let legacy = build_predicate_for_recipe("unsloth", &[], 4, 64)
+            .expect("legacy unsloth predicate must dispatch");
+        let predicate = apply_nvfp4_upgrade(legacy);
+
+        // Sensitive projections preserve the old 6/8-bit affine fallbacks.
+        assert_eq!(
+            predicate("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 6,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        assert_eq!(
+            predicate("model.layers.0.linear_attn.in_proj_a.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        // The legacy 4-bit FFN default still upgrades to NVFP4.
+        assert_eq!(
+            predicate("model.layers.0.mlp.gate_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string(),
+            }
+        );
+    }
+
+    // ── nvidia recipe (data-free MXFP4 port of NVIDIA modelopt) ─────
+
+    #[test]
+    fn nvidia_recipe_emits_expected_formats() {
+        // Keys are in the post-sanitize `language_model.model.layers.N.*` form
+        // the predicate actually receives: MoE experts are already split/stacked
+        // into `switch_mlp.*` before the predicate runs (convert.rs Step 3), and
+        // dense lm_head lands at `language_model.lm_head.weight`.
+        let predicate = build_nvidia_recipe();
+
+        let mxfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 32,
+            mode: "mxfp4".to_string(),
+        };
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+        let affine8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 64,
+            mode: "affine".to_string(),
+        };
+
+        // FFN → mxfp4: dense `.mlp.*`, MoE stacked experts (`switch_mlp.*`),
+        // and the shared expert (`shared_expert.*`).
+        for key in [
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            "language_model.model.layers.0.mlp.up_proj.weight",
+            "language_model.model.layers.0.mlp.down_proj.weight",
+            "language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.3.mlp.switch_mlp.up_proj.weight",
+            "language_model.model.layers.3.mlp.switch_mlp.down_proj.weight",
+            "language_model.model.layers.3.mlp.shared_expert.gate_proj.weight",
+            "language_model.model.layers.3.mlp.shared_expert.up_proj.weight",
+            "language_model.model.layers.3.mlp.shared_expert.down_proj.weight",
+        ] {
+            assert_eq!(predicate(key), mxfp4(), "{key} must be mxfp4 4/32");
+        }
+
+        // lm_head → mxfp4 (handled before should_quantize, which excludes it).
+        assert_eq!(
+            predicate("language_model.lm_head.weight"),
+            mxfp4(),
+            "lm_head must be mxfp4 4/32"
+        );
+
+        // Attention (q/k/v/o) and the large GDN projections → mxfp8.
+        for key in [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.self_attn.k_proj.weight",
+            "language_model.model.layers.0.self_attn.v_proj.weight",
+            "language_model.model.layers.0.self_attn.o_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+        ] {
+            assert_eq!(predicate(key), mxfp8(), "{key} must be mxfp8 8/32");
+        }
+
+        // Split low-rank GDN projections → 8-bit affine (T=0 MTP↔AR
+        // bit-exactness); must not be swept into the mxfp8 GDN group.
+        for key in [
+            "language_model.model.layers.1.linear_attn.in_proj_a.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+        ] {
+            assert_eq!(predicate(key), affine8(), "{key} must be affine 8/64");
+        }
+
+        // All four router-gate spellings → 8-bit affine (mxfp8 destroys top-K
+        // routing precision).
+        for key in [
+            "language_model.model.layers.2.mlp.gate.weight",
+            "language_model.model.layers.2.mlp.shared_expert_gate.weight",
+            "language_model.model.layers.2.mlp.router.proj.weight",
+            "language_model.model.layers.2.feed_forward.gate.weight",
+        ] {
+            assert_eq!(
+                predicate(key),
+                affine8(),
+                "router gate {key} must be affine 8/64"
+            );
+        }
+    }
+
+    #[test]
+    fn nvidia_recipe_skips_protected_keys() {
+        // Every non-quantizable tensor class stays bf16 (explicit `Skip`).
+        let predicate = build_nvidia_recipe();
+        for key in [
+            // MTP head (bf16) — bare and wrapped forms.
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "language_model.model.mtp.layers.0.mlp.gate_proj.weight",
+            // Token embedding.
+            "language_model.model.embed_tokens.weight",
+            // Vision encoder (`visual.*.mlp.*` must NOT reach the FFN branch).
+            "visual.blocks.0.mlp.linear_fc1.weight",
+            // GDN conv + scalar params.
+            "language_model.model.layers.1.linear_attn.conv1d.weight",
+            "language_model.model.layers.1.linear_attn.A_log",
+            "language_model.model.layers.1.linear_attn.dt_bias",
+            // Fused low-rank projection (loader concats a/b into this; not
+            // directly quantized).
+            "language_model.model.layers.1.linear_attn.in_proj_ba.weight",
+            // Norm.
+            "language_model.model.layers.0.input_layernorm.weight",
+        ] {
+            assert_eq!(
+                predicate(key),
+                QuantDecision::Skip,
+                "{key} must stay bf16 (Skip)"
+            );
+        }
+    }
+
+    #[test]
+    fn build_predicate_for_recipe_accepts_nvidia() {
+        // Dispatch must recognize "nvidia" and return a working predicate; the
+        // fixed format map ignores the bits/group_size args passed here.
+        let predicate =
+            build_predicate_for_recipe("nvidia", &[], 4, 32).expect("nvidia recipe must dispatch");
+        assert_eq!(
+            predicate("language_model.model.layers.0.mlp.gate_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 32,
+                mode: "mxfp4".to_string(),
+            },
+        );
+    }
+
     #[test]
     fn sanitize_lfm2_moe_rejects_dense_packed_weight_without_sidecar() {
         // The DENSE (non-expert) analog of the per-expert no-sidecar case: a dense
@@ -10119,7 +12149,7 @@ mod tests {
             "{lm_head_key} mode must be 'affine'"
         );
 
-        // embed_tokens: 2-bit affine, group_size=64
+        // embed_tokens: 2-bit affine, group_size=128
         let et_key = "language_model.model.embed_tokens";
         let et = quant.get(et_key).unwrap_or_else(|| {
             panic!("quantization block must contain per-layer override for {et_key}")
@@ -10127,8 +12157,8 @@ mod tests {
         assert_eq!(et["bits"].as_i64(), Some(2), "{et_key} bits must be 2");
         assert_eq!(
             et["group_size"].as_i64(),
-            Some(64),
-            "{et_key} group_size must be 64"
+            Some(128),
+            "{et_key} group_size must be 128"
         );
         assert_eq!(
             et["mode"].as_str(),
@@ -10295,5 +12325,490 @@ mod tests {
         eprintln!("vision_tower tensors are dense (no .scales) ✓");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Gemma-prequant conversions must write an HONEST top-level
+    /// `quantization` / `quantization_config` block. The importer repacks
+    /// every 2/4-bit module to MLX affine at group_size=128 (mode "affine",
+    /// bits per the E2B schedule) and records a complete per-layer override
+    /// for each — but the top-level values come from the `--quantize` CLI
+    /// defaults (group_size=64), which this path never uses. An external
+    /// mlx-lm-style loader that trusts the top-level default for any tensor
+    /// lacking an override would mis-dequantize at group 64.
+    ///
+    /// Fully synthetic (tiny tensors, no checkpoint needed): drives the real
+    /// `convert_model` pipeline end-to-end and asserts on the WRITTEN
+    /// config.json.
+    #[tokio::test]
+    async fn convert_model_gemma_prequant_top_level_block_is_honest() {
+        let base = std::env::temp_dir().join(format!(
+            "gemma_prequant_toplevel_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+
+        // config.json: gemma quant_method + the exact E2B module_quant_configs
+        // schedule `validate_e2b_qat_schedule` pins.
+        let config = serde_json::json!({
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "quant_method": "gemma",
+                "module_quant_configs": {
+                    "^lm_head$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                    "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                    "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                }
+            }
+        });
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .expect("write config.json");
+
+        // Synthetic source tensors in the wNa8o8 layout:
+        //  - 4-bit packed U8 `[out, in/2]` + per-row f32 scale `[out, 1]`
+        //  - 2-bit packed U8 `[out, in/4]` + per-row f32 scale
+        //  - I8 gate `[out, in]` + per-row f32 scale (dequants to dense bf16)
+        //  - float norm passthrough
+        // Two 4-bit modules vs one 2-bit module makes the modal bit-width an
+        // unambiguous 4, mirroring the real E2B checkpoint where 4-bit
+        // modules dominate.
+        let mut src: HashMap<String, MxArray> = HashMap::new();
+        let row_scales = [0.5f32, 0.25, 0.125, 0.0625];
+        for name in ["q_proj", "k_proj"] {
+            // 4-bit, in_features=128 → 64 packed bytes per row.
+            src.insert(
+                format!("model.language_model.layers.0.self_attn.{name}.weight"),
+                MxArray::from_uint8(&[0x88u8; 4 * 64], &[4, 64]).unwrap(),
+            );
+            src.insert(
+                format!("model.language_model.layers.0.self_attn.{name}.weight_scale"),
+                MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+            );
+        }
+        // 2-bit MLP linear (layer 20 ≥ 15), in_features=128 → 32 bytes per row.
+        src.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight".to_string(),
+            MxArray::from_uint8(&[0x66u8; 4 * 32], &[4, 32]).unwrap(),
+        );
+        src.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight_scale".to_string(),
+            MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+        );
+        // I8 per-layer gate → dense bf16 `.weight`, no `.scales`, no override.
+        src.insert(
+            "model.language_model.layers.0.per_layer_input_gate.weight".to_string(),
+            MxArray::from_int8(&[7i8; 4 * 16], &[4, 16]).unwrap(),
+        );
+        src.insert(
+            "model.language_model.layers.0.per_layer_input_gate.weight_scale".to_string(),
+            MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+        );
+        // Float passthrough.
+        src.insert(
+            "model.language_model.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[1.0f32; 16], &[16]).unwrap(),
+        );
+        crate::utils::safetensors::save_safetensors(
+            input.join("model.safetensors"),
+            &mut src,
+            None,
+        )
+        .expect("write synthetic model.safetensors");
+
+        let result = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4".to_string()),
+            quantize: None,
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .expect("synthetic gemma-prequant conversion must succeed");
+        assert!(result.num_tensors > 0);
+
+        let config_str = std::fs::read_to_string(output.join("config.json"))
+            .expect("output config.json must exist");
+        let out_config: serde_json::Value =
+            serde_json::from_str(&config_str).expect("output config.json must be valid JSON");
+        for block_key in ["quantization", "quantization_config"] {
+            let block = out_config.get(block_key).unwrap_or_else(|| {
+                panic!("output config.json must carry a top-level `{block_key}` block")
+            });
+            assert_eq!(
+                block["group_size"].as_i64(),
+                Some(128),
+                "top-level {block_key}.group_size must match the 128-group affine \
+                 sidecars the importer writes, got {:?}",
+                block["group_size"]
+            );
+            assert_eq!(
+                block["bits"].as_i64(),
+                Some(4),
+                "top-level {block_key}.bits must be the modal sidecar bit-width (4), got {:?}",
+                block["bits"]
+            );
+            assert_eq!(
+                block["mode"].as_str(),
+                Some("affine"),
+                "top-level {block_key}.mode must be 'affine', got {:?}",
+                block["mode"]
+            );
+            // Per-layer overrides keep their true (schedule) values.
+            assert_eq!(
+                block["language_model.model.layers.0.self_attn.q_proj"]["group_size"].as_i64(),
+                Some(128)
+            );
+            assert_eq!(
+                block["language_model.model.layers.0.self_attn.q_proj"]["bits"].as_i64(),
+                Some(4)
+            );
+            assert_eq!(
+                block["language_model.model.layers.20.mlp.down_proj"]["bits"].as_i64(),
+                Some(2)
+            );
+            // The I8-dequant gate is dense: it must NOT get an override entry.
+            assert!(
+                block
+                    .get("language_model.model.layers.0.per_layer_input_gate")
+                    .is_none(),
+                "I8-dequant modules are dense bf16 and must not carry an override"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override() {
+        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real UNSUPPORTED
+        // directory past the nvidia gate. The gate reads the input config.json's
+        // actual model_type (lfm2 — still unsupported now that gemma4 is
+        // allowed), so the run is rejected even though --model-type claims
+        // qwen3_5. Only config.json is written — the gate must fire before
+        // weights load, so the error is the model-type reject, not a
+        // missing-safetensors error.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_realconfig_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "lfm2",
+                "tie_word_embeddings": false
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_5".to_string()), // caller's lie
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a real lfm2 config even with -m qwen3_5");
+        assert!(
+            err.reason.contains("only supported for model types") && err.reason.contains("lfm2"),
+            "expected the nvidia model-type reject naming the real config type lfm2, got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma4_config_with_qwen_override() {
+        // Reviewer [high]: `-m qwen3_5` on a real gemma4 directory must NOT
+        // sanitize as Qwen. The gate now allows gemma4, but the sanitizer
+        // dispatches on --model-type; the family-agreement check rejects the
+        // mismatch (config gemma4_unified vs requested qwen3_5) before the wrong
+        // sanitizer runs. Only config.json is written — the gate must fire
+        // before weights load, so the error is the family-mismatch reject, not a
+        // missing-safetensors error. Restores the spirit of the gemma4-smuggle
+        // guard that ce25261a removed when it opened nvidia to gemma4.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma4_qwen_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "tie_word_embeddings": false
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_5".to_string()), // caller's lie
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a gemma4 config sanitized with -m qwen3_5");
+        assert!(
+            err.reason
+                .contains("different model family than the input config"),
+            "expected the nvidia family-mismatch reject for gemma4 config + qwen3_5 override, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config() {
+        // Round-2 [medium]: real gemma MoE configs carry `enable_moe_block`
+        // under `text_config` (the root key is absent), and the loader resolves
+        // it nested-first (`get_config_bool`). The gate must mirror that: a
+        // gemma4 config whose enable_moe_block lives in text_config=true is MoE
+        // and must be rejected (its `experts.switch_glu.*` keys would fall
+        // through to bf16). Belt-and-braces: set the root key to false to prove
+        // nested wins. Only config.json is written — the gate fires before
+        // weights load.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma4_moe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "tie_word_embeddings": false,
+                "enable_moe_block": false, // root says dense…
+                "text_config": { "enable_moe_block": true } // …nested (loader-canonical) says MoE
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()),
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a gemma4 MoE config (enable_moe_block in text_config)");
+        assert!(
+            err.reason.contains("only dense gemma4"),
+            "expected the nvidia dense-only reject for a text_config MoE gemma4, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override() {
+        // Round-2 [high]: a gemma-QAT source (`quant_method: "gemma"`) with an
+        // aliased `-m gemma4_unified` must NOT slip the already-quantized
+        // rejection into the generic quantizer. The FAMILY predicate
+        // `is_gemma_qat_family` (gemma4/gemma4_unified collapse via
+        // nvidia_recipe_family) still catches the alias for the reject. The
+        // config declares model_type gemma4, so the nvidia family-agreement check
+        // passes (both collapse to gemma) — the QAT gate is what must reject.
+        // Only config.json is written.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma_qat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4",
+                "tie_word_embeddings": false,
+                "quantization_config": { "quant_method": "gemma" }
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()), // aliased override
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("gemma-QAT source with aliased -m gemma4_unified must be rejected");
+        assert!(
+            err.reason
+                .contains("gemma-QAT checkpoints are already quantized"),
+            "expected the gemma-QAT already-quantized reject, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_rejects_unified_gemma_qat_before_e2b_importer() {
+        // WB-2 [high]: a gemma4_unified QAT (audio-carrying) must NOT reach the
+        // E2B prequantized importer, which is EXACT-"gemma4" only and DROPS
+        // AUDIO. This config uses the EXACT E2B language schedule, so under the
+        // pre-fix single family predicate it would PASS validate_e2b_qat_schedule
+        // and enter the importer (dropping audio). With the role split, the
+        // unified marker (model_type gemma4_unified / unified architecture) trips
+        // the explicit unified-QAT reject FIRST — hermetically, before the
+        // convert mutex + enter_cpu, so no output directory is even created.
+        let base = std::env::temp_dir().join(format!(
+            "unified_gemma_qat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "tie_word_embeddings": false,
+                // A real (non-null) audio_config: the unified checkpoint carries
+                // audio the E2B importer would silently drop.
+                "audio_config": { "input_feat_size": 128 },
+                "quantization_config": {
+                    "quant_method": "gemma",
+                    // EXACT E2B schedule — so the pre-fix path would validate + import.
+                    "module_quant_configs": {
+                        "^lm_head$": { "num_bits": 2 },
+                        "language_model\\.embed_tokens$": { "num_bits": 2 },
+                        "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                        "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                        "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                        "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()),
+            quantize: None, // NO quant flags: escapes the already-quantized family reject
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("unified gemma-QAT must be rejected before the E2B importer");
+        assert!(
+            err.reason.contains("unified gemma QAT is not supported"),
+            "expected the unified gemma-QAT reject, got: {}",
+            err.reason
+        );
+        // Hermetic: the reject fires before create_dir_all(&output_dir), so no
+        // audio-dropped E2B output is ever produced. Under the pre-fix single
+        // predicate the output dir WOULD have been created — this discriminates.
+        assert!(
+            !output.exists(),
+            "no output directory should be created for a rejected unified gemma-QAT"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -264,6 +264,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 &hidden,
                 final_norm,
                 lm_head,
+                embed,
                 embedding_weight,
             )?);
             if let Some(start) = chunk_trace_start {
@@ -381,7 +382,7 @@ pub(crate) fn run_paged_prefill_single_shot(
         /* position_ids */ None,
         cached_rope_deltas,
     )?;
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Single-turn image-bearing paged prefill for the MoE stack.
@@ -441,7 +442,7 @@ pub(crate) fn run_paged_vlm_prefill_moe(
         0,
     )?;
 
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Run a single prefill chunk through `embed → layer loop`. Returns
@@ -513,6 +514,15 @@ fn run_paged_prefill_one_chunk_moe(
         cached_rope_deltas,
     );
 
+    // Shared per-forward-pass scratch slot for the M-RoPE cos/sin precompute
+    // (see `Qwen3_5Attention::forward_paged`'s `mrope_cache` doc comment).
+    // Every `FullAttentionPaged` layer in this loop shares one `position_ids`
+    // array, so the first such layer computes the selected cos/sin and every
+    // later one reuses it instead of recomputing the cos/sin table +
+    // `take_along_axis` gather. Stays `None` (untouched) on the text-only
+    // path where `position_ids` is `None`.
+    let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+
     // Layer loop. Safe-by-construction via `iter_mut().zip(...)` —
     // each iteration takes disjoint `&mut DecoderLayer` and `&mut
     // Qwen3_5LayerCache` references, with `kind` consumed by-value
@@ -541,6 +551,7 @@ fn run_paged_prefill_one_chunk_moe(
             layer_positions,
             true,
             rope_position_offset,
+            &mut mrope_cache,
         )?;
         // Smooth the prefill memory peak: every K layers, materialize the
         // residual stream so MLX can release the upstream graph nodes
@@ -566,11 +577,16 @@ fn project_last_token_logits_moe(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let h = final_norm.forward(hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        // Tied + packed-quantized embedding: route through the packed
+        // `quantized_matmul` instead of dequantizing the full dense table.
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -635,12 +651,15 @@ pub(crate) fn run_paged_decode_step(
             None,
             true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -983,14 +1002,36 @@ mod tests {
     ///
     /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
     /// chunked-vs-single-shot drift is reproducible across runs;
-    /// observed `max_abs_diff = 0.0693`, argmax stable at idx=69.
+    /// observed `max_abs_diff = 0.0693`, argmax stable at idx=69 (M3,
+    /// pre scalar-RoPE-axis fix — the magnitude will differ after that
+    /// fix since both paths' rotation angles changed; the 0.25 budget
+    /// rationale below is unchanged).
     /// Requires Metal GPU; run with `--ignored`.
+    ///
+    /// Skips on hosts whose half-precision GEMM fails the
+    /// `test_support::half_gemm_untrustworthy` canary: this config's
+    /// q_proj (K=128, N=256) and fallback-SDPA matmuls (K=32 scores)
+    /// sit inside the vendored-MLX NAX unaligned-K broken regime on
+    /// gen>=17 GPUs, where chunk length changes which kernel class each
+    /// token's math takes and parity deterministically breaks O(1)
+    /// (observed 0.86-0.91 with argmax flips on M5 Max) with no chunking
+    /// bug present.
+    ///
     /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
     /// machines without Metal, which aborts the test process before
     /// Rust can catch the failure.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits() {
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+                 single-shot parity is not meaningful here"
+            );
+            return;
+        }
         unsafe {
             mlx_sys::mlx_seed(0xC0DEC0DE);
         }
@@ -1060,14 +1101,32 @@ mod tests {
     ///
     /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
     /// chunked-vs-single-shot drift is reproducible across runs;
-    /// observed `max_abs_diff = 0.1199`, argmax stable at idx=80.
+    /// observed `max_abs_diff = 0.1199`, argmax stable at idx=80 (M3,
+    /// pre scalar-RoPE-axis fix — the magnitude will differ after that
+    /// fix since both paths' rotation angles changed; the 0.25 budget
+    /// rationale is unchanged).
     /// Requires Metal GPU; run with `--ignored`.
+    ///
+    /// Skips on hosts whose half-precision GEMM fails the
+    /// `test_support::half_gemm_untrustworthy` canary — same rationale
+    /// as `test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits`
+    /// above (observed 0.73-0.91 on M5 Max with no chunking bug).
+    ///
     /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
     /// machines without Metal, which aborts the test process before
     /// Rust can catch the failure.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_chunked_prefill_qwen3_5_moe_uneven_tail() {
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_uneven_tail: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+                 single-shot parity is not meaningful here"
+            );
+            return;
+        }
         unsafe {
             mlx_sys::mlx_seed(0xC0DEC0DE);
         }

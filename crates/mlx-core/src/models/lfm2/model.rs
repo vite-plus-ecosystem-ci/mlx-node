@@ -12,6 +12,7 @@ use crate::engine::backend::{
     TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
+use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
     ThinkingPolicy, build_chatml_continue_delta_text, build_synthetic_user_message,
@@ -39,6 +40,26 @@ use super::layer_cache::Lfm2LayerCache;
 fn last_token_slice_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
+}
+
+/// Whether the warm paged-turn conv-state reuse fast path is enabled.
+///
+/// OPT-IN, DEFAULT OFF. When ON, a qualifying warm continuation (see
+/// [`conv_state_reusable`]) reuses `self.caches`'s live incremental conv
+/// state instead of reconstructing it via a full re-embed + causal-SDPA pass
+/// over the whole cached prefix, skipping the redundant Pass 1. It ships
+/// opt-in because the reused incremental conv state differs MATERIALLY from
+/// the single-pass reconstruction it replaces (~40 ULP, enough to flip a
+/// near-tie argmax) — LFM2 ShortConv `in_proj` produces different bf16 for a
+/// T=1 incremental step vs the batched reconstruction input — so it is a real
+/// behavior change (arguably closer to flat continuous generation) that stays
+/// disabled until a conv oracle validates enabling it by default. Read once on
+/// first call and cached; subsequent reads hit the `OnceLock` fast path.
+fn conv_state_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_CONV_STATE_REUSE", false)
+    })
 }
 
 /// Internal model state owned exclusively by the dedicated model thread.
@@ -81,6 +102,17 @@ pub(crate) struct Lfm2Inner {
     /// `config.eos_token_id` is derived separately in `persistence.rs`;
     /// this carries the FULL eos list plus sampling defaults on top.
     gen_defaults: crate::engine::ModelGenerationDefaults,
+    /// Whether the MOST RECENT `PagedBackend::prime_prefix_state` call
+    /// decided `self.caches`'s conv-layer state already reflected the
+    /// incoming prompt's cached prefix byte-for-byte (see
+    /// [`conv_state_reusable`]), letting `run_paged_prefill_chunk` skip
+    /// the full re-embed + causal-SDPA reconstruction pass
+    /// (`run_conv_only_prefill`) over the cached prefix. Read back by
+    /// `paged_perf_prefill_tokens` so `report_performance: true`
+    /// telemetry reports the SUFFIX-scale numerator (the work this turn
+    /// actually did) instead of the full-prompt-scale numerator that is
+    /// only honest when the reconstruction pass actually ran.
+    last_paged_prefill_reused_conv_state: bool,
 }
 
 /// Classification of the prefix-cache decision made from a
@@ -134,6 +166,50 @@ pub(crate) fn classify_prefix_cache_decision(
     } else {
         PrefixCacheDecision::Miss
     }
+}
+
+/// Decide whether `self.caches`'s conv-layer state ALREADY reflects the
+/// token prefix `plan[..cached_prefix_len]` byte-for-byte, so
+/// `run_paged_prefill_chunk`'s Pass 1 (`run_conv_only_prefill`) — a full
+/// re-embed + causal-SDPA reconstruction over the ENTIRE cached prefix
+/// through every layer, purely to rebuild conv state — can be skipped and
+/// the live caches carried straight into Pass 2 over just the suffix.
+///
+/// Returns `true` only for the standard "resend growing conversation"
+/// warm-continuation pattern: the new turn's paged-attention cache hit
+/// (`cached_prefix_len`, from the content-addressed KV-block pool, which
+/// may span foreign/cross-session blocks) EXACTLY equals the length AND
+/// content of `cached_token_history` — the token sequence
+/// `save_cache_state_internal` proved `self.caches`'s conv state was left
+/// at after the immediately preceding successful turn on THIS model
+/// instance. Any mismatch (first turn, a turn that aborted since the last
+/// save, a partial/foreign prefix hit shorter or longer than
+/// `cached_token_history`, or divergent content) safely returns `false`
+/// and falls back to the full reconstruction — conv state is a pure
+/// function of the token prefix, so this check is sufficient regardless
+/// of which logical chat session produced `cached_token_history`.
+///
+/// `cached_prefix_len == 0` and the degenerate identical-resend case
+/// (`cached_prefix_len` capped one below an exact match by
+/// `prime_prefix_state`'s `max_cache_hit_tokens`) both return `false` —
+/// mirrors [`classify_prefix_cache_decision`]'s exact-match-is-miss
+/// invariant: LFM2 has no safe "rewind by one" primitive.
+///
+/// This predicate only gates the fast path when [`conv_state_reuse_enabled`]
+/// is also true (opt-in via `MLX_LFM2_CONV_STATE_REUSE`, DEFAULT OFF): the
+/// reused live conv state differs materially (~40 ULP, near-tie argmax may
+/// flip) from the single-pass reconstruction it replaces, so it stays off
+/// until an oracle validates it.
+#[inline]
+fn conv_state_reusable(
+    plan: &[u32],
+    cached_token_history: &[u32],
+    cached_prefix_len: usize,
+) -> bool {
+    cached_prefix_len > 0
+        && cached_prefix_len == cached_token_history.len()
+        && plan.len() >= cached_prefix_len
+        && plan[..cached_prefix_len] == cached_token_history[..]
 }
 
 /// Build the LFM2 wire-format delta text for a tool-result turn.
@@ -193,9 +269,9 @@ impl Lfm2Inner {
         // Block-paged KV adapter — default ON.
         //
         // Chat dispatch is wired through this adapter at every chat-entry
-        // site: the engine session core's `ChatBackend::paged_turn` probe
-        // hands whole (fresh) turns to the generic `run_paged_turn` driving
-        // `<Lfm2Inner as PagedBackend>` whenever the adapter is live.
+        // site: the execution plan hands eligible fresh turns to the generic
+        // `run_paged_turn` driving `<Lfm2Inner as PagedBackend>` whenever the
+        // adapter is live.
         //
         // KV-pool sizing: ONLY full_attention layers participate. LFM2's
         // hybrid layer mix is parsed from `config.layer_types`; conv
@@ -297,6 +373,7 @@ impl Lfm2Inner {
             // Empty until the load path parses `generation_config.json`
             // (set via `set_gen_defaults` in `persistence.rs`).
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
+            last_paged_prefill_reused_conv_state: false,
         })
     }
 
@@ -437,10 +514,19 @@ impl Lfm2Inner {
     /// existing conv path (conv layers).
     ///
     /// `full_tokens` is the entire prompt (used for conv layers' prefill
-    /// from token 0). `suffix_tokens` is the new portion beyond the
-    /// paged prefix-cache hit (used by `record_tokens` +
-    /// `update_keys_values` for the attention layers).
-    /// `cached_prefix_len` is the paged-cache hit length.
+    /// from token 0, UNLESS `skip_conv_reconstruction` is set — see
+    /// below). `suffix_tokens` is the new portion beyond the paged
+    /// prefix-cache hit (used by `record_tokens` + `update_keys_values`
+    /// for the attention layers). `cached_prefix_len` is the paged-cache
+    /// hit length. `skip_conv_reconstruction` is
+    /// [`conv_state_reusable`]'s verdict from `prime_prefix_state`
+    /// (threaded through [`Lfm2PrefixState::conv_state_reusable`]),
+    /// and is only ever `true` when the opt-in `MLX_LFM2_CONV_STATE_REUSE`
+    /// flag is set ([`conv_state_reuse_enabled`], DEFAULT OFF): when `true`,
+    /// `self.caches`'s conv-layer state is already known to be at the
+    /// `cached_prefix_len` boundary, so Pass 1 is skipped entirely and Pass 2
+    /// runs directly on the live caches. Default-off ⇒ always `false` ⇒ Pass 1
+    /// reconstruction always runs (byte-identical to prior behavior).
     ///
     /// Returns the last position's logits squeezed to `[vocab]`.
     fn run_paged_prefill_chunk(
@@ -448,6 +534,7 @@ impl Lfm2Inner {
         full_tokens: &[u32],
         suffix_tokens: &[u32],
         cached_prefix_len: u32,
+        skip_conv_reconstruction: bool,
     ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -487,9 +574,16 @@ impl Lfm2Inner {
         //
         // For the no-cache case (cached_prefix_len == 0) the suffix IS
         // the full prompt, so pass 1 is skipped and pass 2 handles
-        // everything in one shot.
+        // everything in one shot. Pass 1 is ALSO skipped whenever
+        // `skip_conv_reconstruction` is set — `prime_prefix_state`
+        // already proved `self.caches`'s conv-layer state is at the
+        // `cached_prefix_len` boundary for THIS EXACT token prefix (the
+        // standard warm-continuation "resend growing conversation"
+        // pattern), so re-deriving it via a full re-embed + causal-SDPA
+        // reconstruction over the whole cached prefix would be
+        // redundant work with no observable effect on the result.
 
-        if cached_prefix_len > 0 {
+        if cached_prefix_len > 0 && !skip_conv_reconstruction {
             // Pass 1: conv-only prefill over the cached prefix. This
             // brings conv state up to position `cached_prefix_len` so
             // pass 2 can continue from there.
@@ -704,6 +798,13 @@ impl Lfm2Inner {
     /// downstream conv layers the correct residual, otherwise their state
     /// drifts and paged-CONTINUE diverges from flat. See
     /// `tests/lfm2_paged_vs_flat_parity.rs::lfm2_paged_budget_forced_warm_continue_parity`.
+    ///
+    /// `run_paged_prefill_chunk` skips calling this entirely when
+    /// [`conv_state_reusable`] already proved `self.caches` is at the
+    /// `cached_prefix_len` boundary for this exact token prefix (the
+    /// warm-continuation fast path) — this reconstruction is only needed to
+    /// derive that same state from scratch when the live caches are NOT
+    /// already known to hold it.
     fn run_conv_only_prefill(&mut self, prefix_tokens: &[u32]) -> Result<()> {
         if prefix_tokens.is_empty() {
             return Ok(());
@@ -984,18 +1085,38 @@ impl ChatBackend for Lfm2Inner {
     // promotion and the raw_text reasoning scrub) is what both the sync
     // and streaming paths need, so no per-family override.
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan {
+            media: MediaPlan::NONE,
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                // Delta turns stay PAGED. The session core rebuilds the full
+                // token stream (`cached_token_history ++ delta`) before the
+                // plan resolves, so a delta reaches `run_paged_turn` as the
+                // same strict extension a resent growing conversation
+                // produces: the adapter warm-continues the live request and
+                // conv Pass-1 (`run_conv_only_prefill`) rebuilds short-conv
+                // state over the cached prefix. The short-conv state itself
+                // is still never represented by the adapter — it is
+                // reconstructed from tokens every paged turn. Declaring
+                // `supports_delta: false` would route deltas to the flat
+                // tail, which tail-prefills onto EMPTY flat attention KV
+                // (paged turns never fill it) while conv state sits at the
+                // prior position — a corrupt, input-independent
+                // continuation.
+                supports_delta: true,
+            }),
+            speculative: None,
+        }
     }
 
-    // `supports_images`: engine default `false` — LFM2 is text-only.
+    // `execution_plan().media`: `NONE` — LFM2 is text-only.
     // The NAPI entry points additionally carry their own "LFM2 is
     // text-only" pre-checks, which fire before any command is dispatched,
     // so the engine's typed pre-render rejection is a defense-in-depth
     // backstop.
     //
-    // `text_delta_image_guard`: engine default — `!supports_images() &&
-    // session_holds_images()` with the parametrized strings
+    // `text_delta_media_guard`: engine default — no declared media support
+    // plus `session_media()` with the parametrized strings
     // ("chat_tokens_delta_sync is text-only; session currently holds
     // image state" / the `chat_stream_tokens_delta` twin).
     //
@@ -1019,29 +1140,24 @@ impl ChatBackend for Lfm2Inner {
         // byte-stable.
     }
 
-    fn session_holds_images(&self) -> bool {
-        // Always `None` for text-only LFM2 in practice; feeds the
-        // DEFAULT `text_delta_image_guard` policy.
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // LFM2 has no path that can populate media state. Keep the advertised
+        // context truthful even though the legacy cache struct retains an
+        // always-None image-key slot for layout symmetry.
+        MediaCapabilities::NONE
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // CRITICAL (engine paged-probe contract — see the DELIBERATE FIX
-        // note at the probe): lfm2's delta paths NEVER touch the paged
-        // adapter. Decline delta turns so the generic flow (eager flat
-        // delta) runs the flat eager prefill+decode over `self.caches` even
-        // when `paged_adapter` is `Some`; fresh turns take the generic
-        // paged engine for both sync and streaming.
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // Fresh AND delta turns land here (`supports_delta: true`). For a
+        // delta, `args.tokens` is already the full stream
+        // (`cached_token_history ++ delta`, rebuilt by the session core
+        // before plan resolution) and the engine forces `reuse_cache = true`,
+        // so `prime_prefix_state` sees the exact strict-extension shape a
+        // resent growing conversation produces — the adapter warm-continues
+        // the live request and `run_paged_prefill_chunk` Pass-1 rebuilds
+        // conv state over the cached prefix.
         //
-        // ⚠ OPPOSITE of qwen3 (which runs the engine UNCONDITIONALLY for
-        // fresh + delta): lfm2 keeps its `is_delta` decline. Consequence:
-        // `is_delta` is ALWAYS false inside lfm2's `run_paged_turn`, so the
-        // engine's `reuse_cache = if is_delta {true} else {p.reuse_cache}`
-        // collapses to `p.reuse_cache`.
-        if args.is_delta {
-            return None;
-        }
-        // The model-neutral `run_paged_turn` drives the whole fresh turn
+        // The model-neutral `run_paged_turn` drives the whole turn
         // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
         // begin_paged_decode → decode loop → save).
         //
@@ -1055,7 +1171,7 @@ impl ChatBackend for Lfm2Inner {
         // and qwen3 — so flat and paged agree token-for-token under a
         // mid-`<think>` budget force. `lfm2_paged_vs_flat_greedy_token_parity`
         // (budget 32) holds because both paths share this loop.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+        crate::engine::paged_turn::run_paged_turn(self, args)
     }
 }
 
@@ -1142,6 +1258,11 @@ pub(crate) struct Lfm2PrefixState {
     effective_cached_prefix_len: usize,
     suffix_len: usize,
     full_tokens: Vec<u32>,
+    /// [`conv_state_reusable`]'s verdict, computed once in
+    /// `prime_prefix_state` and consumed by `paged_prefill` to decide
+    /// whether `run_paged_prefill_chunk` may skip Pass 1
+    /// (`run_conv_only_prefill`) over the cached prefix.
+    conv_state_reusable: bool,
 }
 
 impl PagedPrefix for Lfm2PrefixState {
@@ -1203,20 +1324,38 @@ impl PagedBackend for Lfm2Inner {
             )
             .map_err(Error::from_reason)?;
 
-        // Reset conv-layer state for this turn. The paged path does not carry
-        // conv prefix state across turns; each turn reprefills from the start
-        // of the prompt over conv layers. `run_paged_turn` is family-neutral
-        // and will NOT do this — forget it and conv state goes stale across
-        // turns.
-        self.caches = init_caches(&self.config);
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
+        let cached_prefix_len = turn_plan.cached_prefix_len as usize;
+
+        // Conv-state reuse fast path (see `conv_state_reusable`): when this
+        // turn strictly extends the immediately preceding successful turn's
+        // saved history byte-for-byte, `self.caches`'s conv-layer state is
+        // ALREADY at the `cached_prefix_len` boundary — keep it live instead
+        // of paying for a full re-embed + causal-SDPA reconstruction pass
+        // over the whole cached prefix (`run_paged_prefill_chunk` Pass 1).
+        // Any mismatch (first turn, aborted-since-last-save, or a
+        // foreign/partial prefix hit) falls through to the existing
+        // unconditional reset — `run_paged_turn` is family-neutral and will
+        // NOT do this for us; skip it and conv state goes stale across
+        // turns. Gated OFF by default (`conv_state_reuse_enabled`): reusing the
+        // live incremental conv state differs materially (~40 ULP, near-tie
+        // argmax may flip) from the reconstruction it replaces, so the flag
+        // stays off until an oracle validates it — flag off ⇒ `reused_conv_state
+        // == false` ⇒ the unconditional reset below always runs (pre-fix path).
+        let reused_conv_state = conv_state_reuse_enabled()
+            && conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len);
+        if !reused_conv_state {
+            self.caches = init_caches(&self.config);
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+        }
+        self.last_paged_prefill_reused_conv_state = reused_conv_state;
 
         Ok(Lfm2PrefixState {
-            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            effective_cached_prefix_len: cached_prefix_len,
             suffix_len: turn_plan.suffix_len as usize,
             // Conv Pass-1 needs the FULL prompt (not just the suffix).
             full_tokens: plan.to_vec(),
+            conv_state_reusable: reused_conv_state,
         })
     }
 
@@ -1227,14 +1366,17 @@ impl PagedBackend for Lfm2Inner {
         _stream: Stream,
     ) -> Result<MxArray> {
         // `run_paged_prefill_chunk` records the suffix in the adapter, runs
-        // conv Pass-1 over the cached prefix from `full_tokens`, then the
-        // full forward over the suffix, and folds in the last-token slice
-        // (returns `[vocab]`). The engine fires the post-prefill
-        // `synchronize_and_clear_cache` AFTER this returns (NOT here).
+        // conv Pass-1 over the cached prefix from `full_tokens` (unless
+        // `prefix.conv_state_reusable` says the live caches already cover
+        // it), then the full forward over the suffix, and folds in the
+        // last-token slice (returns `[vocab]`). The engine fires the
+        // post-prefill `synchronize_and_clear_cache` AFTER this returns
+        // (NOT here).
         self.run_paged_prefill_chunk(
             &prefix.full_tokens,
             suffix_tokens,
             prefix.effective_cached_prefix_len as u32,
+            prefix.conv_state_reusable,
         )
     }
 
@@ -1265,17 +1407,39 @@ impl PagedBackend for Lfm2Inner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+        // Invalidate the conv-state-reuse invariant `conv_state_reusable`
+        // depends on: `self.caches`'s conv-layer state may now reflect a
+        // partially-executed (aborted) turn rather than the exact position
+        // `cached_token_history.len()` records (e.g. Pass 2 or a decode step
+        // ran partway before the error). Clearing `cached_token_history`
+        // forces the NEXT `prime_prefix_state` call's length/content check
+        // to fail closed (`> 0` guard), taking the unconditional
+        // `init_caches` reset — the same safe rebuild every paged turn got
+        // before this fast path existed.
+        self.cached_token_history.clear();
     }
 
-    fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, _suffix_len: usize) -> usize {
-        // lfm2 reprefills the FULL prompt through conv layers EVERY turn
-        // (`run_paged_prefill_chunk` Pass-1) even on a warm attention-prefix
-        // hit, so ttft measures full-prompt work and the throughput numerator
-        // must be the FULL prompt — NOT the attention suffix (pinned by the
+    fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, suffix_len: usize) -> usize {
+        // lfm2 reprefills the FULL prompt through conv layers on a normal
+        // warm attention-prefix hit (`run_paged_prefill_chunk` Pass-1), so
+        // ttft measures full-prompt work and the throughput numerator must
+        // be the FULL prompt — NOT the attention suffix (pinned by the
         // `lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse` guard).
         // The default (`suffix_len`) is the standard-KV qwen behavior, which
         // would under-report lfm2's prefill tok/s by the cache-hit ratio.
-        prompt_token_count
+        //
+        // EXCEPTION: when `prime_prefix_state` took the conv-state-reuse
+        // fast path this turn (`last_paged_prefill_reused_conv_state`),
+        // Pass 1 never ran — the ACTUAL prefill work this turn was
+        // suffix-scale, so reporting the full-prompt count here would
+        // inflate `prefill_tokens_per_second` by the cache-hit ratio
+        // instead of under-reporting it. Report the honest numerator for
+        // whichever amount of work actually happened.
+        if self.last_paged_prefill_reused_conv_state {
+            suffix_len
+        } else {
+            prompt_token_count
+        }
     }
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
@@ -1718,6 +1882,94 @@ mod prefix_cache_decision_tests {
 }
 
 #[cfg(test)]
+mod conv_state_reuse_tests {
+    //! Pure-logic coverage of [`conv_state_reusable`] — no model load
+    //! required. Guards the `prime_prefix_state` fast path that skips
+    //! `run_paged_prefill_chunk`'s Pass 1 (`run_conv_only_prefill`)
+    //! whenever `self.caches`'s conv-layer state is provably already at
+    //! the incoming cached-prefix boundary.
+
+    use super::conv_state_reusable;
+
+    #[test]
+    fn zero_cached_prefix_is_not_reusable() {
+        // First turn ever (or a cross-session/foreign miss the paged
+        // adapter itself already reported as 0): nothing to reuse.
+        assert!(!conv_state_reusable(&[1, 2, 3], &[], 0));
+    }
+
+    #[test]
+    fn strict_extension_of_saved_history_is_reusable() {
+        // The standard "resend growing conversation" pattern: the new
+        // prompt is `cached_token_history` plus new tail tokens, and the
+        // paged adapter's own hit length equals the saved history length
+        // exactly.
+        let history = vec![1u32, 2, 3, 4, 5];
+        let plan = vec![1u32, 2, 3, 4, 5, 6, 7];
+        assert!(conv_state_reusable(&plan, &history, history.len()));
+    }
+
+    #[test]
+    fn length_mismatch_is_not_reusable() {
+        // Paged-adapter hit length shorter than the saved history (a
+        // partial/foreign prefix hit, or a branched conversation that
+        // diverges before the end of the prior turn): the live caches
+        // are NOT known to be at this exact boundary.
+        let history = vec![1u32, 2, 3, 4, 5];
+        let plan = vec![1u32, 2, 3, 9, 9, 9];
+        assert!(!conv_state_reusable(&plan, &history, 3));
+
+        // Hit length longer than the saved history (foreign cross-session
+        // KV-block hit dwarfing this instance's own history): also unsafe.
+        assert!(!conv_state_reusable(&plan, &history, 6));
+    }
+
+    #[test]
+    fn content_divergence_is_not_reusable() {
+        // Same lengths, but the prefix bytes differ — a coincidental
+        // length match against an unrelated session's history.
+        let history = vec![1u32, 2, 3, 4, 5];
+        let plan = vec![1u32, 2, 9, 4, 5, 6];
+        assert!(!conv_state_reusable(&plan, &history, history.len()));
+    }
+
+    #[test]
+    fn exact_resend_capped_below_full_length_is_not_reusable() {
+        // `prime_prefix_state` caps the paged adapter's own hit at
+        // `plan.len() - 1` (never lets a cache hit consume the whole
+        // prompt), so an identical resend with zero new tokens reports
+        // `cached_prefix_len == history.len() - 1`, not `history.len()`.
+        // Mirrors `classify_prefix_cache_decision`'s exact-match-is-miss
+        // invariant.
+        let history = vec![1u32, 2, 3, 4, 5];
+        let plan = history.clone();
+        assert!(!conv_state_reusable(&plan, &history, history.len() - 1));
+    }
+
+    #[test]
+    fn chains_across_consecutive_growing_turns() {
+        // Turn 2 reuses against turn 1's saved history; turn 3 reuses
+        // against turn 2's (longer) saved history. Proves the invariant
+        // is not a one-shot check.
+        let history_after_turn1 = vec![1u32, 2, 3];
+        let plan_turn2 = vec![1u32, 2, 3, 4, 5];
+        assert!(conv_state_reusable(
+            &plan_turn2,
+            &history_after_turn1,
+            history_after_turn1.len()
+        ));
+
+        let history_after_turn2 = vec![1u32, 2, 3, 4, 5, 6];
+        let plan_turn3 = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+        assert!(conv_state_reusable(
+            &plan_turn3,
+            &history_after_turn2,
+            history_after_turn2.len()
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tool_delta_marker_tests {
     //! Guard the structured `is_error` channel on LFM2's tool-result
     //! wire format. The shared
@@ -2088,7 +2340,7 @@ mod paged_adapter_construction_tests {
         }
 
         // Prefill the suffix == full prompt (cached_prefix_len = 0).
-        let logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0) {
+        let logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, false) {
             Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();

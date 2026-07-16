@@ -24,6 +24,7 @@
   "dependencies": {
     "@huggingface/hub": "^2.13.2",
     "@inquirer/prompts": "^8.5.2",
+    "@mlx-node/agent": "workspace:*",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/privacy": "workspace:*",

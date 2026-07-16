@@ -24,6 +24,7 @@ use crate::engine::params::{
     ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
     extract_chat_params, resolve_enable_thinking,
 };
+use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::profiling::PerformanceMetrics;
@@ -40,9 +41,10 @@ pub(crate) trait DecodeStep {
     /// Single-token forward pass. `input_ids` is the `[1, 1]` token the
     /// loop reshaped from the previous sample. Returns `(logits,
     /// needs_squeeze)` — `needs_squeeze == true` when the logits still
-    /// carry the sequence axis (`[1, 1, vocab]`, eager Rust forwards)
-    /// and the loop must `squeeze(&[1])` them; compiled C++ forwards
-    /// return `[1, vocab]` directly and pass `false`.
+    /// carry the sequence axis (`[1, 1, vocab]`)
+    /// and the loop must `squeeze(&[1])` them; steppers that already
+    /// collapse to `[1, vocab]` (e.g. the lfm2 and qwen3_5 paged
+    /// steppers) pass `false`.
     fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)>;
 
     /// Like [`DecodeStep::forward`], but the engine ALSO hands the
@@ -54,8 +56,8 @@ pub(crate) trait DecodeStep {
     /// `y.reshape([1, 1])` lazy node — calling `item_at_int32` on it
     /// forces a second per-step eval/sync that the loop already paid at
     /// the top. That extra synchronize is invisible on a slow eager
-    /// forward (qwen3 dense) but measurably regresses a FAST compiled-paged
-    /// decode (lfm2 / future qwen3_5* compiled paged) by several percent.
+    /// forward (qwen3 dense) but measurably regresses a FAST paged
+    /// decode (lfm2, qwen3_5 dense/MoE, gemma4) by several percent.
     /// Such steppers override this to consume the handed `token_id`
     /// directly. The default forwards to [`DecodeStep::forward`] (flat
     /// steppers embed `input_ids` and never need the scalar; qwen3 paged
@@ -128,12 +130,20 @@ pub(crate) trait DecodeStep {
     /// once per step at the END of the loop body, so the paged steppers
     /// can run their own cadence without forking the loop.
     ///
-    /// Default is the FLAT every-256-step `synchronize_and_clear_cache`.
-    /// Paged steppers override to
-    /// `crate::array::maybe_clear_cache_for_paged_step(step)`.
+    /// Default is the FLAT every-256-step `clear_cache` — no
+    /// `synchronize()`. mlx-lm's reference decode loop only calls
+    /// `mx.clear_cache()` on this cadence; a `synchronize()` here would
+    /// additionally target the WRONG stream (it blocks on the thread's
+    /// default stream, which sits idle — the actual forward runs on
+    /// `generation_stream`, only made default for the brief scope of
+    /// `StreamContext` in `crate::stream`, and restored before this call)
+    /// and would be redundant even if it targeted the right one (this
+    /// loop's own `y.eval()` at the top of every iteration already forces
+    /// full evaluation of everything scheduled so far). Paged steppers
+    /// override to `crate::array::maybe_clear_cache_for_paged_step(step)`.
     fn maintain_cache(&mut self, step: i32) {
         if (step + 1) % 256 == 0 {
-            crate::array::synchronize_and_clear_cache();
+            crate::array::clear_cache();
         }
     }
 
@@ -448,45 +458,28 @@ pub(crate) enum ResetScope {
 
 /// Turn-constant inputs for [`ChatBackend::begin_decode`].
 ///
-/// Field set derived from what the compiled/eager decode-setup blocks
-/// read (`models/lfm2/model.rs` compiled seed block, `models/qwen3_5/
-/// model.rs` compiled-init branches):
+/// Field set derived from what the family `begin_decode` impls read:
 pub(crate) struct TurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`]. Two consumers:
-    ///   * `params.reuse_cache` gates the compiled-cache export in
-    ///     [`DecodeStep::end_decode`] — the stepper captures it here at
-    ///     `begin_decode` time (qwen3_5 dense/MoE `if p.reuse_cache`
-    ///     export blocks, lfm2 `if use_compiled && reuse_cache`);
-    ///   * `params.enable_mtp` / `params.mtp_depth` /
-    ///     `params.max_new_tokens` feed the qwen3_5 decode-entry
-    ///     `info!` trace (`chat_with_caches_inner` "chat_decode entry"
-    ///     block).
-    ///
-    /// `params.max_new_tokens` is also the KV budget input: lfm2's
-    /// compiled seed sizes its fixed padded cache via
-    /// `kv_capacity_round_up(prefill_len, max_new_tokens)`; the qwen3.5
-    /// compiled init does the same. (There is deliberately no separate
-    /// `max_new_tokens` field so the two copies cannot drift.)
+    /// The turn's resolved [`ChatParams`]. `params.enable_mtp` /
+    /// `params.mtp_depth` / `params.max_new_tokens` feed the qwen3_5
+    /// dense decode-entry `info!` trace, whose `max_kv_len` estimate is
+    /// derived via `kv_capacity_round_up_saturating(total_seq_len,
+    /// max_new_tokens)`; the other families do not read `params` at
+    /// `begin_decode` time.
     pub params: &'a ChatParams,
     /// Delta-continuation flag (this turn appended a text delta on top of
     /// the live KV caches rather than running a fresh prefill). Read by
-    /// the qwen3.5 dense/MoE, qwen3, and lfm2 decode-setup blocks for
-    /// their session-continuation bookkeeping and entry traces.
+    /// the qwen3.5 dense/MoE and qwen3 `begin_decode` impls for their
+    /// profiler relabels and entry traces.
     pub is_delta: bool,
     /// Whether this turn carried image input. Read by the qwen3.5 dense
     /// decode-entry `info!` trace.
     pub has_images: bool,
     /// Total post-prefill sequence length: cached prefix + freshly
     /// prefilled tokens (i.e. the full prompt; the session-delta paths
-    /// pass `cached_history + delta`).
-    ///
-    /// The qwen3.5 compiled init sizes its fixed KV budget from `seq_len`
-    /// (`kv_capacity_round_up(seq_len, max_new_tokens)` in
-    /// `chat_with_caches_inner`), and `seq_len` there is the TOTAL prompt
-    /// length — not the prefilled tail. lfm2 deliberately ignores this
-    /// field and seeds from the live attention-KV offset instead (see the
-    /// "CRITICAL: seed the compiled decode position from the LIVE
-    /// attention KV offset" comment in `models/lfm2/model.rs`).
+    /// pass `cached_history + delta`). Read by the qwen3.5 dense
+    /// decode-entry trace (`prefill_seq_len` plus the `max_kv_len`
+    /// estimate above).
     pub total_seq_len: usize,
 }
 
@@ -532,8 +525,10 @@ pub(crate) trait PagedPrefix {
     fn suffix_len(&self) -> usize;
 }
 
-/// Outcome of a whole-turn override ([`ChatBackend::paged_turn`] /
-/// [`ChatBackend::mtp_turn`] / [`ChatBackend::vision_turn`]).
+/// Outcome of a specialized whole-turn executor
+/// ([`ChatBackend::run_paged_turn`] /
+/// [`ChatBackend::run_speculative_turn`] /
+/// [`ChatBackend::run_multimodal_turn`]).
 ///
 /// Mirrors the two return shapes of the real per-family whole-turn
 /// functions: the sync cores return `Result<ChatResult>`
@@ -545,7 +540,7 @@ pub(crate) trait PagedPrefix {
 ///
 /// The variant MUST match the turn's sink presence
 /// ([`WholeTurnArgs::sink`]):
-///   * sink `Some` (streaming turn) → the probe must deliver every
+///   * sink `Some` (streaming turn) → the executor must deliver every
 ///     chunk INCLUDING the terminal done-chunk through the sink and
 ///     return [`TurnOutput::Streamed`]. `Complete` here is a
 ///     family-impl contract violation: the session core rejects it
@@ -568,7 +563,7 @@ pub(crate) enum TurnOutput {
     Streamed,
 }
 
-/// Inputs to the whole-turn overrides.
+/// Inputs to the specialized whole-turn executors.
 ///
 /// Field set derived from the real call-site signatures
 /// (`Qwen35Inner::paged_turn_sync_core(tokens, tokenizer, eos_token_id,
@@ -584,23 +579,23 @@ pub(crate) struct WholeTurnArgs<'a> {
     pub params: &'a ChatParams,
     /// Turn's resolved thinking-mode state:
     /// `backend.thinking_setup(&config)` computed ONCE at turn entry. The
-    /// whole-turn overrides (paged/mtp/vision) build their
+    /// specialized executors (paged/speculative/multimodal) build their
     /// `ReasoningTracker` from this via `ReasoningTracker::from_setup`
     /// instead of recomputing `resolve_enable_thinking` inline.
     pub thinking: ThinkingSetup,
-    /// Whether this is a session-delta continuation (text appended on
-    /// top of live caches) rather than a fresh prefill.
-    pub is_delta: bool,
+    /// Request-time feature plan resolved once from the model's immutable
+    /// [`ExecutionPlan`]. Specialized handlers consume this instead of
+    /// re-probing paged/speculative/media capabilities.
+    pub plan: TurnPlan,
     /// Streaming sink; `None` on the sync core (`cb` at the
     /// `paged_turn_stream_core` call sites).
     pub sink: Option<&'a dyn ChunkSink>,
     /// Cooperative-cancel flag; `None` on the sync core.
     pub cancelled: Option<&'a AtomicBool>,
-    /// Raw image bytes for `vision_turn`; empty for text-only turns.
-    pub images: &'a [Vec<u8>],
-    /// Raw (encoded) audio bytes for the multimodal `vision_turn`; empty for
-    /// turns with no audio. Only the unified Gemma 4 audio path consumes this.
-    pub audio: &'a [Vec<u8>],
+    /// Raw media for the model's multimodal preparation layer. Image and
+    /// audio are independent, composable inputs; adding another modality
+    /// should extend this boundary rather than the decode loop.
+    pub media: MediaInputs<'a>,
 }
 
 /// Per-family backend the session cores drive.
@@ -630,15 +625,15 @@ pub(crate) struct WholeTurnArgs<'a> {
 /// qwen3_5/ChatML reference):
 ///   - render/finalize: `render_prompt`, `resolve_params`,
 ///     `finalize_turn`
-///   - capability probes: `has_paged_adapter`, `supports_images`,
-///     `has_live_session`, `session_holds_images`
+///   - execution capabilities: `execution_plan`, `has_live_session`,
+///     `session_media`
 ///   - decode/stop: `extra_eos_ids`, `eos_before_emit`,
 ///     `wired_limit_bytes`
 ///   - streaming: `stream_skip_special_tokens`, `stream_emitter`,
-///     `stream_delta_prompt_tokens`, `text_delta_image_guard`
+///     `stream_delta_prompt_tokens`, `text_delta_media_guard`
 ///   - profiling/perf: `profiler_label`, `augment_performance`
-///   - whole-turn overrides (return `None` = run generic flow):
-///     `paged_turn`, `mtp_turn`, `vision_turn`
+///   - specialized executors selected by the resolved plan:
+///     `run_paged_turn`, `run_speculative_turn`, `run_multimodal_turn`
 ///
 /// (The per-step `DecodeStep` seam — `forward`/`eval_step` required,
 /// `trace_offset`/`trace_name`/`profiler_relabel`/`end_decode`
@@ -928,19 +923,23 @@ pub(crate) trait ChatBackend {
     where
         Self: 'a;
 
-    /// Set up the turn's decode path and return the stepper. == the
-    /// compiled-vs-eager dispatch blocks ahead of every `decode_loop!`
-    /// invocation (compiled lock acquisition + C++ seed-from-prefill on
-    /// the compiled path — `models/lfm2/model.rs` ~873-1100,
-    /// `models/qwen3_5/model.rs` compiled-init branches — or the
-    /// `DecodeOps` closure construction on the eager path). Turn-constant
-    /// captures (embedding weight, stream handles, the
-    /// `turn.params.reuse_cache` gate for [`DecodeStep::end_decode`])
-    /// move into the returned impl.
+    /// Set up the turn's decode stepper. Every family returns a pure-Rust
+    /// eager stepper; `turn` is consulted only for turn-constant setup:
     ///
-    /// lfm2 trap: the lfm2 impl must branch on `turn.is_delta` and return
-    /// the EAGER stepper for delta turns — its delta decode loop is always
-    /// eager, unlike the fresh flat path's compiled dispatch.
+    ///   * qwen3_5 dense reads `turn.params` / `turn.total_seq_len` /
+    ///     `turn.is_delta` / `turn.has_images` for its sync-path
+    ///     decode-entry trace (KV-capacity estimate via
+    ///     `engine::kv_capacity_round_up_saturating`) and, together with
+    ///     the recorded streaming-ness, picks the `chat*_rust` relabel.
+    ///   * qwen3 / MoE read only `turn.is_delta` for their profiler
+    ///     relabels (qwen3 additionally seeds `rope_offsets` from its
+    ///     post-prefill cursor — model state, not `turn`).
+    ///   * lfm2 / gemma4 ignore `turn` entirely and just wrap `self`.
+    ///
+    /// Turn-constant captures (the embedding weight and, for the qwen3.5
+    /// families, its transpose) move into the returned impl.
+    /// [`DecodeStep::end_decode`] is a default no-op that no family
+    /// overrides.
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>>;
 
     /// Decode the generated tokens and assemble the turn's
@@ -973,36 +972,16 @@ pub(crate) trait ChatBackend {
         )
     }
 
-    // ---- optional capability probes ----
+    // ---- immutable execution capabilities ----
 
-    /// Whether a block-paged KV adapter is active (routes the turn to
-    /// `paged_turn`). == the `self.paged_adapter.is_some()` checks.
-    fn has_paged_adapter(&self) -> bool {
-        false
-    }
-
-    /// Whether the family can consume image inputs (routes image-bearing
-    /// turns to `vision_turn`). Text-only families reject images with
-    /// the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error instead — the
-    /// session core fires that rejection BEFORE
-    /// [`ChatBackend::render_prompt`] (TS `ChatSession` restart-routing
-    /// contract: the typed prefix must win over any template error the
-    /// image-bearing message array could trigger; see the fresh-turn
-    /// image guard in `chat_turn_core`).
-    fn supports_images(&self) -> bool {
-        false
-    }
-
-    /// Whether the family can consume audio inputs (routes audio-bearing
-    /// turns to `vision_turn`, the shared multimodal entry). Audio mirrors
-    /// the image guard: an audio-bearing fresh turn against a family that
-    /// returns `false` is rejected with the typed
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix BEFORE
-    /// `render_prompt`. Default `false` keeps every non-audio family — and
-    /// every image-only / text-only flow — byte-identical; only the unified
-    /// Gemma 4 (`has_audio`) checkpoint overrides to `true`.
-    fn supports_audio(&self) -> bool {
-        false
+    /// Features wired into this model instance at load time.
+    ///
+    /// The default is a flat, autoregressive, text-only target. Families opt
+    /// into media, paged attention, and speculation declaratively. The
+    /// session resolves this description into one request-time `TurnPlan`
+    /// before any cache mutation; no capability probe runs in the token loop.
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan::TEXT_ONLY
     }
 
     /// Additional stop-token ids honored ALONGSIDE the session EOS id.
@@ -1054,21 +1033,28 @@ pub(crate) trait ChatBackend {
     /// `"chat_tokens_delta_sync"` on the sync twin,
     /// `"chat_stream_tokens_delta"` on the streaming twin.
     ///
-    /// Default is the lfm2-style text-only defensive guard: reject only
-    /// when the family does NOT support images but the session somehow
-    /// holds image state. Image-capable families that accept text deltas
-    /// on image sessions (qwen3.5's sticky-image-key contract) keep the
-    /// default and return `None` via `supports_images() == true`.
+    /// Default is a per-kind defensive guard: reject when the live session
+    /// holds any media kind the target does not actually have available.
+    /// Media-capable families that accept text deltas (qwen3.5's
+    /// sticky-image-key contract) keep the default.
     ///
-    /// Gemma4's override REJECTS despite `supports_images() == true`
+    /// Gemma4's override REJECTS despite declaring image capability
     /// whenever `cached_image_key.is_some()`, with the typed prefix the
     /// TS `ChatSession` restart routing matches on:
     /// `format!("{IMAGE_CHANGE_RESTART_PREFIX}{entry_fn} is text-only;
     /// session currently holds image state")`.
-    fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
-        if !self.supports_images() && self.session_holds_images() {
+    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
+        let session_media = self.session_media();
+        let unsupported = session_media.difference(self.execution_plan().media.available);
+        if !unsupported.is_empty() {
+            let media_state = match (unsupported.images, unsupported.audio) {
+                (true, true) => "image/audio",
+                (true, false) => "image",
+                (false, true) => "audio",
+                (false, false) => unreachable!("guarded by !unsupported.is_empty()"),
+            };
             Some(format!(
-                "{entry_fn} is text-only; session currently holds image state"
+                "{entry_fn} is text-only; session currently holds {media_state} state"
             ))
         } else {
             None
@@ -1113,7 +1099,7 @@ pub(crate) trait ChatBackend {
 
     /// Turn-level profiler label. Feeds
     /// `DecodeProfiler::new(label, family_name())`; the decode-path
-    /// relabel (compiled/eager) is [`DecodeStep::profiler_relabel`].
+    /// relabel is [`DecodeStep::profiler_relabel`].
     ///
     /// Default == the qwen3_5 dense labels (the de-facto engine
     /// reference): `"chat"` / `"chat_delta"` / `"chat_stream"` /
@@ -1187,60 +1173,50 @@ pub(crate) trait ChatBackend {
         !self.cached_token_history().is_empty()
     }
 
-    /// Whether the live session currently holds image state
-    /// (`cached_image_key.is_some()` on the families that track it).
+    /// Media kinds currently represented by the live session's cache state.
     ///
-    /// Feeds the DEFAULT [`ChatBackend::text_delta_image_guard`] policy
-    /// (reject text deltas on image-holding sessions only for text-only
-    /// families). Families that need a different policy override the
-    /// guard hook itself, not this probe. Default covers families that
-    /// never track image state.
-    fn session_holds_images(&self) -> bool {
-        false
+    /// Feeds the default [`ChatBackend::text_delta_media_guard`] policy
+    /// and the request planner's `context_media` fact on delta turns. Returning
+    /// the specific kinds instead of a boolean prevents speculation from
+    /// mistaking an empty current-turn input for a text-only live context.
+    /// Families that need a different delta policy override the guard hook
+    /// itself. Default covers families that never track media state.
+    fn session_media(&self) -> MediaCapabilities {
+        MediaCapabilities::NONE
     }
 
-    // ---- whole-turn overrides ----
+    // ---- specialized whole-turn executors ----
     //
-    // Consulted by the session cores BEFORE the generic
-    // verify-prefix/prefill/decode flow. `None` means "no override —
-    // run the generic flow"; `Some(result)` is the turn's outcome.
-    //
-    // Streaming contract (see [`TurnOutput`]): when `args.sink` is
-    // `Some`, an override MUST deliver all output (including the
-    // terminal done-chunk) through the sink and return
-    // `TurnOutput::Streamed`; `Complete` under streaming is rejected
-    // loudly by the session core.
+    // The session calls exactly one executor selected by `TurnPlan::path`.
+    // A model that declares a capability but omits its executor fails loudly;
+    // there is no `Option` fall-through that can silently discard media or
+    // disable an optimization. Streaming executors retain the `TurnOutput`
+    // contract documented above.
 
-    /// Block-paged whole-turn path. == `paged_turn_sync_core` /
-    /// `paged_turn_stream_core` on Qwen3.5 dense/MoE.
-    ///
-    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
-    /// attached, stream everything through the sink and return
-    /// [`TurnOutput::Streamed`], never `Complete`.
-    fn paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        None
+    /// Execute a turn whose eligible attention layers use the paged adapter.
+    /// The plan may also select speculative decoding; dense Qwen3.5 handles
+    /// that supported composition inside this executor.
+    fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        Err(Error::from_reason(format!(
+            "{} execution plan selected paged attention but the backend has no paged executor",
+            self.family_name(),
+        )))
     }
 
-    /// MTP speculative-decode whole-turn path. == the
-    /// `p.enable_mtp && has_mtp_weights` branch in
-    /// `models/qwen3_5/model.rs` / `models/qwen3_5_moe/model.rs`, now
-    /// driving the engine-owned `run_mtp_turn`.
-    ///
-    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
-    /// attached, stream everything through the sink and return
-    /// [`TurnOutput::Streamed`], never `Complete`.
-    fn mtp_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        None
+    /// Execute a flat speculative turn (native MTP or an external draft).
+    fn run_speculative_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        Err(Error::from_reason(format!(
+            "{} execution plan selected speculative decoding but the backend has no speculative executor",
+            self.family_name(),
+        )))
     }
 
-    /// Vision (VLM) whole-turn path. == the image-bearing prefill
-    /// branches (`args.images` non-empty) on the VLM-capable families.
-    ///
-    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
-    /// attached, stream everything through the sink and return
-    /// [`TurnOutput::Streamed`], never `Complete`.
-    fn vision_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        None
+    /// Prepare and execute a turn carrying one or more media inputs.
+    fn run_multimodal_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        Err(Error::from_reason(format!(
+            "{} execution plan selected multimodal input but the backend has no multimodal executor",
+            self.family_name(),
+        )))
     }
 }
 
@@ -1253,8 +1229,8 @@ pub(crate) trait ChatBackend {
 /// (`type PagedDecode<'a>`) and the [`Self::PrefixState`] assoc type
 /// have no stable trait-level default, so folding them into the base
 /// trait would force every family to implement them. A family opts in by
-/// implementing this trait and setting its `ChatBackend::paged_turn`
-/// body to `Some(run_paged_turn(self, args))`; families with a forked
+/// implementing this trait and delegating `ChatBackend::run_paged_turn`
+/// to `run_paged_turn(self, args)`; families with a forked
 /// per-family paged core do not implement it.
 ///
 /// `run_paged_turn` MIRRORS the FLAT engine tail
@@ -1306,10 +1282,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// `[vocab]`.
     ///
     /// == the forked cores' `run_paged_prefill_chunk(suffix, prefix_len,
-    /// ..)` + last-token projection. MAY eval its input (compiled-paged
-    /// needs the concrete suffix); eager qwen3 does not. The engine fires
-    /// the post-prefill `synchronize_and_clear_cache` AFTER this returns
-    /// (it is NOT this method's job).
+    /// ..)` + last-token projection. MAY eval intermediates mid-prefill
+    /// (the chunked workers materialize each non-final chunk to bound the
+    /// lazy graph). The engine fires the post-prefill
+    /// `synchronize_and_clear_cache` AFTER this returns (it is NOT this
+    /// method's job).
     fn paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
@@ -1318,9 +1295,10 @@ pub(crate) trait PagedBackend: ChatBackend {
     ) -> Result<MxArray>;
 
     /// Build the per-step paged decode stepper (the analog of
-    /// [`ChatBackend::begin_decode`]). Captures the turn constants
-    /// (`num_layers`, the dummy positions array, the compiled-paged
-    /// guards) into the returned stepper, which then drives
+    /// [`ChatBackend::begin_decode`]). Captures the turn constants into
+    /// the returned stepper (qwen3: `num_layers` + its dummy positions
+    /// array; gemma4 adds a diagnostic step counter; the rest just wrap
+    /// `self`), which then drives
     /// [`crate::engine::decode::run_decode_loop`].
     fn begin_paged_decode(&mut self, setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>>;
 
@@ -1468,7 +1446,7 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// Default — the dedicated `generation_stream`: a fresh Metal command
     /// queue that isolates decode work for the standard-KV families.
     ///
-    /// lfm2 OVERRIDES this to the canonical DEFAULT stream. Its compiled-paged
+    /// lfm2 OVERRIDES this to the canonical DEFAULT stream. Its paged
     /// forward holds persistent per-layer K/V pools across steps; running that
     /// forward on a queue SEPARATE from the shared loop's top-of-iteration
     /// `y.eval()` (which always runs on the default stream) forces a
@@ -1487,9 +1465,7 @@ pub(crate) trait PagedBackend: ChatBackend {
 /// MTP propose/verify loop needs to construct its per-turn stepper. The
 /// per-cycle scratch (snapshot / GDN tape / stashed replay error) does
 /// NOT live here: it becomes STRUCT FIELDS of the concrete
-/// [`MtpStepper`] (the analog of the compiled-paged guards on
-/// [`PagedBackend::PagedDecode`]), so the GDN tape never crosses the
-/// trait boundary.
+/// [`MtpStepper`], so the GDN tape never crosses the trait boundary.
 ///
 /// `depth` is the outer policy's requested draft depth (`params.mtp_depth`
 /// clamped to `[1, 5]`); the stepper still applies its own intra-cycle
@@ -1540,8 +1516,8 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// the GAT (`type MtpDecode<'a>`) has no stable trait-level default, so
 /// folding it into the base trait would force every family to implement
 /// it. A family opts in by implementing this trait (+ [`MtpStepper`] for
-/// its stepper) and setting its `ChatBackend::mtp_turn` body to
-/// `Some(run_mtp_turn(self, args))`; MTP-less families do not implement
+/// its stepper) and delegating `ChatBackend::run_speculative_turn` to
+/// `run_mtp_turn(self, args)`; MTP-less families do not implement
 /// it.
 ///
 /// The engine-owned loop (`run_mtp_turn`) is the relocated
@@ -1559,8 +1535,7 @@ pub(crate) trait MtpBackend: ChatBackend {
     /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
     /// stashed replay error live as STRUCT FIELDS of the concrete stepper
-    /// (declaration order == teardown order, like the compiled-paged
-    /// guards on [`PagedBackend::PagedDecode`]).
+    /// (declaration order == teardown order).
     type MtpDecode<'a>: MtpStepper
     where
         Self: 'a;
@@ -1613,10 +1588,15 @@ pub(crate) trait MtpStepper {
     /// [`Self::restore_and_replay_main`] / [`Self::commit_mtp`]).
     fn embedding_weight(&self) -> &MxArray;
 
-    /// `true` on the dense path where [`Self::commit_mtp`] runs the real
-    /// committed-history commit (and `run_mtp_cycle` uses the
-    /// `chain_start = 0` draft mask). == `MtpOps::committed_history_active`.
-    /// MoE / cycle-history steppers return `false`.
+    /// `true` when [`Self::commit_mtp`] runs the real committed-history
+    /// commit. The engine ANDs it with `cycle_seed_was_chained` to pick
+    /// the chained-cycle commit anchor
+    /// (`MtpCommitAnchor::SkipAlreadyCommittedAnchor` instead of
+    /// `IncludeAnchor`) and the `chained_anchor` argument of
+    /// [`Self::begin_cycle`]. Both the dense and MoE eager steppers
+    /// report this whenever their flag-gated `use_committed` gate holds;
+    /// steppers with no committed-history support return `false`.
+    /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
 
     /// Optional profiler relabel for the MTP path (e.g.
@@ -1701,8 +1681,9 @@ pub(crate) trait MtpStepper {
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
     /// to the persistent MTP cache. The `anchor` selects the commit
     /// payload policy (engine-chosen [`MtpCommitAnchor`]); the model
-    /// consumes it. A no-op impl keeps the cycle-history policy (MoE /
-    /// tests). == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
+    /// consumes it. A no-op impl keeps the cycle-history policy (tests, or
+    /// dense/MoE steppers whose flag-gated `use_committed` gate is off).
+    /// == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
     /// prev_hidden [1,1,hidden], verify_hiddens [1,D+1,hidden],
     /// committed_ids [K+2], k_accepted, embedding_weight)`.
     fn commit_mtp(
@@ -1753,6 +1734,143 @@ pub(crate) trait MtpStepper {
     /// adapter via [`Self::rollback_unemitted`] and never touches the FLAT
     /// desync flag — so the engine skips the set-hook on paged.
     fn into_desynced(self) -> bool;
+}
+
+/// Per-turn setup the engine hands to [`DsparkBackend::begin_dspark_decode`].
+///
+/// DSpark analog of [`MtpTurnSetup`] — carries the turn constants the
+/// engine-owned draft/verify loop
+/// ([`crate::engine::dspark_turn::run_dspark_turn`]) needs to construct its
+/// per-turn stepper. Per-cycle scratch (the tapped target hidden states, the
+/// draft-model KV window) lives as STRUCT FIELDS of the concrete
+/// [`DsparkStepper`], never here. Prefill-derived state (the gemma4 draft
+/// context / assistant seed hidden) travels through the family's own stash
+/// (`Gemma4Inner::draft_turn_state`), consumed by `begin_dspark_decode`.
+#[allow(dead_code)]
+pub(crate) struct DsparkTurnSetup<'a> {
+    /// The turn's resolved [`ChatParams`] — `params.sampling_config` drives
+    /// the per-cycle accept policy and `params.max_new_tokens` is the decode
+    /// budget.
+    pub params: &'a ChatParams,
+    /// Draft block size: the hard upper bound on tokens drafted per
+    /// propose/verify cycle. The engine additionally caps each cycle by
+    /// `params.mtp_depth` and by the remaining token budget minus one.
+    pub block_size: usize,
+}
+
+/// Sub-trait of [`ChatBackend`] for families whose DSpark (draft-model)
+/// speculative-decode whole-turn flows through the engine-owned
+/// propose/verify loop [`crate::engine::dspark_turn::run_dspark_turn`].
+///
+/// Split out of [`ChatBackend`] for the SAME reason as [`MtpBackend`]: the
+/// GAT (`type DsparkDecode<'a>`) has no stable trait-level default. A family
+/// opts in by implementing this trait (+ [`DsparkStepper`] for its stepper)
+/// and overriding `ChatBackend::run_speculative_turn` to call `run_dspark_turn`;
+/// DSpark-less families do not implement it. Production implementation:
+/// gemma4 (`models::gemma4::dspark_decode`).
+pub(crate) trait DsparkBackend: ChatBackend {
+    /// Per-turn DSpark propose/verify stepper. Borrows `&mut self` for the
+    /// whole decode loop (the analog of [`MtpBackend::MtpDecode`]).
+    type DsparkDecode<'a>: DsparkStepper
+    where
+        Self: 'a;
+
+    /// Build the per-turn DSpark stepper (the analog of
+    /// [`MtpBackend::begin_mtp_decode`]). Captures the turn constants (draft
+    /// model handle, target tap, block size) into the returned stepper,
+    /// which then drives the engine-owned `run_dspark_turn` loop.
+    fn begin_dspark_decode(
+        &mut self,
+        setup: &DsparkTurnSetup<'_>,
+    ) -> Result<Self::DsparkDecode<'_>>;
+}
+
+/// One cycle's drafted block from [`DsparkStepper::propose`].
+pub(crate) struct DsparkProposal {
+    /// `L <= max_len` proposed token ids. The stepper may return FEWER than
+    /// asked (confidence truncation) but never more — the engine hard-errors
+    /// on an over-long block (it would overrun the near-tail budget cap's
+    /// target-cache slot expectations).
+    pub draft_ids: Vec<i32>,
+    /// Per-position f32 `[vocab]` proposal-density rows `q_i` — the
+    /// distribution `draft_ids[i]` was actually drawn from, consumed by
+    /// `sampling::accept_with_residual` on the sampled accept path. EMPTY
+    /// whenever the turn's temperature is greedy
+    /// (`sampling::is_greedy_temperature`) — greedy acceptance, with or
+    /// without active penalties, is argmax-based and never reads `q`.
+    pub draft_dists: Vec<MxArray>,
+}
+
+/// Output of [`DsparkStepper::verify`] — ONE batched target forward over
+/// `[anchor, d_0..d_{L-1}]`.
+pub(crate) struct DsparkVerifyOutput {
+    /// Target logits `[1, 1+L, vocab]`: row `i` is the target's next-token
+    /// distribution AFTER `verify_ids[i]`.
+    pub logits: MxArray,
+}
+
+/// Per-turn DSpark stepper the engine-owned loop
+/// ([`crate::engine::dspark_turn::run_dspark_turn`]) drives.
+///
+/// The `&mut self` borrow model is strictly sequential: the engine calls
+/// exactly one method at a time, in the fixed per-cycle order
+/// `propose → verify → commit → eval_boundary`. `eval_boundary` is `&self`
+/// (schedule-only, no state mutation), the rest are `&mut self`.
+///
+/// # Invariant — tapped hidden states NEVER cross this trait
+///
+/// The real stepper taps the target model's hidden states inside
+/// [`Self::verify`], stashes them as its own fields, and consumes them in
+/// [`Self::commit`] (seeding the next cycle's draft context from the kept
+/// prefix). The engine loop sees only token ids, logits, and the
+/// `keep`/`total_written` bookkeeping — so the draft model's conditioning
+/// stays a stepper-private concern and the trait stays model-agnostic.
+/// Production implementation: `Gemma4DsparkStepper`.
+pub(crate) trait DsparkStepper {
+    /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last
+    /// emitted token, whose K/V is NOT yet in the target cache — the
+    /// engine's subsequent [`Self::verify`] writes it at position 0).
+    /// Returns `L <= max_len` drafted ids (never more — the engine
+    /// hard-errors on over-return) plus, on sampled-temperature turns, the
+    /// per-position proposal densities. `rng` is consumed only at
+    /// non-greedy temperature: at greedy temperature — regardless of active
+    /// penalties — drafting and acceptance are argmax-based and must not
+    /// advance it (mirrors the `accept_with_residual` T=0 shortcut's
+    /// zero-RNG contract). `&mut dyn rand::Rng` (rand 0.10's dyn-compatible
+    /// core trait — the pre-0.10 `RngCore`) keeps this trait object-safe
+    /// while the engine loop stays generic over `R: rand::Rng`, matching
+    /// `run_mtp_turn`'s house style.
+    ///
+    /// Never called with `max_len == 0`: the engine skips propose entirely
+    /// on the degenerate single-AR-step cycle.
+    fn propose(
+        &mut self,
+        anchor_id: u32,
+        max_len: usize,
+        params: &ChatParams,
+        rng: &mut dyn rand::Rng,
+    ) -> Result<DsparkProposal>;
+
+    /// ONE batched target forward over `verify_ids = [anchor, d_0..d_{L-1}]`
+    /// (length `1+L`; `L == 0` degenerates to a plain single-token AR step
+    /// THROUGH verify). Writes `1+L` K/V slots into the target cache and
+    /// stashes the tapped per-position hidden states as stepper fields for
+    /// [`Self::commit`].
+    fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput>;
+
+    /// Commit the cycle: keep the first `keep` of the `total_written`
+    /// (`== 1+L`) target-cache slots [`Self::verify`] wrote and roll back
+    /// the rest; consume the stashed tapped hiddens to re-seed the draft
+    /// model on the kept prefix. `keep >= 1` always (the anchor's slot is
+    /// unconditionally kept); the cycle's boundary token has NO K/V slot —
+    /// it becomes the next cycle's anchor.
+    fn commit(&mut self, keep: usize, total_written: usize) -> Result<()>;
+
+    /// Schedule async eval for the boundary token that becomes the next
+    /// cycle's anchor. `&self` — schedules only, no mutation. Called at the
+    /// iteration boundary on the continue path (the analog of
+    /// [`MtpStepper::eval_step_with_chained_hidden`]'s placement).
+    fn eval_boundary(&self, token: &MxArray);
 }
 
 /// Per-family training backend the model-neutral training-command handler

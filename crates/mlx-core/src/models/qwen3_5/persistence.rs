@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, has_sym8_mode, merge_per_layer, parse_mode_str,
-    parse_quant_block, resolve_default_mode,
+    ensure_int8_storage_resolves_sym8, has_sym8_mode, merge_per_layer, normalize_per_layer_key,
+    parse_mode_str, parse_quant_block, resolve_default_mode,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -501,6 +501,7 @@ fn mtplx_mtp_quant(raw: &Value) -> Option<(String, PerLayerQuant)> {
             bits,
             group_size,
             mode,
+            input_amax: None,
         },
     ))
 }
@@ -603,6 +604,7 @@ pub(crate) fn augment_mtplx_mtp_quantization_with_suffixes(
                 bits,
                 group_size,
                 mode,
+                input_amax: None,
             });
     }
 
@@ -625,6 +627,7 @@ fn parse_draft_lm_head_spec(value: &Value) -> Option<PerLayerQuant> {
         bits,
         group_size,
         mode,
+        input_amax: None,
     })
 }
 
@@ -910,6 +913,7 @@ fn apply_weights_inner(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
+    has_vision: bool,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -950,7 +954,7 @@ fn apply_weights_inner(
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
         // layer must never silently fall back, see
         // `try_build_sym8_quantized_linear`).
-        Ok(match plq.mode {
+        let built = match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
@@ -958,7 +962,29 @@ fn apply_weights_inner(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        })
+        };
+        // Thread the per-tensor FP8 activation scale from the resolved
+        // per-layer quant record onto the built projection. Only calibrated
+        // mxfp8 attention/GDN overrides carry a `Some` amax in config; every
+        // other layer stays `None`, so forward behaviour is unchanged here.
+        // Also thread the normalized config key so the activation-amax
+        // calibration tap can bucket recorded `max|activation|` by projection —
+        // but ONLY on the recipe's activation-fp8 sites (attn q/k/v/o, merged
+        // GDN in_proj_qkvz, GDN out_proj). A non-site mxfp8 projection (e.g. a
+        // uniform-mxfp8 or hand-edited checkpoint's FFN/lm_head) gets `None` so
+        // the tap skips it and calibration never fake-quants a non-attn/GDN
+        // site.
+        let nk = normalize_per_layer_key(prefix);
+        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        let amax_key = is_site.then_some(nk);
+        // Gate the CONSUMED activation amax under the SAME predicate as the
+        // recorded `amax_key`: `QuantizedLinear::forward` fake-quants whenever
+        // `input_amax > 0 && mode == MXFP8_MODE`, so a stale / hand-edited /
+        // future-recipe config with `input_amax` on a NON-attn/GDN mxfp8
+        // projection must NOT thread it — else it would fake-quant a non-site's
+        // activations, violating "activation FP8 only on attn/GDN sites".
+        let input_amax = if is_site { plq.input_amax } else { None };
+        Ok(built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key)))
     };
 
     // Embedding
@@ -971,13 +997,54 @@ fn apply_weights_inner(
             .get("embed_tokens")
             .copied()
             .unwrap_or(default_plq);
-        inner
-            .embedding
-            .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
-        info!(
-            "Loaded quantized embedding ({}-bit, quantized_matmul on forward)",
-            plq.bits
-        );
+        // Packed-resident load (`quantized_matmul` on the tied lm_head via
+        // `Embedding::as_linear` on the paged path) is a WIN only where every
+        // per-turn `get_weight()` consumer is packed-aware. That holds for the
+        // paged, non-MTP, non-VLM turn path (input lookup already uses
+        // `embed.forward`; the only eval'd `get_weight()` was the tied-head
+        // matmul, now routed through `as_linear`). It REGRESSES under packed on:
+        // the flat/eager path (`use_block_paged_cache != Some(true)`, incl. sym8
+        // + the non-Metal preview — re-dequants input lookup AND head per turn),
+        // MTP draft (`n_mtp_layers > 0` — per-draft dequant), and VLM image turns
+        // (`has_vision` — the vision-merge text-embed re-dequants). Gate the
+        // packed load to the proven-clean case; everything else keeps the legacy
+        // full-pre-dequant load (unchanged behavior). Coverage of MTP / VLM /
+        // flat is a follow-up.
+        //
+        // `use_block_paged_cache == Some(true)` is config INTENT; the paged
+        // adapter is only created when `compiled_forward_backend_available()`
+        // is ALSO true (`Qwen35Inner::new`), so a non-Metal/CUDA build with a
+        // paged config still runs flat — the added predicate keeps those on the
+        // legacy load (no per-turn dequant regression).
+        let prefer_packed = config.use_block_paged_cache == Some(true)
+            && crate::engine::persistence::compiled_forward_backend_available()
+            && config.n_mtp_layers == 0
+            && !has_vision;
+        if prefer_packed {
+            // Mode hardcoded "affine": embed_tokens/lm_head sidecars are always
+            // affine-quantized in every checkpoint format this loader accepts,
+            // matching what `Embedding::load_quantized` already hardcodes.
+            inner.embedding.load_quantized_packed(
+                weight,
+                scales,
+                biases,
+                plq.group_size,
+                plq.bits,
+                "affine",
+            )?;
+            info!(
+                "Loaded packed-quantized embedding ({}-bit, quantized_matmul on forward + tied lm_head)",
+                plq.bits
+            );
+        } else {
+            inner
+                .embedding
+                .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+            info!(
+                "Loaded quantized embedding ({}-bit, quantized_matmul on forward)",
+                plq.bits
+            );
+        }
     } else if let Some(w) = params.get("embedding.weight") {
         // Dense fallback (no `.scales`): a stripped quant group must never
         // reach the dense lookup / tied-lm_head matmul.
@@ -990,27 +1057,21 @@ fn apply_weights_inner(
         inner.final_norm.set_weight(w)?;
     }
 
-    // LM head
+    // LM head. The outer `Some(head)` guard preserves the tied-embeddings
+    // path: when `tie_word_embeddings`, `inner.lm_head` is `None` and the head
+    // is never installed even if `lm_head.*` tensors are present. The head
+    // installs through the mode-aware `try_build_ql` dispatch (affine / mxfp8 /
+    // mxfp4 / nvfp4 / sym8) so non-affine quantized heads load, not just affine
+    // — the legacy `Linear::load_quantized` hardcoded affine dequant.
     if let Some(ref mut head) = inner.lm_head {
-        if let Some(scales) = params.get("lm_head.scales") {
-            let weight = params.get("lm_head.weight").ok_or_else(|| {
-                Error::from_reason("Missing lm_head.weight for quantized lm_head")
-            })?;
-            let biases = params.get("lm_head.biases");
-            let plq = per_layer_quant
-                .get("lm_head")
-                .copied()
-                .unwrap_or(default_plq);
-            head.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
-            info!(
-                "Loaded quantized lm_head ({}-bit, quantized_matmul on forward)",
-                plq.bits
-            );
+        if let Some(ql) = try_build_ql(params, "lm_head")? {
+            head.set_quantized(ql);
+            info!("Loaded quantized lm_head (mode-aware, quantized_matmul on forward)");
         } else if let Some(w) = params.get("lm_head.weight") {
             // Dense fallback (no `.scales`) — same stripped-quant-group
             // dtype guard as the embedding above.
             ensure_dense_weight_floating("lm_head.weight", w)?;
-            head.set_weight(w)?;
+            head.set_weight(w, "lm_head")?;
         }
     }
 
@@ -1254,6 +1315,10 @@ fn apply_weights_inner(
                 if let Some(w) = params.get(&format!("{}.self_attn.o_proj.bias", prefix)) {
                     attn.set_o_proj_bias(Some(w))?;
                 }
+                // Precompute the block-ordered q_proj weight so forward()/
+                // forward_paged() split queries/gate without a strided
+                // reshape-copy. No-op for quantized q_proj.
+                attn.finalize_q_gate_block()?;
             }
         }
 
@@ -1334,11 +1399,9 @@ fn apply_weights_inner(
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
-        // sym8 v1 scope: MTP is OUT. The sym8 compiled coverage is the FLAT
-        // decode only (`qwen35_decode_fn`, atomic eager C++); the MTP
-        // draft/verify graphs are `mlx::core::compile`d and the sym8 custom
-        // Metal kernels are unproven inside a compile trace. Loading the MTP
-        // head through the affine builders would also mis-pack int8 tensors —
+        // sym8 v1 scope: MTP is OUT. The MTP quant builders carry no sym8 arm
+        // (`mtp.rs` maps `PerLayerMode::Sym8 => None`), and loading the MTP
+        // head through the affine builders would mis-pack int8 tensors —
         // skip the load and fail soft into plain AR decode, mirroring the
         // missing-weights branch.
         if has_sym8_mode(top_level_mode, per_layer_quant) {
@@ -1600,20 +1663,21 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     parse_quant_block(quant_cfg, quant_group_size);
                 augment_mtplx_mtp_quantization(&raw, config.n_mtp_layers, &mut per_layer_quant);
 
-                // sym8 v1 scope: the compiled C++ path covers the FLAT decode
-                // only (`qwen35_decode_fn` — atomic eager C++, no
-                // `mlx::core::compile`). The block-paged decode graph IS
-                // `mlx::core::compile`d, and the sym8 custom Metal kernels are
-                // unproven inside a compile trace — force the flat path so a
+                // sym8 v1 scope: sym8 is only validated on the dense FLAT
+                // (eager int8) decode path. Dense paged decode is pure-Rust
+                // eager too, but sym8 under it is simply UNVALIDATED — the pin
+                // is retained conservatively, forcing the flat path so a
                 // paged-opt-in config (or MLX_QWEN35_PAGED_OVERRIDE=1) cannot
-                // route sym8 through it.
+                // route sym8 through it. (MoE and gemma4 already ship sym8
+                // under paged decode, so lifting this pin is a plausible
+                // follow-up — a behavior decision, not made here.)
                 if has_sym8_mode(top_level_mode, &per_layer_quant)
                     && config.use_block_paged_cache == Some(true)
                 {
                     warn!(
                         "Qwen3.5: sym8 checkpoint requested block-paged KV cache; \
-                         the sym8 compiled path is flat-only — forcing \
-                         use_block_paged_cache=false."
+                         sym8 is validated on the flat (eager int8) path only — \
+                         forcing use_block_paged_cache=false."
                     );
                     config.use_block_paged_cache = Some(false);
                 }
@@ -1666,6 +1730,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     quant_group_size,
                     top_level_mode,
                     &per_layer_quant,
+                    has_vision,
                 )?;
 
                 // Materialize mmap-backed weights. Pages were pre-warmed above, so
@@ -1927,8 +1992,8 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
             .map(|v| v as u32),
         // Stage 1 (MTP-paged enablement): we do NOT auto-flip
         // `use_block_paged_cache` based on `n_mtp_layers > 0`. The
-        // Stage 1 hot path still runs the dense compiled MTP cycle
-        // (verify reads from `g_compiled_caches`, not the paged pool),
+        // default MTP hot path still runs the FLAT eager MTP cycle
+        // (verify reads the flat Rust layer caches, not the paged pool),
         // so eagerly constructing the paged adapter on every MTP-
         // capable checkpoint adds ~256 MB of unused GPU memory pressure
         // AND (more importantly) silently routes pure-AR turns on the
@@ -2317,6 +2382,7 @@ mod tests {
             bits: 4,
             group_size: 32,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         for key in [
             "mtp.layers.0.self_attn.o_proj",
@@ -2408,6 +2474,621 @@ mod tests {
             paged_block_size: None,
             use_block_paged_cache: None,
             n_mtp_layers: 0,
+        }
+    }
+
+    /// A saved dense-MTP checkpoint must round-trip its MTP layer count.
+    /// `parse_config` reads the count ONLY from the HF-convention keys
+    /// (`mtp_num_hidden_layers` / `num_nextn_predict_layers`) and ignores the
+    /// serde field name `n_mtp_layers`, so `save_model_sync` must inject the
+    /// HF key into config.json (mirroring the MoE saver) — without it a
+    /// reloaded checkpoint comes back with `n_mtp_layers = 0` and its MTP
+    /// head is silently dropped.
+    #[test]
+    fn save_model_sync_round_trips_mtp_layer_count() {
+        let label = "save_model_sync_round_trips_mtp_layer_count";
+        let cfg = Qwen3_5Config {
+            n_mtp_layers: 1,
+            ..no_mtp_layer_cfg()
+        };
+
+        let mut inner = match Qwen35Inner::new(cfg) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                // Random-init construction needs MLX ops; skip cleanly when
+                // the GPU/device is unavailable (CI without Metal).
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+        // A random-init MTP head's weights ARE its loaded weights (same
+        // rationale as `create_random_qwen35_moe_checkpoint_sync`); the saver
+        // only serializes the `mtp.*` tensors when this flag is set.
+        inner.mtp_weights_loaded = true;
+
+        let ckpt_dir = std::env::temp_dir().join(format!(
+            "mlx-qwen35-dense-mtp-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = DirCleanup(ckpt_dir.clone());
+        let ckpt_path = ckpt_dir
+            .to_str()
+            .expect("temp checkpoint path is not valid UTF-8")
+            .to_string();
+
+        inner
+            .save_model_sync(&ckpt_path)
+            .unwrap_or_else(|err| panic!("save_model_sync failed in {label}: {}", err.reason));
+
+        let config_json = std::fs::read_to_string(ckpt_dir.join("config.json"))
+            .expect("saved config.json must be readable");
+        let raw: Value = serde_json::from_str(&config_json).expect("saved config.json is JSON");
+        assert_eq!(
+            raw.get("mtp_num_hidden_layers").and_then(|v| v.as_i64()),
+            Some(1),
+            "saved config.json must carry the HF-convention MTP key"
+        );
+
+        let reparsed = parse_config(&raw).expect("saved config.json must re-parse");
+        assert_eq!(
+            reparsed.n_mtp_layers, 1,
+            "reloaded config must reconstruct the MTP module (n_mtp_layers)"
+        );
+    }
+
+    /// Persistence-level regression for the tied+quantized lm_head packed
+    /// fast-path (paged, non-MTP, non-VLM): a quantized `embedding.*` sidecar
+    /// on a paged config must load via `Embedding::load_quantized_packed`
+    /// (packed-resident: `forward()` gather-then-dequants, `as_linear()` runs
+    /// `quantized_matmul`) — NOT the legacy `Embedding::load_quantized` (eager
+    /// full-table pre-dequant into a dense bf16 `[vocab, hidden]` array). Guards
+    /// the gated `apply_weights_inner` load branch directly; the packed-vs-dense
+    /// forward/as_linear numerical equivalence itself is already covered by
+    /// `crate::nn::embedding::tests::packed_affine_2bit_lookup_byte_identical_to_legacy_dense`
+    /// and `packed_affine_as_linear_matches_dense_matmul`.
+    #[test]
+    fn tied_quantized_embedding_loads_via_packed_path() {
+        let label = "tied_quantized_embedding_loads_via_packed_path";
+        // Satisfy the packed-load gate: paged, non-MTP, non-VLM.
+        // `no_mtp_layer_cfg()` already sets `n_mtp_layers = 0` but leaves
+        // `use_block_paged_cache = None`, so opt the fixture into paged here.
+        // The block-paged `LayerKVPool` only accepts head sizes in a fixed set
+        // (`no_mtp_layer_cfg`'s `head_dim = 16` is rejected), so bump the tied
+        // head/attention dim to the smallest valid pool size (32).
+        let mut cfg = no_mtp_layer_cfg(); // tie_word_embeddings: true, vocab 1024
+        cfg.use_block_paged_cache = Some(true);
+        cfg.head_dim = 32;
+
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                // Pool allocation (`LayerKVPool`) requires Metal; skip cleanly
+                // when the GPU/device is unavailable (CI without Metal).
+                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        // Affine-quantize a synthetic [vocab, hidden] table exactly like a
+        // tied checkpoint's `embedding.{weight,scales,biases}` sidecar
+        // (group_size 32, 4-bit — this repo's embed_tokens/lm_head sidecars
+        // are always affine regardless of the body recipe).
+        let vocab = cfg.vocab_size as i64;
+        let hidden = cfg.hidden_size as i64;
+        let n = (vocab * hidden) as usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let dense = match MxArray::from_float32(&data, &[vocab, hidden]) {
+            Ok(a) => match a.astype(DType::BFloat16) {
+                Ok(a) => a,
+                Err(err) => panic!("unexpected astype failure in {label}: {}", err.reason),
+            },
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected MxArray::from_float32 failure in {label}: {msg}");
+            }
+        };
+
+        let group_size = 32;
+        let bits = 4;
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                dense.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        let qw = MxArray::from_handle(out_q, "qw").expect("qw");
+        let qs = MxArray::from_handle(out_s, "qs").expect("qs");
+        let qb = MxArray::from_handle(out_b, "qb").expect("qb");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embedding.weight".to_string(), qw);
+        params.insert("embedding.scales".to_string(), qs);
+        params.insert("embedding.biases".to_string(), qb);
+
+        // Explicit per-layer override so the loader's group_size/bits exactly
+        // match how this test quantized the tensor above (the DEFAULT_QUANT_*
+        // fallback used when no override is present may not match).
+        let mut per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+        per_layer_quant.insert(
+            "embed_tokens".to_string(),
+            PerLayerQuant {
+                bits,
+                group_size,
+                mode: PerLayerMode::Affine,
+                input_amax: None,
+            },
+        );
+
+        // The embedding sidecar is the ONLY tensor this fixture provides.
+        // `apply_weights_inner` loads the embedding UP FRONT, then runs an
+        // end-of-function completeness gate that rejects this deliberately
+        // partial checkpoint (no final_norm / attn / mlp). That Err is expected
+        // and fires strictly AFTER the embedding backend is installed on
+        // `inner`, so the packed-load assertion below still observes the real
+        // load decision. Only tolerate that specific completeness error — any
+        // other failure means the embedding load path itself broke.
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        assert!(
+            inner.embedding.is_packed_quantized(),
+            "tied+quantized embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
+        );
+    }
+
+    /// The dense `lm_head` must install through the mode-aware `LinearProj`
+    /// dispatch (`try_build_ql`): a non-affine (mxfp8) quantized head and an
+    /// affine quantized head both install as `LinearProj::Quantized`, a bf16
+    /// head installs as `LinearProj::Standard`, and a tied config leaves the
+    /// head `None`.
+    ///
+    /// Regression guard for `Linear::load_quantized` hardcoding affine dequant:
+    /// an mxfp8/nvfp4 head previously crashed ("Biases must be provided for
+    /// affine quantization") because the legacy install called
+    /// `head.load_quantized(...)` unconditionally. The install-only checks
+    /// tolerate the end-of-load completeness gate (this fixture provides only
+    /// `lm_head.*`), which fires strictly AFTER the head backend is installed
+    /// on `inner`.
+    #[test]
+    fn dense_lm_head_installs_mode_aware_linearproj() {
+        use super::super::quantized_linear::{
+            LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
+        };
+        let label = "dense_lm_head_installs_mode_aware_linearproj";
+
+        // Construct an untied inner first — this is the op that needs MLX/Metal,
+        // so a clean skip here means the fixture builds below never hit a device
+        // error.
+        let untied_cfg = Qwen3_5Config {
+            vocab_size: 8,
+            tie_word_embeddings: false,
+            ..no_mtp_layer_cfg()
+        };
+        let vocab = untied_cfg.vocab_size as i64;
+        let hidden = untied_cfg.hidden_size as i64;
+
+        let new_inner = || match Qwen35Inner::new(untied_cfg.clone()) {
+            Ok(inner) => Some(inner),
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    None
+                } else {
+                    panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+                }
+            }
+        };
+
+        // Array builders. Reachable only after `Qwen35Inner::new` succeeded, so
+        // the device is up and `.expect` is safe.
+        let u32_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let u8_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("uint8")
+        };
+        let bf16_arr = |shape: &[i64], v: f32| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![v; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+
+        // Run `apply_weights_inner` for an install-only fixture: the partial
+        // checkpoint (only `lm_head.*`) is rejected by the completeness gate,
+        // which runs AFTER the head install — tolerate only that specific error.
+        let apply_install_only =
+            |inner: &mut Qwen35Inner,
+             params: &HashMap<String, MxArray>,
+             plq: &HashMap<String, PerLayerQuant>| {
+                match apply_weights_inner(
+                    inner,
+                    params,
+                    &untied_cfg,
+                    DEFAULT_QUANT_BITS,
+                    DEFAULT_QUANT_GROUP_SIZE,
+                    None,
+                    plq,
+                    /* has_vision */ false,
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let msg = err.reason.to_string();
+                        assert!(
+                            msg.contains("missing mandatory weights"),
+                            "unexpected apply_weights_inner error in {label}: {msg}"
+                        );
+                    }
+                }
+            };
+
+        // (a) Non-affine (mxfp8) head → Quantized. This is the case the legacy
+        //     `head.load_quantized` (affine-only) crashed on.
+        {
+            let Some(mut inner) = new_inner() else { return };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u8_arr(&[vocab, hidden]));
+            params.insert("lm_head.scales".into(), u8_arr(&[vocab, hidden / 32]));
+            let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+            plq.insert(
+                "lm_head".into(),
+                PerLayerQuant {
+                    bits: MXFP8_BITS,
+                    group_size: MXFP8_GROUP_SIZE,
+                    mode: PerLayerMode::Mxfp8,
+                    input_amax: None,
+                },
+            );
+            apply_install_only(&mut inner, &params, &plq);
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+                "mxfp8 lm_head must install as LinearProj::Quantized"
+            );
+            if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+                assert_eq!(ql.mode(), MXFP8_MODE, "mxfp8 head must keep mxfp8 mode");
+            }
+        }
+
+        // (b) Affine head → Quantized (mode "affine").
+        {
+            let Some(mut inner) = new_inner() else { return };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u32_arr(&[vocab, hidden / 8]));
+            params.insert(
+                "lm_head.scales".into(),
+                bf16_arr(&[vocab, hidden / 32], 1.0),
+            );
+            params.insert(
+                "lm_head.biases".into(),
+                bf16_arr(&[vocab, hidden / 32], 0.0),
+            );
+            let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+            plq.insert(
+                "lm_head".into(),
+                PerLayerQuant {
+                    bits: 4,
+                    group_size: 32,
+                    mode: PerLayerMode::Affine,
+                    input_amax: None,
+                },
+            );
+            apply_install_only(&mut inner, &params, &plq);
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+                "affine lm_head must install as LinearProj::Quantized"
+            );
+            if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+                assert_eq!(ql.mode(), "affine", "affine head must keep affine mode");
+            }
+        }
+
+        // (c) bf16 dense head (no `.scales`) → Standard.
+        {
+            let Some(mut inner) = new_inner() else { return };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), bf16_arr(&[vocab, hidden], 0.01));
+            apply_install_only(&mut inner, &params, &HashMap::new());
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Standard(_))),
+                "bf16 lm_head must install as LinearProj::Standard"
+            );
+        }
+
+        // (d) Tied config → head stays `None` regardless of params.
+        {
+            let tied_cfg = Qwen3_5Config {
+                vocab_size: 8,
+                tie_word_embeddings: true,
+                ..no_mtp_layer_cfg()
+            };
+            let mut inner = match Qwen35Inner::new(tied_cfg.clone()) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("Metal") || msg.contains("device") {
+                        eprintln!("skipping {label} tied case (MLX/Metal unavailable): {msg}");
+                        return;
+                    }
+                    panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+                }
+            };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u8_arr(&[vocab, hidden]));
+            params.insert("lm_head.scales".into(), u8_arr(&[vocab, hidden / 32]));
+            match apply_weights_inner(
+                &mut inner,
+                &params,
+                &tied_cfg,
+                DEFAULT_QUANT_BITS,
+                DEFAULT_QUANT_GROUP_SIZE,
+                None,
+                &HashMap::new(),
+                false,
+            ) {
+                Ok(()) => {}
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    assert!(
+                        msg.contains("missing mandatory weights"),
+                        "unexpected apply_weights_inner error in {label} tied case: {msg}"
+                    );
+                }
+            }
+            assert!(
+                inner.lm_head.is_none(),
+                "tied lm_head must remain None when tie_word_embeddings=true"
+            );
+        }
+    }
+
+    /// RED-first regression guard for the FP8-activation loader asymmetry
+    /// (codex [high]): the dense `try_build_ql` closure gated the recorded
+    /// `amax_key` behind `is_activation_fp8_site` but threaded the CONSUMED
+    /// `PerLayerQuant::input_amax` UNCONDITIONALLY. A stale / hand-edited /
+    /// future-recipe config that puts `input_amax` on a NON-activation-site
+    /// mxfp8 projection would have that amax survive the load and drive FP8
+    /// fake-quant in `QuantizedLinear::forward` (`input_amax > 0 && mode ==
+    /// MXFP8_MODE`) — violating the contract that only attn/GDN sites carry
+    /// activation FP8. The fix gates `input_amax` behind the SAME
+    /// `is_activation_fp8_site` predicate as `amax_key`.
+    ///
+    /// `lm_head` normalizes to `"lm_head"` (NOT in the activation-fp8 site set)
+    /// yet installs through the exact `try_build_ql` closure under test. Pre-fix
+    /// this observes `Some(2.0)` (RED); post-fix `None` (GREEN).
+    #[test]
+    fn mxfp8_non_site_lm_head_drops_input_amax_dense_loader() {
+        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        let label = "mxfp8_non_site_lm_head_drops_input_amax_dense_loader";
+
+        let untied_cfg = Qwen3_5Config {
+            vocab_size: 8,
+            tie_word_embeddings: false,
+            ..no_mtp_layer_cfg()
+        };
+        let vocab = untied_cfg.vocab_size as i64;
+        let hidden = untied_cfg.hidden_size as i64;
+
+        let mut inner = match Qwen35Inner::new(untied_cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        let u8_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("uint8")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("lm_head.weight".into(), u8_arr(&[vocab, hidden]));
+        params.insert("lm_head.scales".into(), u8_arr(&[vocab, hidden / 32]));
+
+        // Non-activation-site mxfp8 projection carrying a (stale/hand-edited)
+        // per-tensor activation amax that must NOT survive the load.
+        let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq.insert(
+            "lm_head".into(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(2.0),
+            },
+        );
+
+        // Install-only fixture: the partial checkpoint trips the end-of-load
+        // completeness gate AFTER lm_head is installed on `inner`.
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &untied_cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &plq,
+            /* has_vision */ false,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        assert!(
+            matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+            "mxfp8 lm_head must install as LinearProj::Quantized"
+        );
+        if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+            assert_eq!(
+                ql.input_amax(),
+                None,
+                "dense loader must DROP input_amax on a non-activation-fp8-site mxfp8 projection \
+                 (lm_head); it was threaded unconditionally before the try_build_ql gate fix"
+            );
+        }
+    }
+
+    /// POSITIVE sibling to the non-site guard (dense) and to
+    /// `mxfp8_attention_q_proj_threads_input_amax_through_moe_loader` (MoE): an
+    /// activation-fp8 SITE (`self_attn.q_proj`) must KEEP its calibrated
+    /// `PerLayerQuant::input_amax` through the dense `try_build_ql` closure. The
+    /// symmetric-gate fix drops `input_amax` only on NON-sites, so a real site
+    /// must still thread it (over-correction guard). Layer 3 is the
+    /// full-attention layer (`full_attention_interval = 4`, `(i + 1) % 4 == 0`).
+    #[test]
+    fn mxfp8_attention_q_proj_threads_input_amax_dense_loader() {
+        use super::super::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
+        const AMAX: f32 = 37.5;
+        let label = "mxfp8_attention_q_proj_threads_input_amax_dense_loader";
+
+        let cfg = no_mtp_layer_cfg();
+        let hidden = cfg.hidden_size as i64;
+        let q_dim = (cfg.num_heads * cfg.head_dim) as i64;
+
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        let u8_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("uint8")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.3.self_attn.q_proj.weight".into(),
+            u8_arr(&[q_dim, hidden]),
+        );
+        params.insert(
+            "layers.3.self_attn.q_proj.scales".into(),
+            u8_arr(&[q_dim, hidden / 32]),
+        );
+
+        let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq.insert(
+            "layers.3.self_attn.q_proj".into(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(AMAX),
+            },
+        );
+
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &plq,
+            /* has_vision */ false,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        match &inner.layers[3].attn {
+            AttentionType::Full(attn) => {
+                assert_eq!(
+                    attn.q_proj_input_amax(),
+                    Some(AMAX),
+                    "dense loader must thread PerLayerQuant::input_amax onto the built q_proj \
+                     (activation-fp8 site) after the gate fix"
+                );
+            }
+            AttentionType::Linear(_) => {
+                panic!("layers[3] must be Full attention (full_attention_interval = 4)")
+            }
         }
     }
 

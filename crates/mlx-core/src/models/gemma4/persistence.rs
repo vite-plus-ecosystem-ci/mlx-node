@@ -19,7 +19,7 @@ use crate::models::quant_dispatch::{
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::Gemma4Config;
-use super::model::{Gemma4Inner, Gemma4Model, warmup_forward};
+use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
     PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
@@ -994,10 +994,12 @@ fn apply_weights(
     // int8 bytes as a dense weight, see `try_build_sym8_quantized_linear`).
     //
     // Paged KV stays the gemma4 default under sym8 (`use_block_paged_cache`
-    // defaults true in `model.rs`): gemma4 has NO compiled C++ forward path,
-    // and the eager paged loop drives the same `LinearProj::forward` sym8
-    // route as flat — qwen3_5's force-flat sym8 guard exists only because
-    // its compiled registry can't represent sym8, which does not transfer.
+    // defaults true in `model.rs`): gemma4's eager paged loop drives the
+    // same `LinearProj::forward` sym8 route as flat, and gemma4 ships sym8
+    // under paged decode. qwen3_5's force-flat sym8 pin is a conservative
+    // validation-scope choice on its own path (sym8 there is validated on
+    // the flat path only; paged is simply unvalidated) — a rationale that
+    // does not transfer here.
     let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud
@@ -1848,11 +1850,35 @@ impl Gemma4Inner {
     /// cache-limit coordinator. See `cache_limit.rs` module docs for
     /// why this deterministic measurement is preferred over a
     /// process-wide `get_active_memory()` delta.
-    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
+    ///
+    /// `draft_model_path` optionally points at a draft checkpoint directory
+    /// (DSpark or assistant — probed from its config.json) loaded alongside
+    /// the target for speculative decoding. Draft decoding runs only on the
+    /// flat KV-cache path, so an explicit `use_block_paged_cache: true` in
+    /// the target config is a hard error (silently ignoring the explicit
+    /// draft request would be worse), and the unset default (paged ON) is
+    /// forced to flat.
+    pub fn load_from_dir(model_path: &str, draft_model_path: Option<&str>) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
         // Parse config
         let mut config = parse_config(path)?;
+
+        // DSpark/paged conflict guard — BEFORE any weight I/O so a
+        // misconfigured request fails fast. `use_block_paged_cache`
+        // defaults ON (`unwrap_or(true)` in `Gemma4Inner::new`); a draft
+        // request flips that default to flat, but an EXPLICIT `true` is a
+        // config-level conflict the caller must resolve.
+        if draft_model_path.is_some() {
+            if config.use_block_paged_cache == Some(true) {
+                return Err(Error::from_reason(
+                    "Gemma4 draft_model_path conflicts with use_block_paged_cache=true: DSpark \
+                     speculative decoding runs only on the flat KV-cache path. Remove \
+                     draft_model_path or set use_block_paged_cache to false in config.json.",
+                ));
+            }
+            config.use_block_paged_cache = Some(false);
+        }
 
         // Merge stop tokens and sampling defaults from generation_config.json
         let gen_config_path = path.join("generation_config.json");
@@ -2101,7 +2127,8 @@ impl Gemma4Inner {
         // Gemma4's forward runs entirely through primitive-op FFI that takes
         // weight arrays by POINTER (from this Rust `inner`/`params`), so there
         // is no process-global weight table to populate and nothing to register
-        // here. `inner.model_id` (drawn from `QWEN35_MODEL_ID_COUNTER`) is a
+        // here. `inner.model_id` (drawn from gemma4's private `MODEL_ID_COUNTER`
+        // in `model.rs`) is a
         // purely local per-instance handle surfaced to NAPI; it is not a
         // routing key and never leaves this process state.
 
@@ -2136,6 +2163,46 @@ impl Gemma4Inner {
             );
         }
 
+        // Draft model — loaded AFTER the target body so its geometry
+        // validation runs against the fully-parsed target config. The kind
+        // probe reads the draft config.json ONCE to pick the variant; each
+        // variant's strict loader errors propagate verbatim (they carry the
+        // guard-rail messages: geometry pins, bf16-only gates, tensor-set
+        // completeness).
+        if let Some(draft_dir) = draft_model_path {
+            let draft_path = Path::new(draft_dir);
+            // Same cold-mmap pre-warm as the target shards: the draft's
+            // first forward must not page-fault a cold region on the GPU.
+            prewarm_checkpoint_pages(draft_path);
+            let draft = load_draft_variant(draft_path, &config)?;
+            match &draft {
+                Gemma4Draft::Dspark(d) => info!(
+                    "[gemma4] DSpark draft model loaded: {} layers, block_size={}, target_layer_ids={:?}",
+                    d.num_layers(),
+                    d.config.block_size,
+                    d.config.target_layer_ids,
+                ),
+                Gemma4Draft::Assistant(a) => info!(
+                    "[gemma4] assistant draft model loaded: {} layers, draft hidden={}, backbone={}",
+                    a.num_layers(),
+                    a.config.text_config.hidden_size,
+                    a.config.backbone_hidden_size,
+                ),
+            }
+            // Materialize the draft's mmap-backed tensors NOW, with the same
+            // chunked mechanism as the target's pass below: left lazy, the
+            // FIRST speculative forward would page-fault the whole multi-GB
+            // checkpoint from cold mmap mid-GPU-work (the qwen3.5 cold-mmap
+            // load-watchdog failure class the target pass exists to prevent).
+            // `collect_weight_arrays` enumerates every checkpoint tensor —
+            // byte-coverage pinned per variant by the
+            // `collect_weight_arrays_covers_every_checkpoint_tensor` tests.
+            let draft_weights = draft.collect_weight_arrays();
+            let draft_refs: Vec<&MxArray> = draft_weights.iter().collect();
+            crate::array::memory::materialize_weights(&draft_refs)?;
+            inner.draft = Some(draft);
+        }
+
         // Deterministic weight-byte total for the cache-limit
         // coordinator. Computed from the still-live `params` map
         // before it is dropped at end-of-function.
@@ -2155,9 +2222,80 @@ impl Gemma4Inner {
                 weight_bytes = weight_bytes.saturating_add(shard.nbytes() as u64);
             }
         }
+        // The draft's checkpoint tensors are model-owned resident weights
+        // too (~GBs of bf16 for the 12B DSpark draft); fold them in so
+        // the cache-limit coordinator sees the true footprint instead of
+        // silently over-granting cache on draft-loaded sessions.
+        if let Some(draft) = inner.draft.as_ref() {
+            weight_bytes = weight_bytes.saturating_add(draft.weight_bytes());
+        }
 
         Ok((inner, weight_bytes))
     }
+}
+
+/// Checkpoint identity fields of a draft config.json, read ONCE by
+/// [`load_draft_variant`] to pick the [`Gemma4Draft`] variant before handing
+/// the directory to that variant's strict loader (which re-parses the full
+/// config under its own schema).
+#[derive(serde::Deserialize)]
+struct DraftKindProbe {
+    #[serde(default)]
+    model_type: Option<String>,
+    #[serde(default)]
+    architectures: Vec<String>,
+}
+
+/// Probe the draft checkpoint's kind and run the matching loader:
+/// `model_type` in [`super::assistant::ASSISTANT_MODEL_TYPES`] routes to the
+/// assistant loader, an `architectures` entry of
+/// [`super::dspark::DSPARK_ARCHITECTURE`] to the DSpark loader; anything
+/// else is a hard error naming both accepted kinds.
+fn load_draft_variant(draft_path: &Path, target: &Gemma4Config) -> Result<Gemma4Draft> {
+    let config_path = draft_path.join("config.json");
+    let raw = fs::read_to_string(&config_path).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to read draft config {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let probe: DraftKindProbe = serde_json::from_str(&raw).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to parse draft config {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    if probe
+        .model_type
+        .as_deref()
+        .is_some_and(|t| super::assistant::ASSISTANT_MODEL_TYPES.contains(&t))
+    {
+        return Ok(Gemma4Draft::Assistant(super::assistant::load_draft_model(
+            draft_path, target,
+        )?));
+    }
+    if probe
+        .architectures
+        .iter()
+        .any(|a| a == super::dspark::DSPARK_ARCHITECTURE)
+    {
+        return Ok(Gemma4Draft::Dspark(super::dspark::load_draft_model(
+            draft_path,
+            target.hidden_size as i64,
+            target.vocab_size as i64,
+            target.num_hidden_layers as usize,
+        )?));
+    }
+    Err(Error::from_reason(format!(
+        "Unrecognized gemma4 draft checkpoint {}: expected an assistant draft (model_type one of \
+         {:?}) or a DSpark draft (architectures containing {:?}); got model_type {:?}, \
+         architectures {:?}",
+        config_path.display(),
+        super::assistant::ASSISTANT_MODEL_TYPES,
+        super::dspark::DSPARK_ARCHITECTURE,
+        probe.model_type,
+        probe.architectures,
+    )))
 }
 
 impl Gemma4Model {
@@ -2165,8 +2303,12 @@ impl Gemma4Model {
     ///
     /// Spawns a dedicated model thread. The init_fn runs all weight loading on
     /// that thread, then the thread enters its command loop.
-    pub async fn load_from_dir(model_path: &str) -> Result<Self> {
+    pub async fn load_from_dir(
+        model_path: &str,
+        options: Option<super::model::Gemma4LoadOptions>,
+    ) -> Result<Self> {
         let model_path = model_path.to_string();
+        let draft_model_path = options.and_then(|o| o.draft_model_path);
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || {
@@ -2177,12 +2319,14 @@ impl Gemma4Model {
                 // sampling — the deterministic path is race-free
                 // against concurrent inference. See `cache_limit.rs`
                 // module docs.
-                let (inner, weight_bytes) = Gemma4Inner::load_from_dir(&model_path)?;
+                let (inner, weight_bytes) =
+                    Gemma4Inner::load_from_dir(&model_path, draft_model_path.as_deref())?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
                 let has_audio = inner.embed_audio.is_some();
                 let paged_active = inner.paged_adapter.is_some();
+                let draft_active = inner.draft.is_some();
                 Ok((
                     inner,
                     (
@@ -2191,13 +2335,14 @@ impl Gemma4Model {
                         has_audio,
                         cache_limit_guard,
                         paged_active,
+                        draft_active,
                     ),
                 ))
             },
             crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
         );
 
-        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active) =
+        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active, draft_active) =
             init_rx
                 .await
                 .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
@@ -2210,6 +2355,7 @@ impl Gemma4Model {
             initialized: true,
             paged_active,
             _cache_limit_guard: Some(cache_limit_guard),
+            draft_active,
         })
     }
 }
@@ -2335,6 +2481,296 @@ mod tests {
             "plain gemma4 must leave unified_vision_config None"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Write a config.json into a fresh temp dir (no weights) for
+    /// `load_from_dir` guard tests that must fail BEFORE any weight I/O.
+    fn write_config_dir(json: serde_json::Value) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_dspark_load_guard_test_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp config dir");
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&json).expect("serialize config json"),
+        )
+        .expect("write config.json");
+        dir
+    }
+
+    /// draft_model_path + an EXPLICIT `use_block_paged_cache: true` is a
+    /// hard load error, surfaced from the config guard BEFORE any weight
+    /// I/O (the temp dir deliberately carries no safetensors).
+    #[test]
+    fn dspark_draft_conflicts_with_explicit_paged_cache() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 },
+            "use_block_paged_cache": true
+        }));
+        let err = match Gemma4Inner::load_from_dir(
+            dir.to_str().expect("utf8 temp dir"),
+            Some("/nonexistent/dspark-draft"),
+        ) {
+            Ok(_) => panic!("explicit paged + draft must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("use_block_paged_cache=true"),
+            "error must name the conflicting flag, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("draft_model_path"),
+            "error must name the draft option, got: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With `use_block_paged_cache` UNSET, a draft request passes the guard
+    /// (the default is forced to flat) — the load then fails later on the
+    /// missing weights, NOT on the conflict guard.
+    #[test]
+    fn dspark_draft_with_unset_paged_flag_passes_the_guard() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 }
+        }));
+        let err = match Gemma4Inner::load_from_dir(
+            dir.to_str().expect("utf8 temp dir"),
+            Some("/nonexistent/dspark-draft"),
+        ) {
+            Ok(_) => panic!("temp dir has no weights; the load must still fail downstream"),
+            Err(e) => e,
+        };
+        assert!(
+            !err.reason.contains("use_block_paged_cache=true"),
+            "unset paged flag must not trip the conflict guard, got: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── draft kind probe (load_draft_variant) ──────────────────────────
+
+    /// Tiny target config for the kind-probe tests: only the geometry the
+    /// variant validators compare matters (hidden 8 / vocab 16 guarantees a
+    /// mismatch against both real-checkpoint-shaped draft configs below).
+    fn probe_target_config() -> Gemma4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "eos_token_ids": []
+        }))
+        .expect("probe target config must deserialize")
+    }
+
+    /// An assistant `model_type` must route to the ASSISTANT loader: the
+    /// error is the assistant validator's distinct geometry mismatch
+    /// against the tiny target, not a DSpark schema/architecture error.
+    #[test]
+    fn draft_probe_routes_assistant_model_type_to_assistant_loader() {
+        let dir = write_config_dir(serde_json::json!({
+            "architectures": ["Gemma4UnifiedAssistantForCausalLM"],
+            "model_type": "gemma4_unified_assistant",
+            "backbone_hidden_size": 3840,
+            "use_ordered_embeddings": false,
+            "tie_word_embeddings": true,
+            "text_config": {
+                "hidden_size": 1024,
+                "intermediate_size": 8192,
+                "num_hidden_layers": 4,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention"
+                ],
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "num_global_key_value_heads": 1,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "attention_k_eq_v": true,
+                "sliding_window": 1024,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 262144,
+                "final_logit_softcapping": null,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default"
+                    }
+                }
+            }
+        }));
+        let err = match load_draft_variant(&dir, &probe_target_config()) {
+            Ok(_) => panic!("a geometry-mismatched assistant draft must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("backbone_hidden_size=3840")
+                && err.reason.contains("does not match target hidden_size=8"),
+            "expected the assistant validator's geometry error, got: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `Gemma4DSparkModel` architecture (and no assistant model_type)
+    /// must still route to the DSPARK loader: the error is the DSpark
+    /// validator's distinct geometry mismatch.
+    #[test]
+    fn draft_probe_routes_dspark_architecture_to_dspark_loader() {
+        let dir = write_config_dir(serde_json::json!({
+            "architectures": ["Gemma4DSparkModel"],
+            "model_type": "gemma4_text",
+            "block_size": 7,
+            "mask_token_id": 4,
+            "hidden_size": 3840,
+            "intermediate_size": 8192,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 16,
+            "global_head_dim": 512,
+            "num_global_key_value_heads": 1,
+            "rms_norm_eps": 1e-6,
+            "final_logit_softcapping": 30.0,
+            "vocab_size": 262144,
+            "target_layer_ids": [0, 2],
+            "num_target_layers": 4,
+            "markov_rank": 2,
+            "markov_head_type": "vanilla",
+            "enable_confidence_head": true,
+            "attention_k_eq_v": true,
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                }
+            }
+        }));
+        let err = match load_draft_variant(&dir, &probe_target_config()) {
+            Ok(_) => panic!("a geometry-mismatched DSpark draft must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("DSpark draft hidden_size=3840")
+                && err.reason.contains("does not match target hidden_size=8"),
+            "expected the DSpark validator's geometry error, got: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A draft config matching NEITHER kind is a hard error naming both
+    /// accepted kinds (so a typo'd checkpoint points at the fix).
+    #[test]
+    fn draft_probe_unknown_kind_errors_naming_both_kinds() {
+        let dir = write_config_dir(serde_json::json!({
+            "architectures": ["SomeOtherModel"],
+            "model_type": "gemma4_text"
+        }));
+        let err = match load_draft_variant(&dir, &probe_target_config()) {
+            Ok(_) => panic!("an unknown draft kind must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("gemma4_assistant")
+                && err.reason.contains("gemma4_unified_assistant")
+                && err.reason.contains("Gemma4DSparkModel"),
+            "the error must name both accepted draft kinds, got: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Loading WITH the draft must report a strictly larger weight-byte
+    /// total to the cache-limit coordinator than loading without — larger
+    /// by EXACTLY the draft checkpoint's tensor bytes (the draft's ~GBs of
+    /// bf16 are model-owned resident weights; omitting them over-grants
+    /// cache on exactly the constrained devices the limit protects).
+    ///
+    /// Run (single-threaded; two sequential full 12B loads):
+    ///
+    /// ```shell
+    /// PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) \
+    /// MLX_TEST_GEMMA4_MODEL_PATH=... MLX_TEST_GEMMA4_DSPARK_PATH=... \
+    ///     cargo test -p mlx-core --lib --release -- --ignored \
+    ///     --test-threads=1 load_with_draft_registers_strictly_larger_weight_bytes
+    /// ```
+    #[test]
+    #[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH + MLX_TEST_GEMMA4_DSPARK_PATH (two full 12B loads)"]
+    fn load_with_draft_registers_strictly_larger_weight_bytes() {
+        let (Ok(model), Ok(draft)) = (
+            std::env::var("MLX_TEST_GEMMA4_MODEL_PATH"),
+            std::env::var("MLX_TEST_GEMMA4_DSPARK_PATH"),
+        ) else {
+            eprintln!("skipping: set MLX_TEST_GEMMA4_MODEL_PATH + MLX_TEST_GEMMA4_DSPARK_PATH");
+            return;
+        };
+        // Two full loads back-to-back: skip the warmup forwards.
+        // SAFETY: env-gated model test, run single-threaded by contract.
+        unsafe { std::env::set_var("GEMMA4_NO_WARMUP", "1") };
+        let plain_bytes = {
+            let (_inner, bytes) =
+                Gemma4Inner::load_from_dir(&model, None).expect("plain 12B load failed");
+            bytes
+        };
+        crate::array::clear_cache();
+        let (inner, with_draft_bytes) =
+            Gemma4Inner::load_from_dir(&model, Some(&draft)).expect("12B + draft load failed");
+        unsafe { std::env::remove_var("GEMMA4_NO_WARMUP") };
+
+        let draft_bytes = inner
+            .draft
+            .as_ref()
+            .expect("draft must be attached")
+            .weight_bytes();
+        assert!(
+            draft_bytes > (1u64 << 30),
+            "the real 12B draft checkpoint is multi-GB, got {draft_bytes} bytes"
+        );
+        assert!(
+            with_draft_bytes > plain_bytes,
+            "draft load must register strictly more weight bytes \
+             (with={with_draft_bytes} without={plain_bytes})"
+        );
+        assert_eq!(
+            with_draft_bytes,
+            plain_bytes.saturating_add(draft_bytes),
+            "the weight-byte delta must be exactly the draft checkpoint's tensor bytes"
+        );
+        println!(
+            "[draft_weight_bytes] without={plain_bytes} with={with_draft_bytes} \
+             draft={draft_bytes}"
+        );
     }
 
     #[test]
@@ -3058,6 +3494,7 @@ mod tests {
                 bits: 2,
                 group_size: 64,
                 mode: PerLayerMode::Affine,
+                input_amax: None,
             },
         );
 
@@ -3127,6 +3564,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         per_layer_quant.insert("layers.0.experts.switch_glu.gate_proj".to_string(), mxfp8);
         per_layer_quant.insert("layers.0.experts.switch_glu.up_proj".to_string(), mxfp8);
@@ -3302,6 +3740,7 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         let packed = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .expect("mxfp8 with affine-default bits must resolve, not error");
@@ -3331,6 +3770,7 @@ mod tests {
             bits: 4,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()
@@ -3353,6 +3793,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         let packed =
             resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
@@ -3374,6 +3815,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         // `.err()` (not `expect_err`) so the success type needs no `Debug` bound
         // (`PackedEmbedParams` holds `Option<&MxArray>`, and `MxArray: !Debug`).
@@ -3397,6 +3839,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()

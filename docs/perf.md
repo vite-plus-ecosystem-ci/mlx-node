@@ -40,8 +40,11 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_NO_COMPILE=1`                                   | Disable compiled C++ forward path (Qwen3.5)                                                                                                                                          |
 | `MLX_EVAL_ALL_CACHES=1`                              | Revert to eval-all-caches (default is token-only)                                                                                                                                    |
 | `MLX_QWEN35_NATIVE_KV_WRITE` / `MLX_NATIVE_KV_WRITE` | Toggle native KV-write optimization on Qwen3.5 attention                                                                                                                             |
+| `MLX_QWEN3_NATIVE_KV_WRITE`                          | Toggle graph-native paged KV write/decode-gather on Qwen3 (plain) dense; default on, falls back to the legacy synchronous path on error                                             |
 | `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`                    | Weight-loading chunk size                                                                                                                                                            |
 | `MLX_GDN_KERNEL=perstep\|chunked`                    | Force GDN recurrence kernel (default per-step on all archs; `chunked` is A/B-only and changes generated tokens by 1–2 bf16 ULP → different greedy continuation on some long prompts) |
+| `MLX_LFM2_CONV_STATE_REUSE`                          | Opt-in (default off): reuse live conv state on warm LFM2 paged continuation instead of reconstructing it, skipping the redundant Pass-1 over the cached prefix. Materially changes warm-turn output (~40 ULP, near-tie argmax may flip); off until oracle-validated |
+| `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION`             | Opt-in (default off): multi-turn LFM2 cache-hit prefill tries the graph-native paged-attention bridge (gather_kv_for_prefill_chunk) before read_kv_range, skipping the forced per-layer pool sync. Held opt-in pending a stable-checkpoint paged-vs-flat gate (fused-vs-masked-SDPA ~1-ULP divergence) |
 
 ### Paged-attention
 
@@ -414,7 +417,9 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 | Scheme       | How it's invoked                                                                                                                                         |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 4-bit affine | `mlx_quantized_matmul` (mode `affine`, configurable group size and bits)                                                                                 |
+| MXFP4        | `--q-mode mxfp4`, or the early-FFN class in `--q-recipe unsloth --q-mxfp`; 4-bit microscaling with group size 32                                         |
 | MXFP8        | `mlx_gather_qmm` with `mode="mxfp8"` (used for MoE expert routing); returns `[quantized, scales]`                                                        |
+| NVFP4        | `--q-recipe unsloth --q-mode nvfp4`; early FFNs use NVFP4 4/16 in the official DGX class map                                                             |
 | FP8 E4M3     | `mlx_dequantize` — dequant **before** expert stacking; no re-quantization after stacking                                                                 |
 | FP8 KV cache | Paged-adapter only — `KVCacheDType::Fp8` with per-layer scale management via `KvScaleManager`. FP8 KV is intentionally rejected by the flat-path attach. |
 
@@ -424,7 +429,10 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 
 - mlx-lm-style mixed-bit: `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`
 - `qwen3_5` — Qwen3.5-tuned recipe
-- `unsloth` — requires imatrix calibration
+- `unsloth` — requires imatrix calibration. `--q-mxfp` selects the official map
+  translated from NVFP4/FP8 to MXFP4/MXFP8; `--q-mode nvfp4` selects the
+  official DGX map with NVFP4/MXFP8. Both use the final-eight FFN split and the
+  same BF16 exclusions. Plain affine alone keeps the legacy Dynamic 2.0 map.
 
 AWQ-style imatrix pre-scaling is supported for improved low-bit quality.
 

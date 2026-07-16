@@ -42,11 +42,12 @@ use crate::engine::vision::VisionMerge;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::nn::{Embedding, Linear, RMSNorm};
+use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
+use super::quantized_linear::LinearProj;
 
 fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
@@ -166,7 +167,7 @@ pub(crate) fn run_paged_prefill_chunk(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -208,7 +209,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -292,6 +293,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 &hidden_states,
                 final_norm,
                 lm_head,
+                embed,
                 embedding_weight,
             )?);
             if let Some(start) = chunk_trace_start {
@@ -361,7 +363,7 @@ fn run_paged_prefill_single_shot(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -389,7 +391,7 @@ fn run_paged_prefill_single_shot(
         cached_rope_deltas,
     )?;
 
-    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Single-turn image-bearing paged prefill.
@@ -415,7 +417,7 @@ pub(crate) fn run_paged_vlm_prefill(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -446,7 +448,7 @@ pub(crate) fn run_paged_vlm_prefill(
         0,
     )?;
 
-    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Paged prefill variant that ALSO returns the post-`final_norm` hidden
@@ -455,14 +457,15 @@ pub(crate) fn run_paged_vlm_prefill(
 ///
 /// Mirror of `chunked_prefill_with_hidden` (dense / flat path). The
 /// paged-MTP gate inside `paged_turn_sync_core_inner` consumes this so
-/// `prefill_mtp_commit` can seed `g_mtp_committed_len = N` before the
+/// `begin_mtp_decode`'s prompt-prefix seed can commit the full prompt
+/// (advancing the stepper's `committed_len` to N) before the
 /// first MTP cycle — without it the MTP draft attends over a
 /// prompt-less context and parity vs the AR run breaks.
 ///
 /// Caller MUST gate on `cached_prefix_len == 0` (the dense gate uses
 /// the same `want_prompt_hidden` predicate). On a cache-reuse turn the
 /// prefill only processes the suffix, so the captured hidden would not
-/// cover the full prompt and `prefill_mtp_commit` cannot use it.
+/// cover the full prompt and the prompt-prefix seed cannot use it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_chunk_with_hidden(
     full_tokens: &[u32],
@@ -473,7 +476,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -510,7 +513,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -600,6 +603,8 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
             let logits = if let Some(head) = lm_head {
                 head.forward(&last_hidden)?
+            } else if embed.is_packed_quantized() {
+                embed.as_linear(&last_hidden)?
             } else {
                 let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                 last_hidden.matmul(&weight_t)?
@@ -664,7 +669,7 @@ fn run_paged_prefill_single_shot_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -697,6 +702,7 @@ fn run_paged_prefill_single_shot_with_hidden(
         &hidden_states,
         final_norm,
         lm_head,
+        embed,
         embedding_weight,
         keep_last_hidden,
     )
@@ -743,6 +749,15 @@ fn run_paged_prefill_one_chunk(
     // and image prefill uses the M-RoPE arm so this is ignored there.
     let rope_position_offset = paged_rope_offset(chunk_first_position, cached_rope_deltas);
 
+    // Shared per-forward-pass scratch slot for the M-RoPE cos/sin precompute
+    // (see `Qwen3_5Attention::forward_paged`'s `mrope_cache` doc comment).
+    // Every `FullAttentionPaged` layer in this loop shares one `position_ids`
+    // array, so the first such layer computes the selected cos/sin and every
+    // later one reuses it instead of recomputing the cos/sin table +
+    // `take_along_axis` gather. Stays `None` (untouched) on the text-only
+    // path where `position_ids` is `None`.
+    let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+
     for (layer_idx, ((layer, cache_slot), kind)) in layers
         .iter_mut()
         .zip(caches.iter_mut())
@@ -767,6 +782,7 @@ fn run_paged_prefill_one_chunk(
             layer_positions,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut mrope_cache,
         )?;
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
     }
@@ -776,7 +792,8 @@ fn run_paged_prefill_one_chunk(
 fn project_last_token_logits(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let seq_len = hidden_states.shape_at(1)?;
@@ -785,6 +802,12 @@ fn project_last_token_logits(
     let h = final_norm.forward(&last_hidden)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        // Tied + packed-quantized embedding: route through the packed
+        // `quantized_matmul` instead of a dense `[vocab, hidden]` transpose
+        // + matmul (the `embedding_weight` fallback below reads a fully
+        // pre-dequantized/on-demand-dequantized dense copy).
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -797,13 +820,14 @@ fn project_last_token_logits(
 /// head, returning `(last_token_logits[vocab], full_chunk_hidden[1, T, hidden])`.
 ///
 /// The paged prefill variant needs every chunk's post-`final_norm` hidden so
-/// the MTP committed-history prefill seed (`prefill_mtp_commit`) gets a
-/// contiguous `[1, prompt_len, hidden]` tensor — mirrors
-/// `chunked_prefill_with_hidden` on the dense path.
+/// the MTP committed-history prompt seed (`prompt_hidden`, consumed by
+/// `begin_mtp_decode`) gets a contiguous `[1, prompt_len, hidden]` tensor —
+/// mirrors `chunked_prefill_with_hidden` on the dense path.
 fn project_last_token_logits_with_full_hidden(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
     keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
@@ -813,6 +837,8 @@ fn project_last_token_logits_with_full_hidden(
     let last_hidden = full_hidden.slice_axis(1, prompt_len - 1, prompt_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&last_hidden)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&last_hidden)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         last_hidden.matmul(&weight_t)?
@@ -827,9 +853,10 @@ fn project_last_token_logits_with_full_hidden(
         full_hidden
     };
 
-    // The caller runs `synchronize_and_clear_cache()` before
-    // `prefill_mtp_commit`, which would otherwise free the lazy graph nodes
-    // backing the kept hidden. Materialise before return.
+    // The caller runs `synchronize_and_clear_cache()` after prefill, before
+    // `begin_mtp_decode` consumes the kept hidden as its prompt-prefix seed
+    // — that sweep would otherwise free the lazy graph nodes backing the
+    // kept hidden. Materialise before return.
     kept_hidden.eval();
     debug_assert_eq!(kept_hidden.shape_at(0)?, 1);
     debug_assert!(kept_hidden.shape_at(1)? >= 1);
@@ -848,7 +875,7 @@ pub(crate) fn run_paged_decode_step(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -893,12 +920,15 @@ pub(crate) fn run_paged_decode_step(
             /* position_ids */ None,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -912,9 +942,9 @@ pub(crate) fn run_paged_decode_step(
 /// Routes full-attention layers through the paged adapter (writing one new K/V
 /// slot into the pool, attending over `read_kv_range(0, total_ctx)`) and GDN
 /// layers through the flat `Qwen3_5LayerCache::Linear` slots in `caches`, the
-/// same split `run_paged_decode_step` uses. The eager analogue of the compiled
-/// `forward_with_hidden` closure that calls `forward_dense_cpp_paged` +
-/// `export_last_hidden_paged`.
+/// same split `run_paged_decode_step` uses. The eager analogue of the deleted
+/// compiled `forward_with_hidden` closure that called `forward_dense_cpp_paged`
+/// + `export_last_hidden_paged`.
 ///
 /// Returns `(logits [1, 1, vocab], hidden [1, hidden])`. The hidden is squeezed
 /// on the time axis to match the eager-flat MTP `forward_with_hidden` contract
@@ -926,7 +956,7 @@ pub(crate) fn run_paged_step_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
@@ -971,16 +1001,22 @@ pub(crate) fn run_paged_step_with_hidden(
             /* position_ids */ None,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 
     let h3 = final_norm.forward(&hidden_states)?;
-    let logits = match (lm_head, embedding_weight_t) {
-        (Some(head), _) => head.forward(&h3)?,
-        (None, Some(wt)) => h3.matmul(wt)?,
-        (None, None) => {
-            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-            h3.matmul(&wt)?
+    let logits = if let Some(head) = lm_head {
+        head.forward(&h3)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h3)?
+    } else {
+        match embedding_weight_t {
+            Some(wt) => h3.matmul(wt)?,
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h3.matmul(&wt)?
+            }
         }
     };
     let hidden = h3.squeeze(Some(&[1]))?;
@@ -992,7 +1028,7 @@ pub(crate) fn run_paged_step_with_hidden(
 /// at every verify position, recording the per-layer GDN tape for the rollback
 /// replay.
 ///
-/// The eager analogue of the compiled `forward_mtp_verify_paged` FFI. The
+/// The eager analogue of the deleted compiled `forward_mtp_verify_paged` FFI. The
 /// `verify_ids` (`[1, K+1]` int32) are recorded into the adapter in ONE
 /// `record_tokens` call (so the new K/V land at logical positions
 /// `[ctx, ctx+K]`), then run through every layer: full-attention via the paged
@@ -1011,7 +1047,7 @@ pub(crate) fn run_paged_verify_step(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
@@ -1080,12 +1116,17 @@ pub(crate) fn run_paged_verify_step(
     }
 
     let hiddens = final_norm.forward(&hidden_states)?;
-    let logits = match (lm_head, embedding_weight_t) {
-        (Some(head), _) => head.forward(&hiddens)?,
-        (None, Some(wt)) => hiddens.matmul(wt)?,
-        (None, None) => {
-            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-            hiddens.matmul(&wt)?
+    let logits = if let Some(head) = lm_head {
+        head.forward(&hiddens)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&hiddens)?
+    } else {
+        match embedding_weight_t {
+            Some(wt) => hiddens.matmul(wt)?,
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                hiddens.matmul(&wt)?
+            }
         }
     };
     Ok(super::mtp_decode::MtpVerifyOutput::logits_only(

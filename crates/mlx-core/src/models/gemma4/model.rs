@@ -8,19 +8,21 @@ use napi_derive::napi;
 
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
-use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup,
     ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
+use crate::engine::plan::{
+    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+    SpeculativePlan,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::profiling::PerformanceMetrics;
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -108,6 +110,7 @@ fn escape_gemma4_content(s: &str) -> String {
 
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
+use super::dspark::DsparkTap;
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -384,14 +387,16 @@ pub(crate) struct Gemma4Inner {
     pub(crate) cached_token_history: Vec<u32>,
     /// Content hash of the image set associated with the live cache. Used
     /// in Step 5c to detect mid-session image changes (which require a
-    /// full session restart). `None` when no session is active or the
-    /// session is text-only.
+    /// full session restart). Cleared after a successful warm text save; use
+    /// `media_session_context` for the media kinds still represented by live
+    /// KV across subsequent continuations.
     pub(crate) cached_image_key: Option<u64>,
     /// Content hash of the audio set associated with the live cache. Audio
     /// counterpart of `cached_image_key`: set after an audio prefill so a
     /// follow-up text delta is rejected (the continue path is text-only) and
-    /// a follow-up audio turn cold-restarts. `None` for text-only / image-only
-    /// sessions.
+    /// a follow-up audio turn cold-restarts. Like the image key, this is
+    /// cleared after a warm text save even though the live media KV remains;
+    /// `media_session_context` is the persistent source of truth.
     pub(crate) cached_audio_key: Option<u64>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
@@ -404,9 +409,45 @@ pub(crate) struct Gemma4Inner {
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Draft model for speculative decoding (`Gemma4LoadOptions::
+    /// draft_model_path`), either [`Gemma4Draft`] variant. Mutually
+    /// exclusive with `paged_adapter`: the load path hard-errors on an
+    /// explicit `use_block_paged_cache: true` conflict and forces the unset
+    /// default to flat, so `draft.is_some()` implies
+    /// `paged_adapter.is_none()`.
+    pub(crate) draft: Option<Gemma4Draft>,
+    /// Per-turn draft handoff: the whole-turn core builds the variant's
+    /// prefill-derived state (DSpark fused-context cache / assistant
+    /// last-prompt hidden) during prefill and stashes it here;
+    /// `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
+    /// stepper (the engine's `DsparkTurnSetup` carries only turn constants,
+    /// so prefill-derived state travels through this seam). Always `None`
+    /// outside a live draft whole-turn.
+    pub(crate) draft_turn_state: Option<super::dspark_decode::Gemma4DraftTurnState>,
+    /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
+    /// computed once here in `Gemma4Inner::new` instead of re-derived
+    /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
+    /// decode-step call. Pure function of the immutable `config`, so it
+    /// never changes for the lifetime of this instance. Empty when
+    /// `paged_adapter` is `None`: every paged-only call site that reads it
+    /// errors out on a `None` adapter before consuming the value.
+    pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
+    /// Media kinds causally represented by the current session's live/persisted
+    /// prefix. Unlike the content-hash keys, this survives every successful
+    /// warm text continuation because those turns extend — rather than replace
+    /// — the media-derived KV. Cleared only when that session is reset or a
+    /// successful turn replaces it (text-only save, or a media cold-start whose
+    /// paged prepare succeeded); a FAILED media prepare must leave it set so
+    /// `session_media()` keeps the stale media-expanded history fail-closed.
+    media_session_context: MediaCapabilities,
+    /// Context handed to the currently executing generic paged text turn.
+    /// `run_paged_turn` snapshots `TurnPlan::context_media` here so
+    /// `save_paged_history` can distinguish a warm media continuation from a
+    /// fresh text replacement without widening the model-neutral trait.
+    paged_text_turn_context: MediaCapabilities,
     /// True only while a media (audio / non-unified image) turn left its
     /// global paged KV live AND a sliding history checkpoint remembered at the
     /// full kept-live prefix, so a follow-up text delta can warm-continue on
@@ -414,9 +455,74 @@ pub(crate) struct Gemma4Inner {
     /// `finalize_vision_turn_media_state` on the continuable branch; reset to
     /// `false` at every non-continuable point (`clear_reuse_state`, both vision
     /// prefill-start blocks, the non-continuable finalize). When `false`, the
-    /// `text_delta_image_guard` rejects a media-session delta as today.
+    /// `text_delta_media_guard` rejects a media-session delta as today.
     media_session_continuable: bool,
     pub(crate) model_id: u64,
+}
+
+/// Describe Gemma's actually wired media paths separately from inputs that
+/// must enter the family backend only to preserve a specific compatibility
+/// error.
+const fn gemma4_media_plan(
+    image_components_loaded: bool,
+    audio_embedder_loaded: bool,
+    paged_adapter_loaded: bool,
+) -> MediaPlan {
+    let images_available = image_components_loaded && paged_adapter_loaded;
+    let audio_available = audio_embedder_loaded && paged_adapter_loaded;
+    MediaPlan::with_backend_validation(
+        MediaCapabilities {
+            images: images_available,
+            audio: audio_available,
+        },
+        MediaCapabilities {
+            // Image input was historically admitted unconditionally so the
+            // Gemma core could distinguish missing vision from missing paged
+            // execution. Keep that family-owned diagnostic.
+            images: true,
+            // Audio was historically admitted only when its embedder existed.
+            // With no paged adapter, the family core owns the compatibility
+            // error; with no embedder, the engine rejects it before render.
+            audio: audio_embedder_loaded,
+        },
+    )
+}
+
+/// Draft-model variant loaded alongside the target for speculative decoding
+/// (`Gemma4LoadOptions::draft_model_path`). The kind probe in
+/// `persistence.rs` picks the variant from the draft checkpoint's
+/// config.json identity fields, then hands the directory to that variant's
+/// strict loader.
+pub(crate) enum Gemma4Draft {
+    /// DeepSpec DSpark external draft: 5-layer cross-attending transformer
+    /// drafting whole masked blocks over a fused target-hidden context
+    /// ([`super::dspark`]).
+    Dspark(super::dspark::DsparkDraftModel),
+    /// Google assistant checkpoint draft: Q-only transformer drafting by
+    /// chained single-token AR steps over the target's committed KV caches
+    /// ([`super::assistant`]).
+    Assistant(super::assistant::AssistantDraftModel),
+}
+
+impl Gemma4Draft {
+    /// Checkpoint tensor bytes for cache-limit accounting (see the variant
+    /// loaders' `weight_bytes` docs for the measurement contract).
+    pub(crate) fn weight_bytes(&self) -> u64 {
+        match self {
+            Self::Dspark(draft) => draft.weight_bytes(),
+            Self::Assistant(draft) => draft.weight_bytes(),
+        }
+    }
+
+    /// Every checkpoint-backed tensor the draft owns, for the post-load
+    /// materialization pass (cheap array-handle clones covering exactly the
+    /// applied checkpoint set — byte-coverage pinned per variant).
+    pub(crate) fn collect_weight_arrays(&self) -> Vec<MxArray> {
+        match self {
+            Self::Dspark(draft) => draft.collect_weight_arrays(),
+            Self::Assistant(draft) => draft.collect_weight_arrays(),
+        }
+    }
 }
 
 /// Gemma 4 dense language model.
@@ -471,6 +577,28 @@ pub struct Gemma4Model {
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// Snapshot of `Gemma4Inner::draft.is_some()` captured at load time
+    /// (same mirroring pattern as `paged_active`): whether a draft model —
+    /// either [`Gemma4Draft`] variant — was loaded via
+    /// `Gemma4LoadOptions::draft_model_path`. Surfaced through the
+    /// `hasMtpWeights()` NAPI method (named for parity with the Qwen3.5
+    /// surface) so server endpoints can branch without a model-thread
+    /// roundtrip. Stubs from `new(config)` always report `false`.
+    pub(crate) draft_active: bool,
+}
+
+/// Optional load-time settings for [`Gemma4Model::load`].
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct Gemma4LoadOptions {
+    /// Directory of a draft checkpoint (config.json + safetensors) to load
+    /// alongside the target model for speculative decoding — either a
+    /// DSpark draft or a Google assistant draft; the kind is probed from
+    /// the draft config.json. Draft decoding runs only on the flat KV-cache
+    /// path: setting this while the model config explicitly enables
+    /// `use_block_paged_cache` is a hard load error, and an unset
+    /// `use_block_paged_cache` is forced to `false`.
+    pub draft_model_path: Option<String>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -971,6 +1099,27 @@ impl Gemma4Inner {
             None
         };
 
+        // Derive the per-layer paged-routing classification once here
+        // instead of on every paged prefill-chunk / decode-step call (see
+        // `compute_layer_kinds_from_kv_cache_specs`'s BTreeMap/BTreeSet
+        // grouping + sort). It's a pure function of `config`, which is
+        // immutable for the lifetime of this `Gemma4Inner`. Only meaningful
+        // when `paged_adapter` is `Some` — every caller first errors out on
+        // a `None` adapter before reading the result, so `Vec::new()` below
+        // is never read in that case. Guaranteed to succeed whenever
+        // `paged_adapter` built above, since that already validated a
+        // strictly stronger constraint (a single full-attention group) over
+        // the same specs.
+        let layer_kinds = if paged_adapter.is_some() {
+            compute_layer_kinds_from_kv_cache_specs(&config).map_err(|e| {
+                Error::from_reason(format!(
+                    "Gemma4Inner::new: failed to derive cached layer-kind routes: {e}"
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -990,12 +1139,39 @@ impl Gemma4Inner {
             cached_image_key: None,
             cached_audio_key: None,
             paged_adapter,
+            draft: None,
+            draft_turn_state: None,
+            layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
+            media_session_context: MediaCapabilities::NONE,
+            paged_text_turn_context: MediaCapabilities::NONE,
             media_session_continuable: false,
             model_id,
         })
+    }
+
+    /// The loaded DSpark draft, when the draft variant is DSpark.
+    pub(crate) fn dspark_draft(&self) -> Option<&super::dspark::DsparkDraftModel> {
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// The loaded assistant draft, when the draft variant is assistant.
+    pub(crate) fn assistant_draft(&self) -> Option<&super::assistant::AssistantDraftModel> {
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Assistant(draft)) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// Whether ANY draft variant is loaded (the speculative whole-turn
+    /// gate; see `mtp_turn`).
+    pub(crate) fn has_draft(&self) -> bool {
+        self.draft.is_some()
     }
 
     /// Initialize the per-turn KV caches in-place.
@@ -1024,17 +1200,17 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Build the per-layer routing list for the paged dispatch.
+    /// Return the per-layer routing list for the paged dispatch.
     ///
-    /// See [`compute_layer_kinds`] (free helper) for full semantics.
-    /// This wrapper is the on-`Gemma4Inner` entry point used by the
-    /// chat-session forward dispatch.
+    /// Cheap clone of `self.layer_kinds`, cached once in `Gemma4Inner::new`
+    /// instead of being re-derived (BTreeMap/BTreeSet grouping + a sort —
+    /// see [`compute_layer_kinds`] (free helper) and
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every call. It's a pure
+    /// function of the immutable `Gemma4Config`, so recomputing it from
+    /// scratch on every paged prefill-chunk / decode-step call was pure
+    /// waste.
     pub(crate) fn compute_layer_kinds(&self) -> Result<Vec<Gemma4LayerKind>> {
-        compute_layer_kinds_from_kv_cache_specs(&self.config).map_err(|e| {
-            Error::from_reason(format!(
-                "Gemma4 compute_layer_kinds: failed to derive KV routes: {e}"
-            ))
-        })
+        Ok(self.layer_kinds.clone())
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -1055,18 +1231,35 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Clear cached token history and image key. Called from both
+    /// Clear cached token history and media identity/context. Called from both
     /// `init_caches_sync` and `reset_caches_sync`.
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_audio_key = None;
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
         self.media_session_continuable = false;
+    }
+
+    /// Publish the raw media identity and the persistent causal context for a
+    /// successfully finalized multimodal turn.
+    fn publish_media_session_context(
+        &mut self,
+        new_image_key: Option<u64>,
+        new_audio_key: Option<u64>,
+    ) {
+        self.cached_image_key = new_image_key;
+        self.cached_audio_key = new_audio_key;
+        self.media_session_context = MediaCapabilities {
+            images: new_image_key.is_some(),
+            audio: new_audio_key.is_some(),
+        };
     }
 
     fn find_gemma4_sliding_history_checkpoint(
@@ -1654,7 +1847,7 @@ impl Gemma4Inner {
     ///
     /// The engine session core owns message-side image extraction
     /// (`engine::session::extract_images_from_messages`) and prompt
-    /// rendering; the raw bytes arrive via [`WholeTurnArgs::images`].
+    /// rendering; the raw bytes arrive via [`WholeTurnArgs::media`].
     /// The "no vision support" rejection surfaces from INSIDE the vision
     /// turn (after render).
     fn prepare_vision_tokens(
@@ -1933,7 +2126,7 @@ impl Gemma4Inner {
     ///   sliding-history checkpoint actually `stored`, AND the adapter is
     ///   `live_for_continue`): the global paged KV is kept live (full blocks
     ///   registered for content-addressed reuse) and the marker is set so
-    ///   `text_delta_image_guard` lets the next text delta through. On that delta
+    ///   `text_delta_media_guard` lets the next text delta through. On that delta
     ///   the global prefix is reused IN-PLACE (`continue_turn` keeps the block
     ///   table, `cachedTokens > 0`, only the new suffix is forwarded — it is NOT
     ///   re-walked) and the sliding caches resolve to `state="live"`
@@ -2029,8 +2222,7 @@ impl Gemma4Inner {
                 // Publish history FIRST: the checkpoint reads its length, and
                 // the next delta's prefix restore matches against it.
                 self.cached_token_history = full_history;
-                self.cached_image_key = new_image_key;
-                self.cached_audio_key = new_audio_key;
+                self.publish_media_session_context(new_image_key, new_audio_key);
                 let history_for_ckpt = self.cached_token_history.clone();
                 let stored = self
                     .remember_gemma4_sliding_history_checkpoint(&history_for_ckpt)
@@ -2069,14 +2261,13 @@ impl Gemma4Inner {
         }
 
         // Non-continuable: release the global KV but keep history + media keys so
-        // a follow-up text delta reaches `text_delta_image_guard`, which rejects
+        // a follow-up text delta reaches `text_delta_media_guard`, which rejects
         // it (marker is false). Matches the vision core's prior behavior.
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
         self.cached_token_history = full_history;
-        self.cached_image_key = new_image_key;
-        self.cached_audio_key = new_audio_key;
+        self.publish_media_session_context(new_image_key, new_audio_key);
         self.media_session_continuable = false;
         Ok(())
     }
@@ -2157,6 +2348,14 @@ impl Gemma4Inner {
         // marker. Reset BEFORE the side-effecting prepare below, which releases
         // any prior kept-live request and can then fail (block exhaustion) via
         // `?` — a stale `true` would wrongly admit a later text delta.
+        // `media_session_context` and `paged_text_turn_context` are deliberately
+        // NOT cleared here: after a warm text continuation the raw media keys
+        // are already gone, so on a failed prepare the persistent context is
+        // the only provenance left over the still-cached media-expanded
+        // history — `text_delta_media_guard` and `verify_cache_prefix` read it
+        // (via `session_media`) to keep rejecting text-only reuse until the TS
+        // floor cold-restarts. Both are cleared with the other reuse state
+        // once the prepare has succeeded.
         self.media_session_continuable = false;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -2176,11 +2375,16 @@ impl Gemma4Inner {
                 .map_err(Error::from_reason)?;
         }
         // Fresh sliding flat caches + clear all reuse/checkpoint state so the
-        // cold prefill starts from an empty context.
+        // cold prefill starts from an empty context. Media provenance
+        // (`media_session_context`, `paged_text_turn_context`) is cleared only
+        // here, once the prepare above has succeeded — a failed prepare must
+        // leave it readable (fail closed).
         self.caches = Some(init_caches_for_config(&self.config));
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_audio_key = None;
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
@@ -2389,6 +2593,14 @@ impl Gemma4Inner {
         // marker. Reset BEFORE the side-effecting prepare below, which releases
         // any prior kept-live request and can then fail (block exhaustion) via
         // `?` — a stale `true` would wrongly admit a later text delta.
+        // `media_session_context` and `paged_text_turn_context` are deliberately
+        // NOT cleared here: after a warm text continuation the raw media keys
+        // are already gone, so on a failed prepare the persistent context is
+        // the only provenance left over the still-cached media-expanded
+        // history — `text_delta_media_guard` and `verify_cache_prefix` read it
+        // (via `session_media`) to keep rejecting text-only reuse until the TS
+        // floor cold-restarts. Both are cleared with the other reuse state
+        // once the prepare has succeeded.
         self.media_session_continuable = false;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -2407,10 +2619,15 @@ impl Gemma4Inner {
                 )
                 .map_err(Error::from_reason)?;
         }
+        // Media provenance (`media_session_context`, `paged_text_turn_context`)
+        // is cleared only here, once the prepare above has succeeded — a failed
+        // prepare must leave it readable (fail closed).
         self.caches = Some(init_caches_for_config(&self.config));
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_audio_key = None;
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
@@ -4421,7 +4638,7 @@ impl Gemma4Inner {
     //
     // Image-change invariant: `chat_session_continue` / `_tool` run on
     // top of the live caches, so they MUST be text-only. If the session
-    // currently carries image state (i.e. `cached_image_key.is_some()`)
+    // currently carries image or audio state (`session_media()` non-empty)
     // we surface an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed
     // error so the TS `ChatSession` layer can route the caller back
     // through a fresh `chat_session_start`.
@@ -4456,10 +4673,10 @@ impl Gemma4Inner {
         Ok(ids[0])
     }
 
-    /// Vision whole-turn dispatch for the engine's
-    /// [`ChatBackend::vision_turn`] probe. Only fresh turns carry
-    /// images (the engine's delta inputs are text-only by construction
-    /// and the delta image guard rejects image-holding sessions), so
+    /// Multimodal whole-turn dispatch for the engine's
+    /// [`ChatBackend::run_multimodal_turn`] handler. Only fresh turns carry
+    /// media (the engine's delta inputs are text-only by construction
+    /// and the delta media guard rejects media-holding sessions), so
     /// the paged cores cold-start unconditionally —
     /// `verify_cache_prefix(.., has_images = true)` forces a miss.
     ///
@@ -4467,7 +4684,7 @@ impl Gemma4Inner {
     /// no paged adapter (explicit `use_block_paged_cache: false`, a
     /// non-Metal build, or paged init failure) has no vision path and
     /// returns an error instead of silently falling back.
-    fn vision_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    fn multimodal_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if self.paged_adapter.is_none() {
             return Err(Error::from_reason(
                 "gemma4 image turns require the block-paged KV backend; the model was loaded \
@@ -4480,8 +4697,8 @@ impl Gemma4Inner {
             (Some(sink), Some(cancelled)) => {
                 self.vision_paged_turn_stream_core(
                     args.tokens,
-                    args.images,
-                    args.audio,
+                    args.media.images,
+                    args.media.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4493,8 +4710,8 @@ impl Gemma4Inner {
             _ => {
                 let result = self.vision_paged_turn_sync_core(
                     args.tokens,
-                    args.images,
-                    args.audio,
+                    args.media.images,
+                    args.media.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4538,6 +4755,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
         // forward returns `[1, 1, vocab]`.
@@ -4573,6 +4791,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         Ok(())
     }
@@ -4780,6 +4999,10 @@ impl PagedBackend for Gemma4Inner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        // `run_paged_turn` snapshots the request planner's context here for
+        // the duration of the executor. Empty means this text turn is a fresh
+        // replacement; non-empty means it extended a media-derived session.
+        let continued_media_context = self.paged_text_turn_context;
         // Save token history ONLY — the adapter's pool owns the K/V.
         // `keep_all` is the flat rule (engine: `finish_reason ==
         // "length"`); when it is false the terminal stop token is dropped
@@ -4796,12 +5019,23 @@ impl PagedBackend for Gemma4Inner {
             };
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
-            // A text save is text-only, so drop any stale media key — mirrors
-            // the flat `save_cache_state` fresh-turn clear. On a warm reuse the
-            // delta image guard already kept these `None`, so this is a no-op;
-            // on a fresh start it clears a key a prior media turn left behind.
+            // A text save carries no new raw media identity, so drop the hash
+            // keys. A warm continuation retains its causal media kinds in
+            // `media_session_context`; a fresh start clears that context below.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            if continued_media_context.is_empty() {
+                // A successful fresh text turn replaced any previous media
+                // session. Its saved/live KV is now genuinely text-only.
+                self.media_session_context = MediaCapabilities::NONE;
+                self.media_session_continuable = false;
+            } else {
+                // A warm text delta extended the same live media prefix. The
+                // raw hash keys are turn-local and intentionally cleared, but
+                // the causal media context must survive every continuation.
+                debug_assert!(self.media_session_continuable);
+                self.media_session_context = continued_media_context;
+            }
             // Sliding-window warm-continue checkpoint keyed on the freshly
             // set history (post-reconcile `request_tokens()` == the trimmed
             // history). Fallible: a checkpoint/eval error aborts the turn so
@@ -4821,6 +5055,8 @@ impl PagedBackend for Gemma4Inner {
             // force an "audio state" restart on the text-only session.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            self.media_session_context = MediaCapabilities::NONE;
+            self.media_session_continuable = false;
         }
         Ok(())
     }
@@ -4912,6 +5148,31 @@ impl ChatBackend for Gemma4Inner {
         // channel segments itself). Defensive: pin `true` so the engine's
         // emitter gate can never suppress.
         p.include_reasoning = true;
+        // Draft depth: with a draft model loaded, `mtpDepth` resolves per
+        // variant — a family-local post-edit of the engine's central
+        // `[1, 5]` clamp (an MTP-head contract that does not apply to
+        // external drafts), always clamping from the RAW config value.
+        //   * DSpark: unset runs full draft blocks (`block_size`, 7 on the
+        //     v1 checkpoint); explicit values clamp to `[1, block_size]`.
+        //   * Assistant: chained AR drafting has no checkpoint-pinned block
+        //     size — unset resolves to `ASSISTANT_DEFAULT_DEPTH`; explicit
+        //     values clamp to `[1, ASSISTANT_MAX_DEPTH]`.
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => {
+                let block_size = draft.config.block_size;
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(block_size),
+                    None => block_size,
+                };
+            }
+            Some(Gemma4Draft::Assistant(_)) => {
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(super::assistant::ASSISTANT_MAX_DEPTH),
+                    None => super::assistant::ASSISTANT_DEFAULT_DEPTH,
+                };
+            }
+            None => {}
+        }
         p
     }
 
@@ -5055,10 +5316,10 @@ impl ChatBackend for Gemma4Inner {
         Ok(())
     }
 
-    /// Prefix-reuse check. The engine routes every image-bearing turn
-    /// through `vision_turn` BEFORE this check, so only the session-side
-    /// image gate (`cached_image_key.is_some()` → miss) is needed here;
-    /// there is no `has_images` parameter.
+    /// Prefix-reuse check. The engine routes every media-bearing turn
+    /// through the multimodal executor BEFORE this check, so only the
+    /// session-side media gate (`session_media()` non-empty → miss) is needed
+    /// here; there is no `has_images` parameter.
     ///
     /// All-or-nothing: returns `0` or `cached.len()` (exact-match falls
     /// through the `hit == tokens.len()` branch in the session core to
@@ -5074,10 +5335,12 @@ impl ChatBackend for Gemma4Inner {
         // keeps prefix reuse strictly aligned with text-only sessions and
         // sidesteps the media-key coordination the Qwen3.5 shared helper
         // handles, while letting a continuable media session reuse an
-        // exactly-cached prefix.
-        if (self.cached_image_key.is_some() || self.cached_audio_key.is_some())
-            && !self.media_session_continuable
-        {
+        // exactly-cached prefix. Held state is `session_media()` (raw keys ∪
+        // persistent `media_session_context`), not the raw keys alone: after a
+        // failed media prepare on a warm-continued session only the context
+        // survives, and the media-expanded cached history must not seed a
+        // text-only prefix hit.
+        if !self.session_media().is_empty() && !self.media_session_continuable {
             return 0;
         }
         // The live KV caches must exist — `cached_token_history` can
@@ -5125,6 +5388,8 @@ impl ChatBackend for Gemma4Inner {
             // structurally `None`.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            self.media_session_context = MediaCapabilities::NONE;
+            self.media_session_continuable = false;
         }
     }
 
@@ -5173,6 +5438,7 @@ impl ChatBackend for Gemma4Inner {
                 &self.final_norm,
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?;
         }
         eval_gemma4_caches(
@@ -5201,6 +5467,7 @@ impl ChatBackend for Gemma4Inner {
                 self.embed_weight_t.as_ref(),
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?
         };
         logits.squeeze(Some(&[1]))
@@ -5250,31 +5517,29 @@ impl ChatBackend for Gemma4Inner {
         })
     }
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
-    }
-
-    /// UNCONDITIONALLY `true` — even for checkpoints without a vision
-    /// tower. Image-bearing messages are accepted on every entry point and
-    /// surface the exact "Images provided but model has no vision support
-    /// (no vision_config in config.json)" error from INSIDE the turn (after
-    /// template rendering); returning `false` here would replace that with
-    /// the engine's typed pre-render restart-prefix error. The error
-    /// surfaces from inside `vision_turn` instead (see
-    /// `prepare_vision_tokens`).
-    fn supports_images(&self) -> bool {
-        true
-    }
-
-    /// Audio support is gated on the unified `embed_audio` projection being
-    /// built at load time (`config.has_audio`). Unlike `supports_images`
-    /// (which is unconditionally `true` so the "no vision support" error
-    /// surfaces from inside the turn), audio is rejected at the pre-render
-    /// guard for non-audio checkpoints: there is no audio entry inside the
-    /// turn to surface a clearer message, and the engine's typed restart
-    /// prefix is the correct contract.
-    fn supports_audio(&self) -> bool {
-        self.embed_audio.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        let paged_available = self.paged_adapter.is_some();
+        let image_components_loaded = (self.vision_tower.is_some()
+            || self.unified_vision_embedder.is_some())
+            && self.embed_vision.is_some()
+            && self.image_processor.is_some();
+        let audio_embedder_loaded = self.embed_audio.is_some();
+        ExecutionPlan {
+            media: gemma4_media_plan(
+                image_components_loaded,
+                audio_embedder_loaded,
+                paged_available,
+            ),
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: self.has_draft().then_some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: false,
+            }),
+        }
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {
@@ -5302,14 +5567,14 @@ impl ChatBackend for Gemma4Inner {
         Box::new(Gemma4Emitter::new())
     }
 
-    /// REJECT text deltas on image-holding sessions despite
-    /// `supports_images() == true`: gemma4's prefix reuse is text-only, so
+    /// REJECT text deltas on media-holding sessions despite the declared
+    /// image capability: gemma4's prefix reuse is text-only, so
     /// a delta on top of an image session would prefill on caches whose
     /// positions include expanded image tokens the history bookkeeping
     /// does not model. The message has NO space after the prefix:
     /// `"{PREFIX}{entry_fn} is text-only; session currently holds image
     /// state"`.
-    fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
+    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
         // Warm-continue: a continuable media turn (audio / non-unified image)
         // kept its global paged KV live + a sliding history checkpoint at the
         // full prefix, so a text delta restores causally on the live media KV.
@@ -5334,12 +5599,12 @@ impl ChatBackend for Gemma4Inner {
         }
         // A continuable media session whose paged request is no longer live
         // must cold-restart, not warm-continue against a released request.
-        // A warm text delta clears `cached_image_key` but leaves the marker
-        // armed, so the key checks below would silently fall through to `None`;
-        // gate on the marker (the true media-held signal) and emit the audio /
-        // image restart message that matches whichever media key still remains.
+        // Gate on the marker (the media-held signal while a continuation is
+        // armed) and use the persistent media context so the image/audio
+        // diagnostic stays correct across repeated continuations, whose warm
+        // text saves cleared the raw `cached_image_key`/`cached_audio_key`.
         if self.media_session_continuable {
-            let media_state = if self.cached_audio_key.is_some() {
+            let media_state = if self.session_media().audio {
                 "audio"
             } else {
                 "image"
@@ -5349,12 +5614,20 @@ impl ChatBackend for Gemma4Inner {
                 engine::IMAGE_CHANGE_RESTART_PREFIX
             ));
         }
-        if self.cached_image_key.is_some() {
+        // Non-continuable media hold: read `session_media()` (raw keys ∪
+        // persistent `media_session_context`), not the raw keys alone. A paged
+        // media prepare that fails AFTER a warm text continuation leaves the
+        // keys `None` (warm saves drop them) and the marker disarmed (the
+        // vision cores reset it ahead of the fallible prepare); the surviving
+        // context is then the only signal that the cached history still holds
+        // media-expanded positions a text-only prefill cannot rebuild.
+        let held = self.session_media();
+        if held.images {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds image state",
                 engine::IMAGE_CHANGE_RESTART_PREFIX
             ))
-        } else if self.cached_audio_key.is_some() {
+        } else if held.audio {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds audio state",
                 engine::IMAGE_CHANGE_RESTART_PREFIX
@@ -5364,11 +5637,11 @@ impl ChatBackend for Gemma4Inner {
         }
     }
 
-    fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
-        // No-op: gemma4 has no MTP heads (acceptance fields stay None) and
-        // its metrics carry no `profile_phases`. The default would only add
-        // profiling-gated extras; keep the payload byte-stable instead.
-    }
+    // `augment_performance` deliberately NOT overridden: the default
+    // (`profiler.fill_mtp_acceptance`) fills the `mtp_*` acceptance fields
+    // after a DSpark turn (and copies `profile_phases` when profiling is
+    // enabled). AR turns record no MTP cycle, so their acceptance fields
+    // stay `None` as before.
 
     fn has_live_session(&self) -> bool {
         // Requires an initialized session: a non-empty
@@ -5376,20 +5649,45 @@ impl ChatBackend for Gemma4Inner {
         !self.cached_token_history.is_empty() && self.caches.is_some()
     }
 
-    fn session_holds_images(&self) -> bool {
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // Keys cover a just-finalized media turn and direct/transitional test
+        // states. `media_session_context` remains authoritative after warm
+        // text saves clear those keys while preserving the same live media KV.
+        self.media_session_context.union(MediaCapabilities {
+            images: self.cached_image_key.is_some(),
+            audio: self.cached_audio_key.is_some(),
+        })
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // Gated on `has_paged_adapter()`; with the adapter live EVERY
-        // text turn (fresh + delta, sync + streaming) takes the generic
-        // paged engine, which drives the adapter lifecycle via
-        // [`PagedBackend`] and reuses the shared `run_decode_loop`.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The execution plan admits every text turn shape (fresh + delta,
+        // sync + streaming) when the adapter is loaded. The generic paged
+        // engine drives the lifecycle via [`PagedBackend`].
+        debug_assert!(args.plan.use_paged_attention);
+        debug_assert!(self.paged_adapter.is_some());
+        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
+        debug_assert!(self.paged_text_turn_context.is_empty());
+        self.paged_text_turn_context = args.plan.context_media;
+        let result = crate::engine::paged_turn::run_paged_turn(self, args);
+        self.paged_text_turn_context = MediaCapabilities::NONE;
+        result
     }
 
-    fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        Some(self.vision_chat_turn(args))
+    /// Draft speculative-decode whole-turn path (either [`Gemma4Draft`]
+    /// variant). The execution plan admits this handler only after request
+    /// opt-in, with a loaded draft, flat KV, and text-only input.
+    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(args.media.is_empty());
+        debug_assert!(matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ));
+        self.draft_chat_turn(args)
+    }
+
+    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(!args.media.is_empty());
+        self.multimodal_chat_turn(args)
     }
 }
 
@@ -5485,6 +5783,7 @@ impl Gemma4Model {
             initialized: false,
             paged_active: false,
             _cache_limit_guard: None,
+            draft_active: false,
         }
     }
 
@@ -5515,10 +5814,61 @@ impl Gemma4Model {
         self.model_id as u32
     }
 
+    /// Whether a draft model — DSpark or Google assistant — is loaded on
+    /// this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+    /// the speculative-decode whole-turn path.
+    ///
+    /// Note: this only reports draft availability. Whether speculative
+    /// decoding actually runs on a given call also requires the per-request
+    /// `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+    /// surface, but it reports an external draft model (either variant),
+    /// not in-checkpoint MTP heads. Stubs from `new(config)` always return
+    /// `false`.
+    #[napi]
+    pub fn has_mtp_weights(&self) -> bool {
+        self.draft_active
+    }
+
     /// Load a Gemma4 model from a directory.
     #[napi]
-    pub async fn load(model_path: String) -> Result<Gemma4Model> {
-        Self::load_from_dir(&model_path).await
+    pub async fn load(
+        model_path: String,
+        options: Option<Gemma4LoadOptions>,
+    ) -> Result<Gemma4Model> {
+        Self::load_from_dir(&model_path, options).await
+    }
+
+    /// Test-only entry point that dispatches `ChatCmd::StreamSessionStart`
+    /// and returns the raw mpsc receiver the model thread writes into, so a
+    /// pure-Rust integration test can exercise the streaming path without a
+    /// NAPI host (same pattern as `Qwen3_5Model::chat_stream_session_start_for_test`).
+    #[doc(hidden)]
+    pub fn chat_stream_session_start_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        thread.send(ChatCmd::StreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
     }
 }
 
@@ -5723,7 +6073,11 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 ///
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
-fn forward_body(
+///
+/// When `tap` is provided, the residual-stream hidden of each tapped layer
+/// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
+/// `layer_ids` order; the compute graph is otherwise unchanged.
+pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
     inputs_embeds: Option<MxArray>,
     embedding: &Embedding,
@@ -5733,7 +6087,22 @@ fn forward_body(
     ple: Option<&PleComponents>,
     per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
+    if let Some(t) = tap.as_deref() {
+        let mut previous: Option<usize> = None;
+        for &id in t.layer_ids {
+            if id >= layers.len() || previous.is_some_and(|prev| id <= prev) {
+                return Err(Error::from_reason(format!(
+                    "forward_body: tap layer_ids {:?} must be strictly ascending decoder indices below {}",
+                    t.layer_ids,
+                    layers.len()
+                )));
+            }
+            previous = Some(id);
+        }
+    }
+
     // Step 1: Embedding (or use pre-computed embeddings)
     let mut h = if let Some(embeds) = inputs_embeds {
         embeds
@@ -5884,6 +6253,15 @@ fn forward_body(
                 shared_kv.insert(i, (keys, values));
             }
         }
+
+        // Residual-stream hidden of layer i (post residual add, pre
+        // final-norm — HF `hidden_states[i + 1]`), captured for both the
+        // regular and the KV-shared branch.
+        if let Some(t) = tap.as_deref_mut()
+            && t.layer_ids.contains(&i)
+        {
+            t.captured.push(h.clone());
+        }
     }
 
     // Final norm
@@ -5893,7 +6271,7 @@ fn forward_body(
 /// Full forward pass: transformer body + lm_head + logit softcapping.
 ///
 /// Used for the final prefill chunk and for each decode step.
-fn forward_inner(
+pub(crate) fn forward_inner(
     input_ids: &MxArray,
     embedding: &Embedding,
     layers: &[Gemma4DecoderLayer],
@@ -5903,6 +6281,7 @@ fn forward_inner(
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
     let h = forward_body(
         Some(input_ids),
@@ -5914,17 +6293,34 @@ fn forward_inner(
         ple,
         None,
         config,
+        tap,
     )?;
+    lm_head_logits(&h, embedding, lm_head, embed_weight_t, config)
+}
 
-    crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &h, None);
+/// LM head + logit softcapping over a post-final-norm hidden state — the
+/// tail `forward_inner` runs after `forward_body`.
+///
+/// Projects through the explicit lm_head when present, otherwise through the
+/// tied embedding table (packed-quantized, pre-transposed, or dense
+/// transpose fallback), then applies `final_logit_softcapping` when the
+/// config sets it.
+pub(crate) fn lm_head_logits(
+    h: &MxArray,
+    embedding: &Embedding,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    config: &Gemma4Config,
+) -> Result<MxArray> {
+    crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", h, None);
 
     // LM head or tied embeddings
     let logits = if let Some(head) = lm_head {
-        head.forward(&h)?
+        head.forward(h)?
     } else if embedding.is_packed_quantized() {
         // Packed tied lm_head: project through the quantized matmul without
         // materializing the dense table.
-        embedding.as_linear(&h)?
+        embedding.as_linear(h)?
     } else if let Some(w_t) = embed_weight_t {
         h.matmul(w_t)?
     } else {
@@ -5947,9 +6343,135 @@ fn forward_inner(
     }
 }
 
+/// Run the target over a `[1, T]` verify block at the current cache offset,
+/// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
+///
+/// This is exactly the existing T>1-at-offset forward (`forward_inner`, with
+/// the same masks/rope the chunked prefill uses). It does not sample and
+/// touches no history bookkeeping; caches advance by T. Callers pair it with
+/// `snapshot_before_verify` / `commit_after_verify` for rollback.
+pub(crate) fn dspark_verify_forward(
+    block_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+    tap: &mut DsparkTap<'_>,
+) -> Result<MxArray> {
+    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
+        return Err(Error::from_reason(format!(
+            "dspark_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
+            block_ids.shape()?.as_ref()
+        )));
+    }
+    forward_inner(
+        block_ids,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embed_weight_t,
+        ple,
+        config,
+        Some(tap),
+    )
+}
+
+/// Run the target over a `[1, T]` verify block at the current cache offset
+/// and return the `[1, T, vocab]` softcapped logits together with the
+/// `[1, T, hidden]` post-final-norm hidden state (the assistant draft chains
+/// its next round's `h_prev` from the hidden at the last kept slot).
+///
+/// Same forward as [`dspark_verify_forward`] minus the residual-stream tap:
+/// it does not sample and touches no history bookkeeping; caches advance by
+/// T. Callers pair it with `snapshot_before_verify` / `commit_after_verify`
+/// for rollback.
+pub(crate) fn assistant_verify_forward(
+    block_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+) -> Result<(MxArray, MxArray)> {
+    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
+        return Err(Error::from_reason(format!(
+            "assistant_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
+            block_ids.shape()?.as_ref()
+        )));
+    }
+    let hidden = forward_body(
+        Some(block_ids),
+        None,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        ple,
+        None,
+        config,
+        None,
+    )?;
+    let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
+    Ok((logits, hidden))
+}
+
+/// Shared-slot mask for `snapshot_before_verify`, index-aligned with the
+/// per-layer caches vec: entry i is true iff decoder layer i is KV-shared.
+/// Shared layers read their anchor layer's cache; their own vec entry is
+/// never written by a forward pass.
+pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
+    (0..config.num_hidden_layers as usize)
+        .map(|i| config.is_kv_shared_layer(i))
+        .collect()
+}
+
+/// Target-layer indices whose KV caches the assistant draft reads: one
+/// source per attention type, index-aligned with the per-layer caches vec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssistantKvSources {
+    pub sliding: usize,
+    pub full: usize,
+}
+
+/// Resolve the assistant draft's K/V source layers: for each attention type,
+/// the LAST non-KV-shared target layer of that type — the max index
+/// `i < config.first_kv_shared_layer()` whose `layer_types` entry equals the
+/// type string exactly, the same matching `should_store_shared_kv` uses to
+/// mark anchors. Layers with a missing or unrecognized `layer_types` entry
+/// match neither type. With KV sharing enabled these are exactly the anchor
+/// layers `should_store_shared_kv` marks; without sharing they are simply
+/// the last layer of each type. Errors when the non-shared prefix lacks
+/// either attention type — the draft needs one K/V source per type.
+pub(crate) fn assistant_kv_source_indices(config: &Gemma4Config) -> Result<AssistantKvSources> {
+    let first_shared = config.first_kv_shared_layer();
+    let last_below_boundary = |layer_type: &str| {
+        (0..first_shared).rfind(|&i| config.layer_types.get(i).is_some_and(|t| t == layer_type))
+    };
+    let sliding = last_below_boundary("sliding_attention").ok_or_else(|| {
+        Error::from_reason(format!(
+            "assistant KV source mapping: no non-KV-shared sliding_attention layer in layers 0..{first_shared}"
+        ))
+    })?;
+    let full = last_below_boundary("full_attention").ok_or_else(|| {
+        Error::from_reason(format!(
+            "assistant KV source mapping: no non-KV-shared full_attention layer in layers 0..{first_shared}"
+        ))
+    })?;
+    Ok(AssistantKvSources { sliding, full })
+}
+
 /// Compute PLE (per-layer embeddings) from input_ids.
 /// Returns shape [B, T, num_layers, ple_dim].
-fn compute_ple(
+pub(crate) fn compute_ple(
     input_ids: &MxArray,
     h: &MxArray,
     ple: &PleComponents,
@@ -6214,7 +6736,7 @@ fn gemma4_default_paged_cache_memory_mb(
 /// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
 /// which can GPU-timeout with very large graphs. Using 512 keeps individual
 /// command buffers under Metal's timeout limit.
-const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
+pub(crate) const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
@@ -6629,7 +7151,7 @@ fn gemma4_paged_prefill_body_chunk_plan_inner(
 
 /// Evaluate all Gemma4 cache arrays to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
+pub(crate) fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
     let mut arrays: Vec<&MxArray> = Vec::new();
     for cache in caches {
         cache.collect_cache_arrays(&mut arrays);
@@ -6672,6 +7194,7 @@ fn prefill_body_gemma4(
     final_norm: &RMSNorm,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
 
@@ -6717,6 +7240,7 @@ fn prefill_body_gemma4(
             ple,
             chunk_ple.as_ref(),
             config,
+            tap.as_deref_mut(),
         )?;
         eval_gemma4_caches(caches)?;
         crate::array::clear_cache();
@@ -6741,6 +7265,7 @@ fn prefill_body_gemma4(
             ple,
             remaining_ple.as_ref(),
             config,
+            tap,
         )?;
     }
 
@@ -6916,6 +7441,41 @@ mod tests {
             image_token_id,
             audio_token_id
         ));
+    }
+
+    #[test]
+    fn gemma4_media_plan_separates_availability_from_backend_validation() {
+        let text_only_flat = gemma4_media_plan(false, false, false);
+        assert_eq!(text_only_flat.available, MediaCapabilities::NONE);
+        assert_eq!(text_only_flat.backend_validated, MediaCapabilities::IMAGES);
+
+        let image_flat = gemma4_media_plan(true, false, false);
+        assert_eq!(image_flat.available, MediaCapabilities::NONE);
+        assert_eq!(image_flat.backend_validated, MediaCapabilities::IMAGES);
+
+        let audio_flat = gemma4_media_plan(false, true, false);
+        assert_eq!(audio_flat.available, MediaCapabilities::NONE);
+        assert_eq!(
+            audio_flat.backend_validated,
+            MediaCapabilities::IMAGES_AND_AUDIO
+        );
+
+        let media_paged = gemma4_media_plan(true, true, true);
+        assert_eq!(media_paged.available, MediaCapabilities::IMAGES_AND_AUDIO);
+        assert_eq!(media_paged.backend_validated, MediaCapabilities::NONE);
+
+        let missing_image_components_paged = gemma4_media_plan(false, true, true);
+        assert_eq!(
+            missing_image_components_paged.available,
+            MediaCapabilities {
+                images: false,
+                audio: true,
+            }
+        );
+        assert_eq!(
+            missing_image_components_paged.backend_validated,
+            MediaCapabilities::IMAGES
+        );
     }
 
     /// Pins the composition order `prepare_multimodal_tokens` relies on: on the
@@ -7792,7 +8352,7 @@ mod tests {
         inner.media_session_continuable = false;
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "clean session must not reject a text delta"
         );
@@ -7803,7 +8363,7 @@ mod tests {
         inner.cached_audio_key = None;
         inner.media_session_continuable = false;
         let image_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("text delta after non-continuable image turn must reject");
         assert!(
             image_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7820,7 +8380,7 @@ mod tests {
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = false;
         let audio_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("text delta after non-continuable audio turn must reject");
         assert!(
             audio_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7839,7 +8399,7 @@ mod tests {
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = true;
         let audio_not_live_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("continuable audio session with no live request must REJECT");
         assert!(
             audio_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7857,7 +8417,7 @@ mod tests {
         inner.cached_audio_key = None;
         inner.media_session_continuable = true;
         let image_not_live_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("continuable image session with no live request must REJECT");
         assert!(
             image_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7875,7 +8435,7 @@ mod tests {
     /// must clear `cached_audio_key`, exactly as the flat `save_cache_state`
     /// does on a fresh turn. Without that clear, a text-only paged start over a
     /// reused model whose prior turn was audio would leave `cached_audio_key`
-    /// stale, and the next text delta's `text_delta_image_guard` would wrongly
+    /// stale, and the next text delta's `text_delta_media_guard` would wrongly
     /// force an "audio state" restart on the text-only session. This pins the
     /// fix: pre-fix the post-save key would stay `Some` and the guard would
     /// return the audio-state restart string, failing both asserts below.
@@ -7920,10 +8480,212 @@ mod tests {
         // session. Pre-fix this would be `Some("…holds audio state")`.
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "after a text-only paged save the guard must not force an audio restart"
         );
+    }
+
+    /// A warm text save clears the raw image/audio hash keys, but it extends
+    /// the same live media-derived KV. The exact media kinds therefore remain
+    /// visible to the next delta planner across any number of continuations.
+    /// This exercises image-only, audio-only, and combined contexts without a
+    /// real paged adapter; the no-adapter guard also proves the preserved
+    /// context retains the existing modality-specific restart wording.
+    #[test]
+    fn test_media_context_survives_repeated_warm_text_saves() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let cases = [
+            (MediaCapabilities::IMAGES, Some(11), None, "image state"),
+            (MediaCapabilities::AUDIO, None, Some(22), "audio state"),
+            (
+                MediaCapabilities::IMAGES_AND_AUDIO,
+                Some(33),
+                Some(44),
+                "audio state",
+            ),
+        ];
+
+        for (context, image_key, audio_key, expected_state) in cases {
+            inner.clear_reuse_state();
+            inner.publish_media_session_context(image_key, audio_key);
+            inner.media_session_continuable = true;
+            assert_eq!(inner.session_media(), context);
+
+            for turn in 0..2u32 {
+                // Mirrors `run_paged_turn` handing the planner's prior context
+                // to `save_paged_history` for a successful warm text delta.
+                inner.paged_text_turn_context = inner.session_media();
+                inner
+                    .save_paged_history(&[10, 11, turn], &[20, 21], false, true)
+                    .expect("warm text paged save must succeed");
+
+                assert!(inner.cached_image_key.is_none());
+                assert!(inner.cached_audio_key.is_none());
+                assert_eq!(
+                    inner.session_media(),
+                    context,
+                    "turn {turn} must preserve the media-derived context"
+                );
+                assert!(inner.media_session_continuable);
+
+                // This fixture has no adapter, so the guard must reject. Its
+                // unchanged error format should still name the true context
+                // after the raw keys have been cleared.
+                let reject = inner
+                    .text_delta_media_guard("chat_session_continue")
+                    .expect("not-live media context must request a restart");
+                assert!(reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX));
+                assert!(reject.contains(expected_state), "got: {reject}");
+            }
+        }
+    }
+
+    /// A failed paged media prepare must fail CLOSED. The vision cores disarm
+    /// `media_session_continuable` BEFORE the fallible adapter prepare (a
+    /// stale armed marker could wrongly warm-continue) but clear
+    /// `media_session_context` only after it succeeds, so a `?`-return from
+    /// the prepare leaves exactly: marker disarmed, raw keys `None` (a prior
+    /// warm text save already dropped them), context still set, and the
+    /// media-expanded `cached_token_history` intact. Both delta gates must
+    /// reject from that surviving context alone — `text_delta_media_guard`
+    /// with the typed restart error and `verify_cache_prefix` with a forced
+    /// miss. The counterfactual block pins that the context is load-bearing:
+    /// wiping it (the pre-fix failure state) silently admits the delta.
+    ///
+    /// The state is built with the real transition functions
+    /// (`publish_media_session_context` → warm `save_paged_history` → the
+    /// marker disarm the vision cores perform ahead of the prepare); driving
+    /// `vision_paged_turn_sync_core` itself to the failing prepare needs a
+    /// real tokenizer file, which unit tests do not have.
+    #[test]
+    fn test_failed_media_prepare_fails_closed_after_warm_continuation() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        // Live caches so the prefix check below can only miss via the media
+        // gate (not via `caches.is_none()`).
+        inner
+            .init_caches_sync()
+            .expect("init_caches_sync must succeed");
+
+        // Warm-continued image session: the media turn's finalize published
+        // keys + context and armed the marker, then a warm text save dropped
+        // the raw keys while preserving the context.
+        inner.publish_media_session_context(Some(11), None);
+        inner.media_session_continuable = true;
+        inner.paged_text_turn_context = inner.session_media();
+        inner
+            .save_paged_history(&[100, 101, 102], &[103, 104], false, true)
+            .expect("warm text paged save must succeed");
+        // Mirrors `run_paged_turn` resetting the turn-scoped snapshot.
+        inner.paged_text_turn_context = MediaCapabilities::NONE;
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_audio_key.is_none());
+        assert_eq!(inner.session_media(), MediaCapabilities::IMAGES);
+
+        // `keep_all = false` dropped the trailing stop token 104.
+        assert_eq!(inner.cached_token_history, vec![100, 101, 102, 103]);
+        let delta_tokens: Vec<u32> = vec![100, 101, 102, 103, 200];
+
+        // While the continuation is armed the media gate does not force a
+        // prefix miss (warm reuse stays possible).
+        assert_eq!(
+            inner.verify_cache_prefix(&delta_tokens, true),
+            inner.cached_token_history.len(),
+            "an armed continuation must not be forced to miss"
+        );
+
+        // The next media turn's failure window: the vision cores disarm the
+        // marker, then the paged prepare fails and returns before the
+        // success-only clears — history and context survive untouched.
+        inner.media_session_continuable = false;
+
+        let reject = inner
+            .text_delta_media_guard("chat_session_continue")
+            .expect("a text delta after a failed media prepare must fail closed");
+        assert!(
+            reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "failed-prepare rejection must carry the restart prefix, got: {reject}"
+        );
+        assert!(
+            reject.contains("image state"),
+            "failed-prepare rejection must name the surviving context, got: {reject}"
+        );
+        assert_eq!(
+            inner.verify_cache_prefix(&delta_tokens, true),
+            0,
+            "the media-expanded history must not seed a text-only prefix hit"
+        );
+
+        // Counterfactual — the pre-fix failure state (context wiped alongside
+        // the marker): both gates silently admit the delta over the stale
+        // media-expanded history, which is exactly the fail-open this ordering
+        // prevents.
+        inner.media_session_context = MediaCapabilities::NONE;
+        assert!(
+            inner
+                .text_delta_media_guard("chat_session_continue")
+                .is_none(),
+            "without the surviving context the guard admits — the context is load-bearing"
+        );
+        assert_eq!(
+            inner.verify_cache_prefix(&delta_tokens, true),
+            inner.cached_token_history.len(),
+            "without the surviving context the stale history reads as a text prefix hit"
+        );
+    }
+
+    #[test]
+    fn test_fresh_text_save_replaces_persistent_media_context() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        inner.publish_media_session_context(Some(11), Some(22));
+        inner.media_session_continuable = true;
+        // Fresh plans carry no prior context. A successful text save therefore
+        // replaces, rather than extends, the old media session.
+        inner.paged_text_turn_context = MediaCapabilities::NONE;
+        inner
+            .save_paged_history(&[1, 2, 3], &[4, 5], false, true)
+            .expect("fresh text paged save must succeed");
+
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert!(!inner.media_session_continuable);
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_audio_key.is_none());
     }
 
     /// Image/audio symmetry in `verify_cache_prefix`: a non-continuable session
@@ -8017,18 +8779,28 @@ mod tests {
             "marker must default to false on construction"
         );
 
-        // clear_reuse_state resets the marker.
+        // clear_reuse_state resets the marker and both persistent/transient
+        // media context sources.
+        inner.publish_media_session_context(Some(7), Some(8));
+        inner.paged_text_turn_context = MediaCapabilities::IMAGES_AND_AUDIO;
         inner.media_session_continuable = true;
         inner.clear_reuse_state();
         assert!(
             !inner.media_session_continuable,
             "clear_reuse_state must reset the continuable marker"
         );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert_eq!(
+            inner.paged_text_turn_context,
+            MediaCapabilities::NONE,
+            "clear_reuse_state must clear transient turn context"
+        );
 
         // reset_caches_sync (which calls clear_reuse_state) resets the marker
         // AND nulls caches → has_live_session() false → a delta cannot continue.
+        inner.publish_media_session_context(None, Some(9));
+        inner.paged_text_turn_context = MediaCapabilities::AUDIO;
         inner.media_session_continuable = true;
-        inner.cached_audio_key = Some(9);
         inner
             .reset_caches_sync()
             .expect("reset_caches_sync must succeed");
@@ -8040,11 +8812,12 @@ mod tests {
             inner.cached_audio_key.is_none(),
             "reset_caches_sync must clear the media key"
         );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
         // After reset, even toggling the marker can't allow a delta: the
         // session is dead (no live caches), and the reset already cleared it.
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "post-reset session holds no media key → guard returns None (no media to reject)"
         );
@@ -8884,6 +9657,158 @@ mod tests {
         }
     }
 
+    /// Element-wise comparison for `Gemma4LayerKind`, which intentionally
+    /// does not derive `PartialEq` (mirrors `Lfm2LayerKind`, which doesn't
+    /// either — this codebase's existing tests compare these routing enums
+    /// via `matches!`/`match`, not `assert_eq!`).
+    fn layer_kind_matches(a: &super::Gemma4LayerKind, b: &super::Gemma4LayerKind) -> bool {
+        use super::Gemma4LayerKind::*;
+        match (a, b) {
+            (Sliding, Sliding) => true,
+            (GlobalPaged { paged_idx: x }, GlobalPaged { paged_idx: y }) => x == y,
+            (
+                SharedOnGlobal {
+                    anchor_paged_idx: x,
+                },
+                SharedOnGlobal {
+                    anchor_paged_idx: y,
+                },
+            ) => x == y,
+            (
+                SharedOnSliding {
+                    anchor_layer_idx: x,
+                },
+                SharedOnSliding {
+                    anchor_layer_idx: y,
+                },
+            ) => x == y,
+            _ => false,
+        }
+    }
+
+    /// `Gemma4Inner::new` must cache `layer_kinds` once instead of
+    /// re-deriving it (BTreeMap/BTreeSet grouping + a sort, see
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every paged
+    /// prefill-chunk / decode-step call. The cached field must always equal
+    /// a fresh from-scratch computation over the same config — covers
+    /// all-global, hybrid sliding+global, and KV-shared layouts (mirrors
+    /// the three `test_compute_layer_kinds_*` cases above).
+    #[test]
+    fn test_gemma4_inner_caches_layer_kinds_matching_fresh_compute() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+
+        let all_global = super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec!["full_attention".to_string(); 4],
+            ..paged_tiny_config(Some(true))
+        };
+
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let hybrid = super::Gemma4Config {
+            num_hidden_layers: 10,
+            layer_types: (0..10).map(|i| cycle[i % 5].clone()).collect(),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let shared_layer_types: Vec<String> = (0..8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        let kv_shared = super::Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types: shared_layer_types,
+            num_kv_shared_layers: Some(4),
+            ..paged_tiny_config(Some(true))
+        };
+
+        for cfg in [all_global, hybrid, kv_shared] {
+            let expected = super::compute_layer_kinds_from_kv_cache_specs(&cfg)
+                .expect("fresh layer-kind computation must succeed for a valid paged config");
+            let inner = match super::Gemma4Inner::new(cfg) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("No Metal device found") {
+                        eprintln!("skipping (no Metal device): {msg}");
+                        return;
+                    }
+                    panic!("unexpected Gemma4Inner::new failure: {msg}");
+                }
+            };
+            assert!(
+                inner.paged_adapter.is_some(),
+                "test configs force use_block_paged_cache=true"
+            );
+            assert_eq!(
+                inner.layer_kinds.len(),
+                expected.len(),
+                "cached layer_kinds length must match a fresh compute"
+            );
+            for (i, (got, want)) in inner.layer_kinds.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    layer_kind_matches(got, want),
+                    "layer {i}: cached layer_kinds diverged from fresh compute: \
+                     got {got:?}, want {want:?}"
+                );
+            }
+        }
+    }
+
+    /// Manual timing probe (not a correctness gate — `#[ignore]`d so it
+    /// never runs in CI). Measures the per-call cost this task eliminates:
+    /// re-deriving the routing table from scratch (BTreeMap/BTreeSet + sort)
+    /// vs. the cached `Vec::clone`. Pure CPU, no GPU/model weights, immune
+    /// to thermal throttling. Run with:
+    /// `cargo test -p mlx-core --release --lib -- --ignored --nocapture \
+    ///  bench_layer_kinds_manual`
+    #[test]
+    #[ignore]
+    fn bench_layer_kinds_manual() {
+        // Scaled to ~48 layers with a realistic 5:1 sliding:global cycle
+        // and KV-sharing, so the BTreeMap/BTreeSet grouping + sort has a
+        // realistic amount of work to do.
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 48,
+            layer_types: (0..48).map(|i| cycle[i % 5].clone()).collect(),
+            num_kv_shared_layers: Some(8),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let n: u32 = 200_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                super::compute_layer_kinds_from_kv_cache_specs(std::hint::black_box(&cfg)).unwrap(),
+            );
+        }
+        eprintln!("recompute: {:?}/call", start.elapsed() / n);
+
+        let cached = super::compute_layer_kinds_from_kv_cache_specs(&cfg).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(std::hint::black_box(&cached).clone());
+        }
+        eprintln!("cached clone: {:?}/call", start.elapsed() / n);
+    }
+
     #[test]
     fn test_compute_layer_kv_cache_specs_group_full_sliding_and_shared_aliases() {
         let layer_types: Vec<String> = (0..8)
@@ -9215,5 +10140,645 @@ mod tool_delta_marker_tests {
             occurrences, 1,
             "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
         );
+    }
+}
+
+#[cfg(test)]
+mod dspark_tap_tests {
+    //! Tap purity: threading a `DsparkTap` through the Gemma4 forward
+    //! paths must leave the compute graph byte-identical to a tap-less
+    //! run, while capturing the residual-stream hiddens of the tapped
+    //! layers. Runs a tiny random-weight Gemma4 (4 layers, hybrid
+    //! sliding/global types, one KV-shared layer) through the REAL
+    //! `forward_body` / `forward_inner` / `dspark_verify_forward` paths.
+
+    use super::*;
+    use crate::models::gemma4::dspark::DsparkTap;
+
+    fn tiny_config() -> Gemma4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+        }))
+        .expect("tiny Gemma4 config must deserialize")
+    }
+
+    pub(super) fn tiny_model(
+        config: &Gemma4Config,
+    ) -> (Embedding, Vec<Gemma4DecoderLayer>, RMSNorm) {
+        let embedding =
+            Embedding::new(config.vocab_size as u32, config.hidden_size as u32).unwrap();
+        let layers: Vec<Gemma4DecoderLayer> = (0..config.num_hidden_layers as usize)
+            .map(|i| Gemma4DecoderLayer::new(config, i).unwrap())
+            .collect();
+        let final_norm =
+            RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps)).unwrap();
+        (embedding, layers, final_norm)
+    }
+
+    pub(super) fn assert_bitwise_eq(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        assert_eq!(
+            a.shape().unwrap().to_vec(),
+            b.shape().unwrap().to_vec(),
+            "{ctx}: shape"
+        );
+        let a_bits: Vec<u32> = a
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let b_bits: Vec<u32> = b
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(a_bits, b_bits, "{ctx}: bits");
+    }
+
+    #[test]
+    fn dspark_tap_purity_and_verify_forward() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+
+        // 6-token prefill then a 3-token verify block: the block runs
+        // T>1 at offset 6, which also crosses the sliding window (6+3 > 8)
+        // so the windowed-mask path is exercised.
+        let prefill_ids = MxArray::from_int32(&[3, 9, 17, 25, 33, 41], &[1, 6]).unwrap();
+        let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
+
+        // Pass A: no tap.
+        let mut caches_a = init_caches_for_config(&config);
+        let hidden_a = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        let logits_a = forward_inner(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+
+        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1),
+        // with the real snapshot → verify → commit flow around the verify.
+        let layer_ids = [0usize, 2, 3];
+        let shared_slots = dspark_shared_slot_mask(&config);
+        assert_eq!(
+            shared_slots,
+            vec![false, false, false, true],
+            "config-derived shared-slot mask"
+        );
+        let mut caches_b = init_caches_for_config(&config);
+        let mut prefill_tap = DsparkTap::new(&layer_ids);
+        let hidden_b = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            None,
+            None,
+            &config,
+            Some(&mut prefill_tap),
+        )
+        .unwrap();
+        let rollback = super::super::layer_cache::snapshot_before_verify(
+            &caches_b,
+            block_ids.shape_at(1).unwrap() as usize,
+            &shared_slots,
+        )
+        .unwrap();
+        let mut verify_tap = DsparkTap::new(&layer_ids);
+        let logits_b = dspark_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            &mut verify_tap,
+        )
+        .unwrap();
+
+        // Tap must not perturb the compute graph.
+        assert_bitwise_eq(&hidden_a, &hidden_b, "prefill hidden");
+        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
+        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 64]);
+
+        // One [B, T, hidden] capture per tapped layer, per forward call.
+        assert_eq!(prefill_tap.captured.len(), layer_ids.len());
+        for arr in &prefill_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 6, 32]);
+        }
+        assert_eq!(verify_tap.captured.len(), layer_ids.len());
+        for arr in &verify_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 3, 32]);
+        }
+
+        // Different layers must yield different hiddens (real per-layer
+        // captures, not one array pushed repeatedly).
+        let first = verify_tap.captured[0].to_float32().unwrap().to_vec();
+        let second = verify_tap.captured[1].to_float32().unwrap().to_vec();
+        assert_ne!(first, second, "captures must differ across layers");
+
+        // Caches advance by T on both passes; the KV-shared layer's own
+        // vec entry is never written (it reads its anchor's cache).
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
+            assert_eq!(caches_a[idx].get_offset(), 9, "cache {idx} tapless offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched"
+        );
+
+        // Partial-keep commit on the real model: active caches land at
+        // prefill + keep, the shared slot stays untouched.
+        super::super::layer_cache::commit_after_verify(&mut caches_b, &rollback, 1).unwrap();
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched after commit"
+        );
+    }
+
+    #[test]
+    fn dspark_tap_rejects_unsorted_or_out_of_range_layer_ids() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let ids = MxArray::from_int32(&[3, 9], &[1, 2]).unwrap();
+
+        for bad in [vec![2usize, 0], vec![1, 1], vec![7]] {
+            let mut caches = init_caches_for_config(&config);
+            let mut tap = DsparkTap::new(&bad);
+            let result = forward_body(
+                Some(&ids),
+                None,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                None,
+                None,
+                &config,
+                Some(&mut tap),
+            );
+            assert!(result.is_err(), "layer_ids {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dspark_verify_forward_rejects_bad_block_shape() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let layer_ids = [0usize];
+
+        // Batch > 1 is rejected.
+        let batch2 = MxArray::from_int32(&[1, 2], &[2, 1]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &batch2,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
+        );
+
+        // 1-D input is rejected.
+        let flat = MxArray::from_int32(&[1, 2], &[2]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &flat,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod assistant_seam_tests {
+    //! Target-side seams for the assistant draft model: the K/V source
+    //! mapping (which target caches the draft reads), the extracted
+    //! `lm_head_logits` tail, and `assistant_verify_forward` (verify logits
+    //! plus the post-final-norm hidden the draft chains from). Runs a tiny
+    //! random-weight Gemma4 (4 hybrid layers, one KV-shared) through the
+    //! REAL forward paths.
+
+    use super::dspark_tap_tests::{assert_bitwise_eq, tiny_model};
+    use super::*;
+    use crate::models::gemma4::dspark::DsparkTap;
+
+    /// Tiny flat-path Gemma4 config (mirrors the DSpark decode tests):
+    /// 4 hybrid layers, one KV-shared.
+    fn tiny_target_config() -> Gemma4Config {
+        serde_json::from_value(tiny_target_config_value())
+            .expect("tiny Gemma4 config must deserialize")
+    }
+
+    fn tiny_target_config_value() -> serde_json::Value {
+        serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+            "use_block_paged_cache": false,
+            "eos_token_ids": []
+        })
+    }
+
+    /// [`tiny_target_config`] with overridden layer types and KV sharing
+    /// (the two inputs `assistant_kv_source_indices` reads).
+    fn hybrid_config(layer_types: &[&str], num_kv_shared_layers: Option<i32>) -> Gemma4Config {
+        let mut v = tiny_target_config_value();
+        v["layer_types"] = serde_json::json!(layer_types);
+        v["num_hidden_layers"] = serde_json::json!(layer_types.len());
+        match num_kv_shared_layers {
+            Some(n) => v["num_kv_shared_layers"] = serde_json::json!(n),
+            None => {
+                v.as_object_mut()
+                    .expect("tiny config value is an object")
+                    .remove("num_kv_shared_layers");
+            }
+        }
+        serde_json::from_value(v).expect("tiny Gemma4 config must deserialize")
+    }
+
+    // ── K/V source mapping ─────────────────────────────────────────────
+
+    /// With one KV-shared layer the non-shared prefix is [s, f, s]: the
+    /// draft reads the last sliding layer (2) and the last full layer (1)
+    /// — exactly the anchors `should_store_shared_kv` marks.
+    #[test]
+    fn kv_source_indices_pick_last_non_shared_layer_of_each_type() {
+        let config = hybrid_config(
+            &[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            Some(1),
+        );
+        let sources = assistant_kv_source_indices(&config).expect("mapping must resolve");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 2,
+                full: 1
+            }
+        );
+    }
+
+    /// Without KV sharing the boundary is num_hidden_layers, so the mapping
+    /// is simply the last layer of each type.
+    #[test]
+    fn kv_source_indices_without_sharing_pick_last_layer_of_each_type() {
+        let config = hybrid_config(
+            &[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            None,
+        );
+        let sources = assistant_kv_source_indices(&config).expect("mapping must resolve");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 2,
+                full: 3
+            }
+        );
+    }
+
+    /// A non-shared prefix lacking either attention type is a hard error —
+    /// the draft needs one K/V source per type.
+    #[test]
+    fn kv_source_indices_error_when_type_missing_below_boundary() {
+        // Prefix [sliding, sliding] has no full_attention layer.
+        let config = hybrid_config(
+            &[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "full_attention",
+            ],
+            Some(2),
+        );
+        let err = assistant_kv_source_indices(&config).expect_err("missing full layer must error");
+        assert!(err.reason.contains("full_attention"), "got: {}", err.reason);
+
+        // Prefix [full, full] has no sliding_attention layer.
+        let config = hybrid_config(
+            &[
+                "full_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
+            Some(2),
+        );
+        let err =
+            assistant_kv_source_indices(&config).expect_err("missing sliding layer must error");
+        assert!(
+            err.reason.contains("sliding_attention"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    /// A truncated `layer_types` vec leaves trailing layers without an
+    /// entry. Such layers match neither attention type: the mapping resolves
+    /// only exact `layer_types` entries (like `should_store_shared_kv`) and
+    /// errors when a type has no exact entry below the boundary, instead of
+    /// treating the missing entries as full attention.
+    #[test]
+    fn kv_source_indices_ignore_layers_with_missing_layer_types_entry() {
+        // 4 layers, `layer_types` truncated to 2 entries, no KV sharing.
+        let truncated = |layer_types: &[&str]| -> Gemma4Config {
+            let mut v = tiny_target_config_value();
+            v["layer_types"] = serde_json::json!(layer_types);
+            v.as_object_mut()
+                .expect("tiny config value is an object")
+                .remove("num_kv_shared_layers");
+            serde_json::from_value(v).expect("tiny Gemma4 config must deserialize")
+        };
+
+        // Both types have exact entries: layers 2/3 (no entry) must not be
+        // selected even though the full-attention fallback would claim them.
+        let sources =
+            assistant_kv_source_indices(&truncated(&["sliding_attention", "full_attention"]))
+                .expect("mapping must resolve from the exact entries");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 0,
+                full: 1
+            }
+        );
+
+        // No exact full_attention entry anywhere: hard error, not index 3.
+        let err =
+            assistant_kv_source_indices(&truncated(&["sliding_attention", "sliding_attention"]))
+                .expect_err("missing full_attention entry must error");
+        assert!(err.reason.contains("full_attention"), "got: {}", err.reason);
+    }
+
+    // ── lm_head tail extraction ────────────────────────────────────────
+
+    /// `forward_body` + `lm_head_logits` composed by hand must reproduce
+    /// `forward_inner` bitwise, with and without logit softcapping.
+    #[test]
+    fn lm_head_logits_matches_forward_inner() {
+        let mut capped = tiny_target_config_value();
+        capped["final_logit_softcapping"] = serde_json::json!(30.0);
+        let configs: [Gemma4Config; 2] = [
+            tiny_target_config(),
+            serde_json::from_value(capped).expect("tiny Gemma4 config must deserialize"),
+        ];
+        for config in &configs {
+            let (embedding, layers, final_norm) = tiny_model(config);
+            let ids = MxArray::from_int32(&[3, 9, 1, 5], &[1, 4]).unwrap();
+
+            let mut caches_a = init_caches_for_config(config);
+            let logits_a = forward_inner(
+                &ids,
+                &embedding,
+                &layers,
+                &mut caches_a,
+                &final_norm,
+                &None,
+                None,
+                None,
+                config,
+                None,
+            )
+            .unwrap();
+
+            let mut caches_b = init_caches_for_config(config);
+            let hidden = forward_body(
+                Some(&ids),
+                None,
+                &embedding,
+                &layers,
+                &mut caches_b,
+                &final_norm,
+                None,
+                None,
+                config,
+                None,
+            )
+            .unwrap();
+            let logits_b = lm_head_logits(&hidden, &embedding, &None, None, config).unwrap();
+
+            let ctx = format!(
+                "lm_head tail (softcap {:?})",
+                config.final_logit_softcapping
+            );
+            assert_bitwise_eq(&logits_a, &logits_b, &ctx);
+        }
+    }
+
+    // ── assistant verify forward ───────────────────────────────────────
+
+    /// Same forward as `dspark_verify_forward` (bitwise-equal logits against
+    /// an empty-tap run on equivalent fresh caches), plus the post-final-norm
+    /// hidden as the second tuple element; caches advance by T and bad block
+    /// shapes are rejected.
+    #[test]
+    fn assistant_verify_forward_returns_hidden_and_logits() {
+        let config = tiny_target_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+
+        // 6-token prefill then a 3-token verify block: the block runs T>1
+        // at offset 6 and crosses the sliding window (6+3 > 8).
+        let prefill_ids = MxArray::from_int32(&[3, 9, 1, 5, 2, 8], &[1, 6]).unwrap();
+        let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
+        let prefill = |caches: &mut [Gemma4LayerCache]| {
+            forward_body(
+                Some(&prefill_ids),
+                None,
+                &embedding,
+                &layers,
+                caches,
+                &final_norm,
+                None,
+                None,
+                &config,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Reference: dspark_verify_forward with an EMPTY tap.
+        let mut caches_a = init_caches_for_config(&config);
+        prefill(&mut caches_a);
+        let mut tap = DsparkTap::new(&[]);
+        let logits_a = dspark_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            &mut tap,
+        )
+        .unwrap();
+        assert!(tap.captured.is_empty(), "empty tap must capture nothing");
+
+        // Assistant seam on equivalent fresh caches.
+        let mut caches_b = init_caches_for_config(&config);
+        prefill(&mut caches_b);
+        let (logits_b, hidden) = assistant_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 16]);
+        assert_eq!(hidden.shape().unwrap().to_vec(), vec![1, 3, 8]);
+        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
+
+        // The hidden is the post-final-norm state of the same block forward.
+        let mut caches_c = init_caches_for_config(&config);
+        prefill(&mut caches_c);
+        let hidden_ref = forward_body(
+            Some(&block_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_c,
+            &final_norm,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_bitwise_eq(&hidden_ref, &hidden, "post-final-norm hidden");
+
+        // Caches advance by T; the KV-shared layer's own vec entry is never
+        // written (it reads its anchor's cache).
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched"
+        );
+
+        // Bad block shapes are rejected: batch > 1 and 1-D input.
+        for bad in [
+            MxArray::from_int32(&[1, 2], &[2, 1]).unwrap(),
+            MxArray::from_int32(&[1, 2], &[2]).unwrap(),
+        ] {
+            let mut caches = init_caches_for_config(&config);
+            assert!(
+                assistant_verify_forward(
+                    &bad,
+                    &embedding,
+                    &layers,
+                    &mut caches,
+                    &final_norm,
+                    &None,
+                    None,
+                    None,
+                    &config,
+                )
+                .is_err(),
+                "block shape {:?} must be rejected",
+                bad.shape().unwrap().as_ref()
+            );
+        }
     }
 }
