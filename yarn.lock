@@ -5,16 +5,16 @@ __metadata:
   version: 10
   cacheKey: 10c0
 
-"@ai-sdk/gateway@npm:3.0.155":
-  version: 3.0.155
-  resolution: "@ai-sdk/gateway@npm:3.0.155::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2F%40ai-sdk%2Fgateway%2F-%2Fgateway-3.0.155.tgz"
+"@ai-sdk/gateway@npm:3.0.156":
+  version: 3.0.156
+  resolution: "@ai-sdk/gateway@npm:3.0.156::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2F%40ai-sdk%2Fgateway%2F-%2Fgateway-3.0.156.tgz"
   dependencies:
     "@ai-sdk/provider": "npm:3.0.14"
     "@ai-sdk/provider-utils": "npm:4.0.40"
     "@vercel/oidc": "npm:3.2.0"
   peerDependencies:
     zod: ^3.25.76 || ^4.1.8
-  checksum: 10c0/d55f3b04cd719a5c912035fede1d6d660dbf0a07518802e329660081d9c41c849a947c9db594c9c22e7058b1596f35b9bd5d0d766e05c6ba04a8d472062c7c0d
+  checksum: 10c0/8a700e9d1cfb1b6926fcec8aa40d3d70f42575b1a4045af45ffdebeb2c0e18e100bc81383a0181609cf60ac4ff2851db51a0594f3093ee489c04eb561b30c6e9
   languageName: node
   linkType: hard
 
@@ -4083,9 +4083,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-core@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89, vite@npm:@voidzero-dev/vite-plus-core@0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-core@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-core%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Ff100b07e4577216d1e2f18af0f8c70a78aa1017a.tgz"
+"@voidzero-dev/vite-plus-core@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d, vite@npm:@voidzero-dev/vite-plus-core@0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-core@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-core%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F3fd66627bc069a59bed7eefb882c4aa8ff35b56e.tgz"
   dependencies:
     "@oxc-project/runtime": "npm:=0.141.0"
     "@oxc-project/types": "npm:=0.141.0"
@@ -4150,62 +4150,62 @@ __metadata:
       optional: true
     yaml:
       optional: true
-  checksum: 10c0/364d80fb26d4ba3d1969b08b1cf4de104f45a489a0f5e8ace3358ebdfdb4110a03c7c008c7edde71dc62dfa7c2b24343de3541af2e2ac2d6a5349f0eb4ecad0d
+  checksum: 10c0/54147891ef0346d73e41240c0653b4d6482fa88bf767eba815b93c5cc3ff7302a0e9e648b4648ae27e8974f370378c05ba47af04eae0a4493a993313fe659b2b
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-darwin-arm64@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-darwin-arm64%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Fb8d6432472b079d93400935b8b247d39b8266544.tgz"
+"@voidzero-dev/vite-plus-darwin-arm64@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-darwin-arm64%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F747c5ad286b69f5888cf9550d4faec300adab4ad.tgz"
   conditions: os=darwin & cpu=arm64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-darwin-x64@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-darwin-x64%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Fbbca84c1fca37c5615731f394948efb6e323fc6e.tgz"
+"@voidzero-dev/vite-plus-darwin-x64@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-darwin-x64%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2Fff984bcac4b1815bc7aafcbcd92d7b7f0a93c563.tgz"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-arm64-gnu%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2F8c5f9aaf230fc69acaef745de119d90d7a791e46.tgz"
+"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-arm64-gnu%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F0d3be36451daad4b46f1bfb9b34c5ed4da4f080c.tgz"
   conditions: os=linux & cpu=arm64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-arm64-musl%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Fbebaffe140f605885e269edf2c4e13901e44f755.tgz"
+"@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-arm64-musl%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F0801d55a2baab12eb99ca0b121eb29991d317bfc.tgz"
   conditions: os=linux & cpu=arm64 & libc=musl
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-x64-gnu%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Fb60d2052a085275d91c7d64e06a2be887f84a9dc.tgz"
+"@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-x64-gnu%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F5a1c74ac96fb41954b56e55d35d36e3f59b148eb.tgz"
   conditions: os=linux & cpu=x64 & libc=glibc
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-linux-x64-musl@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-x64-musl%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Fe526e1579eb3565a39a91e490f2403a89c9a59c3.tgz"
+"@voidzero-dev/vite-plus-linux-x64-musl@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-linux-x64-musl%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F76445f699ae1ae6fd5f46b6ac9f2b14545463e2d.tgz"
   conditions: os=linux & cpu=x64 & libc=musl
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-win32-arm64-msvc%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2F1184d7c73e7cd60e5b7bd9be048cc28d7430867b.tgz"
+"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-win32-arm64-msvc%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2Fef29bdc44bea6f35036ccc3b256284b3ac592606.tgz"
   conditions: os=win32 & cpu=arm64
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-win32-x64-msvc%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2Fedeeffca1d5f39c46445eef8fbeb598851910216.tgz"
+"@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2F%40voidzero-dev%2Fvite-plus-win32-x64-msvc%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F28c76f7605b5b1640b25929aa33c0576efeb1eb7.tgz"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
@@ -4470,16 +4470,16 @@ __metadata:
   linkType: hard
 
 "ai@npm:^6.0.209":
-  version: 6.0.233
-  resolution: "ai@npm:6.0.233::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fai%2F-%2Fai-6.0.233.tgz"
+  version: 6.0.234
+  resolution: "ai@npm:6.0.234::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fai%2F-%2Fai-6.0.234.tgz"
   dependencies:
-    "@ai-sdk/gateway": "npm:3.0.155"
+    "@ai-sdk/gateway": "npm:3.0.156"
     "@ai-sdk/provider": "npm:3.0.14"
     "@ai-sdk/provider-utils": "npm:4.0.40"
     "@opentelemetry/api": "npm:^1.9.0"
   peerDependencies:
     zod: ^3.25.76 || ^4.1.8
-  checksum: 10c0/bdffeed7913c0ca80c990f7098b7c601239a024dd930e47641021cfcda64049fba9f98c453a45e4664a71bd5538c2222b21f9de3e0f168c83cc1985aa21258f8
+  checksum: 10c0/f96f3a0f3be112ee257d7486ed0f86f6bda0ee989a25f66ff40a66c8c18657fedf6271e14bfde83ca74df7616550c66b43948bfedf5a3c9318b10af7a8b56db8
   languageName: node
   linkType: hard
 
@@ -6771,9 +6771,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite-plus@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89":
-  version: 0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89
-  resolution: "vite-plus@npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2Fvite-plus%2F0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89%2F5dc398192f1a48142cf5f97ffef37673dadfedbe.tgz"
+"vite-plus@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d":
+  version: 0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d
+  resolution: "vite-plus@npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d::__archiveUrl=https%3A%2F%2Fregistry-bridge.viteplus.dev%2Ftarballs%2Fvite-plus%2F0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d%2F573e75f31b487c3b0531201c61fb93b8c637eb09.tgz"
   dependencies:
     "@oxc-project/types": "npm:=0.141.0"
     "@oxlint/plugins": "npm:=1.73.0"
@@ -6786,15 +6786,15 @@ __metadata:
     "@vitest/snapshot": "npm:4.1.10"
     "@vitest/spy": "npm:4.1.10"
     "@vitest/utils": "npm:4.1.10"
-    "@voidzero-dev/vite-plus-core": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-darwin-arm64": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-darwin-x64": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
-    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:0.0.0-commit.9855245a469b178066c25a5d45c971c130565d89"
+    "@voidzero-dev/vite-plus-core": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-darwin-arm64": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-darwin-x64": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
+    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:0.0.0-commit.57939439ddcb16d9f54ebf7d41432893182ee46d"
     oxfmt: "npm:=0.60.0"
     oxlint: "npm:=1.75.0"
     oxlint-tsgolint: "npm:=7.0.2001"
@@ -6829,7 +6829,7 @@ __metadata:
     oxlint: ./bin/oxlint
     vp: ./bin/vp
     vpr: ./bin/vpr
-  checksum: 10c0/7eda96dfce673ed2e35824fc6713eca4ead1a3067c6e0c7fe9cbcf477b08c08341605d2faad211a7211040f608eaa3c2b15b45b10e9c72fa5fa0996fe71f9336
+  checksum: 10c0/60f0a9dc43e5dfe4c928f18c29672fea6bf8a6aff097e0d8eb21733b14ce6daf8fec58d57f5fe22a828c0c92ecc8fe77b20956d579f81c82ccc540dd71f9627b
   languageName: node
   linkType: hard
 
