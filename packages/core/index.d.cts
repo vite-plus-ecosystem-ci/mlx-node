@@ -165,9 +165,27 @@ export declare class Gemma4Model {
    * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Whether this loaded instance can execute image-bearing chat turns.
+   * Config-only stubs and incomplete/non-paged physical paths return false.
+   */
+  supportsImages(): boolean;
   modelId(): number;
+  /**
+   * Whether a draft model — DSpark or Google assistant — is loaded on
+   * this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+   * the speculative-decode whole-turn path.
+   *
+   * Note: this only reports draft availability. Whether speculative
+   * decoding actually runs on a given call also requires the per-request
+   * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+   * surface, but it reports an external draft model (either variant),
+   * not in-checkpoint MTP heads. Stubs from `new(config)` always return
+   * `false`.
+   */
+  hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
-  static load(modelPath: string): Promise<Gemma4Model>;
+  static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
   /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
@@ -731,9 +749,20 @@ export declare class MxArray {
   divScalar(value: number): MxArray;
   matmul(other: MxArray): MxArray;
   /**
-   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-   * where self is A. More efficient than separate matmul and add operations.
-   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
+   * Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
+   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
+   *
+   * Computed explicitly (matmul, optional alpha scale, then add beta*C)
+   * rather than via the fused `mlx::core::addmm` primitive. The fused
+   * primitive is correct on a well-formed metallib, but this project's local
+   * release build is known to non-deterministically miscompile fused GEMM
+   * kernels (see the metallib-corruption notes), which manifested as the
+   * fused addmm dropping `beta*C` and corrupting every biased linear — most
+   * visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
+   * bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
+   * explicit form keeps the `C` term robust to that build hazard; the
+   * `nn::linear` unit tests assert it applies a non-zero `C`, so they double
+   * as a canary if a future build corrupts the matmul kernel too.
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
   abs(): MxArray;
@@ -1221,6 +1250,28 @@ export declare class Qwen35Model {
    */
   hasMtpWeights(): boolean;
   /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a `config.json`
+   * family guess: it requires a loaded vision encoder, image processor,
+   * and the block-paged KV adapter used by the dense vision path.
+   */
+  supportsImages(): boolean;
+  /**
+   * Synchronous snapshot used by higher layers to preflight rendered
+   * prompts and clamp output before native cache allocation.
+   */
+  contextLimits(): Qwen35ContextLimits;
+  /**
+   * Compute the exact prompt length after Qwen image-placeholder expansion
+   * without running the vision encoder or touching inference caches.
+   *
+   * `prompt_tokens` is the already-rendered chat-template output. `messages`
+   * supplies the complete image history so both fresh and leased-session
+   * preflights account for every image in template order.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1364,6 +1415,21 @@ export declare class Qwen35MoeModel {
    * the per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
+  /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a model-family guess:
+   * it requires the loaded vision encoder, image processor, and block-paged
+   * KV adapter used by the MoE vision path.
+   */
+  supportsImages(): boolean;
+  /** Synchronous active-context snapshot shared with the dense wrapper. */
+  contextLimits(): Qwen35ContextLimits;
+  /**
+   * Exact, non-mutating Qwen image-placeholder expansion count for a fully
+   * rendered prompt and complete message history.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -2263,8 +2329,68 @@ export declare const enum BuiltinRewardType {
   JsonSchema = 'JsonSchema',
 }
 
+/**
+ * Data-free static FP8 activation-amax calibration over RAW-text PREFILL
+ * (NVIDIA modelopt `MaxCalibrator` parity), end to end in native code.
+ *
+ * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
+ * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
+ * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
+ * clear error). Both loaders are the SAME ones the inference session uses
+ * ([`persistence::load_with_thread`]) — the model is only usable on its
+ * dedicated model thread. Then:
+ *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
+ *      model thread SELF-ARMS that thread's thread-local
+ *      [`ActivationAmaxCollector`] flag (RAII, AFTER load so no load-time eval
+ *      is recorded), tokenizes each `text` WITHOUT the chat template, truncates
+ *      to `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
+ *      mxfp8 attn/GDN projection's activation tap fires over realistic raw-text
+ *      activations, resetting caches between rows, then disarms on exit;
+ *   2. ONLY if the full loop succeeded — drains the per-tensor amax and
+ *      ATOMICALLY writes it into `<model_path>/config.json` (temp file +
+ *      `rename`).
+ *
+ * CONCURRENCY: the whole clear→prefill→take→write section is serialized by
+ * [`calib_guard`] (a process-wide `try_lock`); a second concurrent calibration
+ * fails fast with "another calibration is in progress". The arm flag is
+ * thread-local (so a concurrent inference model can't contaminate the run), but
+ * the running-max MAP is process-global, so serializing RUNS keeps two
+ * calibrations from interleaving `record`/`take` on it. The map is CLEARED at
+ * the very start so stale amax from a prior PANICKED run cannot leak into this
+ * write.
+ *
+ * On ANY error before the final write, the partial amax is discarded and
+ * `config.json` is left UNTOUCHED (a failed calibration must not mutate the
+ * live model in place). A run that prefilled ZERO rows (empty dataset, or every
+ * row tokenized to nothing) is likewise an ERROR that leaves `config.json`
+ * untouched — a no-op calibration must not report a silent success. Returns the
+ * number of projections calibrated (the count of collected amax entries); 0
+ * means a real prefill ran but the model exercised no activation-fp8 sites (not
+ * an nvidia-recipe checkpoint), and in that case `config.json` is left
+ * UNCHANGED (no rewrite).
+ */
+export declare function calibrateActivationAmaxRaw(
+  modelPath: string,
+  texts: Array<string>,
+  calibSeq: number,
+): Promise<number>;
+
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
+  /**
+   * Internal logical cache owner. The agent provider forwards Pi's stable
+   * session id so model-global GDN sidecars can retain parent and child
+   * branches independently. This does not namespace the physical paged KV
+   * cache; exact token/extra-key hashes remain shareable across owners.
+   */
+  cacheOwnerId?: string | undefined;
+  /**
+   * Internal top-level owner for the bounded Qwen3.5 GDN sidecar store.
+   * `cache_owner_id` may identify a child Pi session; this separately
+   * identifies the current interactive root so /new and /resume can rotate
+   * the protected branch without changing PagedAttention cache identity.
+   */
+  cacheRootOwnerId?: string | undefined;
   maxNewTokens?: number | undefined;
   temperature?: number | undefined;
   topK?: number | undefined;
@@ -2327,18 +2453,37 @@ export interface ChatConfig {
   reuseCache?: boolean | undefined;
   /**
    * MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-   * loop on the dense compiled path. Requires the model checkpoint to carry
-   * an MTP head (otherwise silently ignored). Default: `false`.
+   * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
+   * checkpoint to carry an MTP head (otherwise silently ignored). Default:
+   * `false`.
    */
   enableMtp?: boolean | undefined;
   /**
-   * MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
-   * by the verify FFI contract. Default: 1.
+   * MTP: number of draft tokens per speculative cycle.
    *
+   * On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the verify
+   * FFI contract, and when unset native code currently pins depth 1.
    * When `mtpAdaptiveDepth` is `true`, this value is used as the
    * throughput-policy seed and the expected-value policy's max depth.
    * Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
    * enable it.
+   *
+   * Gemma4 external drafts (`draftModelPath`) resolve the field per draft
+   * variant instead (`gemma4/model.rs` `resolve_params`, always from the
+   * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
+   * contract that does not apply to external drafts):
+   * - DSpark: with both knobs unset, full draft blocks (the checkpoint's
+   *   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
+   *   short target-AR/DSpark break-even calibration. A short generation
+   *   budget that cannot finish calibration retains the fixed-block
+   *   schedule. An explicit
+   *   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
+   *   opts the guard back in; explicit `false` disables it.
+   * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
+   *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
+   *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+   *
+   * `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
    */
   mtpDepth?: number | undefined;
   /**
@@ -2351,7 +2496,9 @@ export interface ChatConfig {
    * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
    * When false, the loop pins `mtpDepth` for every cycle.
    *
-   * Default: false. An explicit value always wins over the default.
+   * Default: false, except Gemma4 DSpark enables its measured break-even
+   * guard when both this field and `mtpDepth` are unset. An explicit value
+   * always wins over the family default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }
@@ -2385,6 +2532,17 @@ export interface ChatMessage {
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
+  /**
+   * Thinking mode used when this assistant message was generated.
+   *
+   * This is replay provenance, not a request override. Gemma4's disabled-
+   * thinking generation prefix contains an explicit empty thought channel,
+   * while an enabled-thinking turn that emitted no reasoning contains no
+   * such channel. Keeping the historical mode on the message lets the chat
+   * template reproduce either byte sequence even when a later request
+   * changes its current thinking setting.
+   */
+  thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
   /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */
@@ -2524,7 +2682,7 @@ export interface ConversionOptions {
   quantGroupSize?: number;
   /**
    * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+   * "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
    * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
    */
   quantMode?: string;
@@ -2540,8 +2698,12 @@ export interface ConversionOptions {
   imatrixPath?: string;
   /**
    * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-   * When true, applies after the recipe predicate: any 8-bit affine decision
-   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * When true, applies after the recipe predicate: eligible 8-bit affine
+   * decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+   * affine-only loaders (lm_head, embed_tokens, router.proj,
+   * embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+   * and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+   * in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;
@@ -2634,11 +2796,11 @@ export declare function createRandomQwen35Checkpoint(config: Qwen35Config, saveP
 /**
  * Create a random-init Qwen3.5 MoE model and save it to disk.
  *
- * Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
- * random-weight `Qwen35MoeInner` directly, then dispatches
- * `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
- * of the promise, so the in-memory model is released once the checkpoint has
- * been written. Used by TypeScript test fixtures that need an on-disk
+ * Spawns a dedicated model thread whose init runs
+ * [`create_random_qwen35_moe_checkpoint_sync`] (random-init inner + save);
+ * the thread holds no state and is dropped once the promise resolves, so
+ * the in-memory model is released as soon as the checkpoint has been
+ * written. Used by TypeScript test fixtures that need an on-disk
  * checkpoint without keeping a NAPI model instance alive.
  */
 export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
@@ -2918,6 +3080,21 @@ export interface Gemma4Config {
   useBlockPagedCache?: boolean | undefined;
 }
 
+/** Optional load-time settings for [`Gemma4Model::load`]. */
+export interface Gemma4LoadOptions {
+  /**
+   * Directory of a draft checkpoint (config.json + safetensors) to load
+   * alongside the target model for speculative decoding — either a
+   * DSpark draft or a Google assistant draft; the kind is probed from
+   * the draft config.json. When omitted, `<model_path>/draft/` is loaded
+   * automatically when present. Draft decoding runs only on the flat
+   * KV-cache path: setting this while the model config explicitly enables
+   * `use_block_paged_cache` is a hard load error, and an unset
+   * `use_block_paged_cache` is forced to `false`.
+   */
+  draftModelPath?: string;
+}
+
 /**
  * Vision encoder configuration for Gemma4 multimodal models.
  *
@@ -3093,6 +3270,13 @@ export interface GgufConversionOptions {
   inputPath: string;
   /** Output directory for converted SafeTensors model */
   outputDir: string;
+  /**
+   * Optional directory containing the authoritative HuggingFace config and
+   * tokenizer/processor assets. GGUF metadata is not rich enough to recreate
+   * unified Gemma4 config fields such as head_dim, layer_types, vision, and
+   * audio configuration exactly.
+   */
+  configSourceDir?: string;
   /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
   dtype?: string;
   /** Enable verbose logging */
@@ -3128,8 +3312,12 @@ export interface GgufConversionOptions {
   vlmKeyPrefix?: boolean;
   /**
    * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-   * When true, applies after the recipe predicate: any 8-bit affine decision
-   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * When true, applies after the recipe predicate: eligible 8-bit affine
+   * decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+   * affine-only loaders (lm_head, embed_tokens, router.proj,
+   * embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+   * and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+   * in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;
@@ -3889,7 +4077,7 @@ export interface Qwen35Config {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
@@ -3940,6 +4128,18 @@ export interface Qwen35Config {
    * unavailable.
    */
   nMtpLayers: number;
+}
+
+/**
+ * Trained and physically available active-context limits for one loaded
+ * Qwen3.5 model. Values are snapshots because the physical pool is fixed for
+ * the lifetime of the resident model.
+ */
+export interface Qwen35ContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -3997,7 +4197,7 @@ export interface Qwen35MoeConfig {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**

@@ -22,6 +22,8 @@ use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -56,6 +58,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }
@@ -78,7 +81,7 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
         model_path
     );
 
-    let model = Gemma4Model::load(model_path.clone())
+    let model = Gemma4Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Gemma4 model");
 
@@ -110,6 +113,7 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         },
@@ -179,7 +183,7 @@ async fn gemma4_session_start_prefix_reuse_divergence_miss() {
         model_path
     );
 
-    let model = Gemma4Model::load(model_path.clone())
+    let model = Gemma4Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Gemma4 model");
 
@@ -242,7 +246,7 @@ async fn gemma4_session_reset_purges_prefix_cache_cold_prefill() {
         model_path
     );
 
-    let model = Gemma4Model::load(model_path.clone())
+    let model = Gemma4Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Gemma4 model");
 

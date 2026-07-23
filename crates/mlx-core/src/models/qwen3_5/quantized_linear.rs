@@ -33,6 +33,8 @@ pub const NVFP4_BITS: i32 = 4;
 pub const NVFP4_GROUP_SIZE: i32 = 16;
 pub const NVFP4_MODE: &str = "nvfp4";
 
+pub use crate::quant::fp8_weight::{FP8_E4M3_BITS, FP8_E4M3_GROUP_SIZE, FP8_E4M3_MODE};
+
 // `PerLayerMode` and `PerLayerQuant` are family-neutral types shared with
 // `qwen3_5_moe` and `gemma4`; they live in `crate::models::quant_dispatch`
 // so the three families don't cross-import from each other.
@@ -92,6 +94,18 @@ impl LinearProj {
     /// a valid bf16 tensor (see `Qwen3_5MTPModule::has_quantized_weights`).
     pub fn is_quantized(&self) -> bool {
         matches!(self, LinearProj::Quantized(_))
+    }
+
+    /// The per-tensor FP8 activation scale threaded onto the quantized backend
+    /// at load time (`None` for a dense projection). Test-only read-back seam
+    /// used to prove the loaders thread `PerLayerQuant::input_amax` onto the
+    /// built `QuantizedLinear`.
+    #[cfg(test)]
+    pub(crate) fn input_amax(&self) -> Option<f32> {
+        match self {
+            LinearProj::Standard(_) => None,
+            LinearProj::Quantized(ql) => ql.input_amax(),
+        }
     }
 }
 
@@ -259,6 +273,50 @@ pub fn try_build_nvfp4_quantized_linear(
     ))
 }
 
+/// Build the plain per-output E4M3 correctness fallback.
+///
+/// Checkpoint storage is strict: Uint8 `[N,K]` E4M3 bytes + floating `[N,1]`
+/// dequant scales, with no affine `.biases`. The weight is reconstructed to
+/// BF16 once here and `QuantizedLinear::forward` uses an ordinary A16 matmul.
+/// This preserves the DGX artifact's weight format without claiming native
+/// W8A8 execution.
+pub fn try_build_fp8_e4m3_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Result<Option<QuantizedLinear>> {
+    let weight_key = format!("{key_prefix}.weight");
+    let scales_key = format!("{key_prefix}.scales");
+    let weight = params.get(&weight_key);
+    let scales = params.get(&scales_key);
+    let (weight, scales) = match (weight, scales) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(Error::from_reason(format!(
+                "plain FP8 layer '{key_prefix}': .weight present but mandatory .scales missing"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(Error::from_reason(format!(
+                "plain FP8 layer '{key_prefix}': .scales present but .weight missing"
+            )));
+        }
+        (Some(weight), Some(scales)) => (weight, scales),
+    };
+    if params.contains_key(&format!("{key_prefix}.biases")) {
+        return Err(Error::from_reason(format!(
+            "plain FP8 layer '{key_prefix}': unexpected .biases sidecar"
+        )));
+    }
+    let dequant_weight =
+        crate::quant::fp8_weight::validate_and_dequantize(weight, scales, 2, key_prefix)?;
+    Ok(Some(QuantizedLinear::new_fp8_e4m3(
+        weight.clone(),
+        scales.clone(),
+        dequant_weight,
+        None,
+    )))
+}
+
 /// Try to build a QuantizedLinear from weight/scales/biases keys in a params map.
 pub fn try_build_quantized_linear(
     params: &HashMap<String, MxArray>,
@@ -388,10 +446,12 @@ pub fn try_build_sym8_quantized_linear(
     )))
 }
 
-/// QuantizedLinear: Linear layer using quantized_matmul for efficient inference.
+/// Linear layer backed by a serialized quantized weight format.
 ///
-/// Stores weights in packed uint32 format with separate scales and optional biases.
-/// Uses MLX's fused dequantize+matmul Metal kernel for ~4x memory reduction.
+/// Affine/MX/NVFP modes use packed Uint32 weights and MLX quantized_matmul;
+/// sym8 uses dedicated int8 kernels. Plain `fp8_e4m3` is the intentionally
+/// non-native exception: it retains raw Uint8 checkpoint storage, reconstructs
+/// BF16 once at load, and uses ordinary A16 matmul.
 pub struct QuantizedLinear {
     weight: MxArray,         // Packed uint32 quantized weights [out, in_packed]
     scales: MxArray,         // Quantization scales
@@ -399,7 +459,10 @@ pub struct QuantizedLinear {
     bias: Option<MxArray>,   // Linear bias (additive)
     group_size: i32,
     bits: i32,
-    mode: String, // "affine", "mxfp8", "mxfp4", "nvfp4", or "sym8"
+    mode: String, // "affine", "mxfp8", "mxfp4", "nvfp4", "fp8_e4m3", or "sym8"
+    // Reconstructed BF16 `[N,K]` weight for the plain E4M3 correctness
+    // fallback. `Some` iff mode == fp8_e4m3; activations remain A16.
+    fp8_dequant_weight: Option<MxArray>,
     // sym8 kernel operands (`Some` iff `mode == "sym8"`): `w_i8` is the opaque
     // contiguous [K,N] int8 weight (pre-transposed at load), `s_w` is the f32
     // [N] per-output-channel scale. Consumed by `int8_w8a16_qmv` (M <= 2,
@@ -409,6 +472,22 @@ pub struct QuantizedLinear {
     // `mlx_quantized_matmul` (there is no affine pack for sym8).
     w_i8: Option<MxArray>,
     s_w: Option<MxArray>,
+    // Per-tensor static FP8 (E4M3) activation scale (modelopt MaxCalibrator
+    // amax), threaded from the layer's `config.json` quantization override via
+    // `PerLayerQuant::input_amax`. `Some` only on calibrated mxfp8 attention/GDN
+    // projections; `None` everywhere else. Carried here for a later task to
+    // fake-quant activations to E4M3 for W8A8 numeric parity — forward does NOT
+    // yet read it, so behaviour is unchanged while `None`.
+    input_amax: Option<f32>,
+    // The projection's normalized per-layer config key
+    // (`normalize_per_layer_key(prefix)`), threaded at load so the
+    // activation-amax calibration tap can bucket recorded `max|activation|` by
+    // projection. `Some` on every projection built by the two `try_build_ql`
+    // loaders (dense + MoE); `None` on test-fabricated / non-loader instances.
+    // Read ONLY by the calibration tap in `forward` (gated by
+    // `mode == MXFP8_MODE` + collector-enabled), so it never affects normal
+    // inference.
+    amax_key: Option<String>,
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -450,9 +529,64 @@ impl QuantizedLinear {
             group_size,
             bits,
             mode,
+            fp8_dequant_weight: None,
             w_i8: None,
             s_w: None,
+            input_amax: None,
+            amax_key: None,
         }
+    }
+
+    /// Construct a plain E4M3 storage-backed linear with a load-time BF16
+    /// reconstruction. The raw Uint8 tensor remains available through
+    /// `get_weight()` so storage identity is never confused with MXFP8.
+    pub fn new_fp8_e4m3(
+        weight: MxArray,
+        scales: MxArray,
+        dequant_weight: MxArray,
+        bias: Option<MxArray>,
+    ) -> Self {
+        Self {
+            weight,
+            scales,
+            biases: None,
+            bias,
+            group_size: FP8_E4M3_GROUP_SIZE,
+            bits: FP8_E4M3_BITS,
+            mode: FP8_E4M3_MODE.to_string(),
+            fp8_dequant_weight: Some(dequant_weight),
+            w_i8: None,
+            s_w: None,
+            input_amax: None,
+            amax_key: None,
+        }
+    }
+
+    /// Attach a per-tensor FP8 activation scale (`PerLayerQuant::input_amax`).
+    ///
+    /// Consuming builder used at the load-time dispatch site to thread the
+    /// calibrated amax onto a freshly built projection. `None` is the no-op /
+    /// default (bf16 activations, current behaviour). A later task reads this
+    /// field in `forward` to fake-quant activations to E4M3.
+    pub fn with_input_amax(mut self, input_amax: Option<f32>) -> Self {
+        self.input_amax = input_amax;
+        self
+    }
+
+    /// The calibrated per-tensor FP8 activation scale, if any.
+    pub fn input_amax(&self) -> Option<f32> {
+        self.input_amax
+    }
+
+    /// Attach the projection's normalized config key for the calibration tap.
+    ///
+    /// Consuming builder used at the load-time dispatch site (next to
+    /// [`with_input_amax`](Self::with_input_amax)) so the activation-amax
+    /// collector can bucket recorded `max|activation|` by projection. `None` is
+    /// the default (no calibration bucket — test-fabricated instances).
+    pub fn with_amax_key(mut self, amax_key: Option<String>) -> Self {
+        self.amax_key = amax_key;
+        self
     }
 
     /// Construct a sym8 linear from pre-validated operands (see
@@ -472,8 +606,11 @@ impl QuantizedLinear {
             group_size: SYM8_GROUP_SIZE,
             bits: SYM8_BITS,
             mode: SYM8_MODE.to_string(),
+            fp8_dequant_weight: None,
             w_i8: Some(w_kn),
             s_w: Some(s_w),
+            input_amax: None,
+            amax_key: None,
         }
     }
 
@@ -486,7 +623,7 @@ impl QuantizedLinear {
     /// `M >= 3` → [`int8_gemm::int8_w8a8_matmul`] (the W8A8 prefill GEMM —
     /// act quant amortizes at prefill M). The only env gate is the
     /// same-binary A/B escape hatch `INT8_QMV_W8A16=0` (read inside the
-    /// shared C++ builder, so eager and compiled stay byte-identical) which
+    /// shared C++ builder, so every caller sees one dispatch rule) which
     /// reroutes decode back to the W8A8 qmv. Fail-loud on kernel error
     /// (there is no affine pack to fall back to).
     fn forward_sym8(&self, x: &MxArray) -> Result<MxArray> {
@@ -534,8 +671,73 @@ impl QuantizedLinear {
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        // Whether THIS thread is the calibrating model thread (thread-local, so
+        // a concurrently-running inference model on another thread never trips
+        // this). Read once and reused for both the tap and the fake-quant
+        // suppression below.
+        let calibrating =
+            crate::calibration::activation_amax::ActivationAmaxCollector::is_calibrating();
+
+        // Activation-amax calibration tap (modelopt MaxCalibrator): while this
+        // thread is calibrating, record this projection's raw bf16 activation
+        // `max|x|` BEFORE any fake-quant. Gated to mxfp8 sites (the recipe's
+        // activation-fp8 attn/GDN projections) via the same mode check the
+        // fake-quant gate below uses. The recorded value is the clean bf16 input
+        // — the fake-quant is suppressed while calibrating (below), so an
+        // already-calibrated model re-calibrates at raw-bf16 MaxCalibrator
+        // parity. When not calibrating this is a single thread-local load then
+        // skip, so forward is behaviorally unchanged for normal inference.
+        if calibrating
+            && self.mode == MXFP8_MODE
+            && let Some(key) = &self.amax_key
+        {
+            crate::calibration::activation_amax::ActivationAmaxCollector::record(key, x)?;
+        }
+
+        // Calibrated per-tensor FP8 (E4M3) activation fake-quant, matching
+        // NVIDIA modelopt's static W8A8 attention/GDN math. SUPPRESSED while
+        // this thread is calibrating: the calibration pass must measure the raw
+        // bf16 activation regardless of any existing `input_amax` (an upstream
+        // fake-quant would perturb downstream activations, breaking raw-bf16
+        // MaxCalibrator parity on a re-calibration).
+        //
+        // Otherwise the gate requires BOTH a positive `input_amax` AND
+        // `self.mode == MXFP8_MODE`: in the nvidia recipe the mxfp8 projections
+        // are EXACTLY the attn/GDN activation-fp8 sites, so the mode check
+        // enforces the invariant at the point of use rather than trusting the
+        // loaders. Even if a stale, malformed, or hand-edited config erroneously
+        // threads `input_amax` onto a non-mxfp8 projection (mxfp4 FFN, affine
+        // gates/in_proj_ba, lm_head, sym8), `x` stays the original bf16 reference
+        // there and that forward is byte-identical to before. Apple GPUs have no
+        // fp8 matmul hardware — this is numeric parity, not speed.
+        let xq_owned;
+        let x = if calibrating {
+            x
+        } else {
+            match self.input_amax {
+                Some(amax) if amax > 0.0 && self.mode == MXFP8_MODE => {
+                    xq_owned = crate::quant::fp8_activation::fp8_fake_quant(x, amax)?;
+                    &xq_owned
+                }
+                _ => x,
+            }
+        };
+
         if self.mode == SYM8_MODE {
             return self.forward_sym8(x);
+        }
+
+        if self.mode == FP8_E4M3_MODE {
+            let weight = self.fp8_dequant_weight.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
+                )
+            })?;
+            let mut result = x.matmul(&weight.transpose(Some(&[1, 0]))?)?;
+            if let Some(ref b) = self.bias {
+                result = result.add(b)?;
+            }
+            return Ok(result);
         }
 
         let mode_c = CString::new(self.mode.as_str())
@@ -570,10 +772,19 @@ impl QuantizedLinear {
 
     pub fn set_weight(&mut self, weight: MxArray) {
         self.weight = weight;
+        if self.mode == FP8_E4M3_MODE {
+            // This infallible legacy mutator cannot validate/rebuild the plain
+            // FP8 pair. Invalidate the reconstruction so forward fails loud
+            // instead of using a stale BF16 weight.
+            self.fp8_dequant_weight = None;
+        }
     }
 
     pub fn set_scales(&mut self, scales: MxArray) {
         self.scales = scales;
+        if self.mode == FP8_E4M3_MODE {
+            self.fp8_dequant_weight = None;
+        }
     }
 
     pub fn set_biases(&mut self, biases: Option<MxArray>) {
@@ -597,7 +808,7 @@ impl QuantizedLinear {
     }
 
     /// Quantization mode discriminator string ("affine", "mxfp8", "mxfp4",
-    /// "nvfp4", or "sym8").
+    /// "nvfp4", "fp8_e4m3", or "sym8").
     pub fn mode(&self) -> &str {
         &self.mode
     }
@@ -612,6 +823,84 @@ impl QuantizedLinear {
             (Some(w), Some(s)) => Some((&self.weight, w, s)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod plain_fp8_weight_tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn params(prefix: &str) -> HashMap<String, MxArray> {
+        let source = MxArray::from_float32(
+            &[
+                0.0, 0.5, -1.0, 2.0, -0.25, 1.5, 0.75, -2.5, 1.0, -0.5, 0.25, 3.0,
+            ],
+            &[3, 4],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let (weight, scales) =
+            crate::quant::fp8_weight::quantize_per_output_channel(&source, prefix).unwrap();
+        HashMap::from([
+            (format!("{prefix}.weight"), weight),
+            (format!("{prefix}.scales"), scales),
+        ])
+    }
+
+    #[test]
+    fn plain_fp8_builder_reconstructs_bf16_and_forward_is_a16_matmul() {
+        let p = params("proj");
+        let ql = try_build_fp8_e4m3_quantized_linear(&p, "proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ql.mode(), FP8_E4M3_MODE);
+        assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
+        assert_eq!(ql.get_scales().shape().unwrap().to_vec(), vec![3, 1]);
+
+        let x = MxArray::from_float32(&[1.0, -0.5, 0.25, 2.0], &[1, 4])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let got = ql.forward(&x).unwrap();
+        let dequant = crate::quant::fp8_weight::validate_and_dequantize(
+            p.get("proj.weight").unwrap(),
+            p.get("proj.scales").unwrap(),
+            2,
+            "proj",
+        )
+        .unwrap();
+        let want = x
+            .matmul(&dequant.transpose(Some(&[1, 0])).unwrap())
+            .unwrap();
+        got.eval();
+        want.eval();
+        assert_eq!(
+            got.to_uint16_native().unwrap(),
+            want.to_uint16_native().unwrap()
+        );
+    }
+
+    #[test]
+    fn plain_fp8_builder_fails_loud_on_incomplete_or_malformed_storage() {
+        let mut missing_scales = params("proj");
+        missing_scales.remove("proj.scales");
+        assert!(try_build_fp8_e4m3_quantized_linear(&missing_scales, "proj").is_err());
+
+        let mut wrong_weight_dtype = params("proj");
+        let bad = wrong_weight_dtype["proj.weight"]
+            .from_fp8(DType::BFloat16)
+            .unwrap();
+        wrong_weight_dtype.insert("proj.weight".into(), bad);
+        assert!(try_build_fp8_e4m3_quantized_linear(&wrong_weight_dtype, "proj").is_err());
+
+        let mut wrong_scale_shape = params("proj");
+        wrong_scale_shape.insert(
+            "proj.scales".into(),
+            MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
+        );
+        assert!(try_build_fp8_e4m3_quantized_linear(&wrong_scale_shape, "proj").is_err());
     }
 }
 
@@ -855,5 +1144,392 @@ mod sym8_tests {
             MxArray::from_float32(&short_scales, &[n - 1]).unwrap(),
         );
         assert!(try_build_sym8_quantized_linear(&p, "l").is_err());
+    }
+}
+
+#[cfg(test)]
+mod fp8_activation_tests {
+    use super::*;
+    use crate::array::DType;
+    use crate::quant::fp8_activation::fp8_fake_quant;
+
+    /// Deterministic LCG float in `[-2, 2]` (failures reproduce exactly).
+    fn next_f32(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = ((*state >> 40) & 0xFFFF) as f32 / 65535.0; // [0, 1]
+        u * 4.0 - 2.0
+    }
+
+    /// MXFP8-quantize a 2D bf16 weight, returning `(packed_weight, uint8 scales)`
+    /// (mxfp8 has no biases) — mirrors the embedding-test helper.
+    fn quantize_mxfp8(weight: &MxArray) -> (MxArray, MxArray) {
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                MXFP8_GROUP_SIZE,
+                MXFP8_BITS,
+                c"mxfp8".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize mxfp8 failed");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+        )
+    }
+
+    /// A fresh mxfp8 `QuantizedLinear` over shared (cloned) packed operands, so
+    /// the same weights back every instance in one test (`with_input_amax`
+    /// consumes `self`, so each variant needs its own struct).
+    fn make_mxfp8_linear(w_q: &MxArray, scales: &MxArray) -> QuantizedLinear {
+        QuantizedLinear::new(
+            w_q.clone(),
+            scales.clone(),
+            None,
+            None,
+            MXFP8_GROUP_SIZE,
+            MXFP8_BITS,
+            MXFP8_MODE.to_string(),
+        )
+    }
+
+    /// MXFP4-quantize a 2D bf16 weight, returning `(packed_weight, uint8 E2M1
+    /// scales)` (mxfp4 has no biases) — mirrors [`quantize_mxfp8`] with the
+    /// mxfp4 mode / group_size / bits. Used to build a NON-mxfp8 projection for
+    /// the negative gate test.
+    fn quantize_mxfp4(weight: &MxArray) -> (MxArray, MxArray) {
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                MXFP4_GROUP_SIZE,
+                MXFP4_BITS,
+                c"mxfp4".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize mxfp4 failed");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+        )
+    }
+
+    /// A fresh mxfp4 `QuantizedLinear` over shared (cloned) packed operands
+    /// (`with_input_amax` consumes `self`, so each variant needs its own
+    /// struct).
+    fn make_mxfp4_linear(w_q: &MxArray, scales: &MxArray) -> QuantizedLinear {
+        QuantizedLinear::new(
+            w_q.clone(),
+            scales.clone(),
+            None,
+            None,
+            MXFP4_GROUP_SIZE,
+            MXFP4_BITS,
+            MXFP4_MODE.to_string(),
+        )
+    }
+
+    /// Assert two bf16 outputs are byte-for-byte identical via their native u16
+    /// payload (no f32 round-trip — see project memory: an f32 cast can hide a
+    /// 1-ULP bf16 divergence).
+    fn assert_bf16_bit_identical(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        let av = a.to_uint16_native().unwrap();
+        let bv = b.to_uint16_native().unwrap();
+        assert_eq!(av.len(), bv.len(), "{ctx}: length mismatch");
+        let bad = av.iter().zip(bv.iter()).filter(|(x, y)| x != y).count();
+        assert_eq!(bad, 0, "{ctx}: {bad}/{} bf16 words differ", av.len());
+    }
+
+    fn to_f32(a: &MxArray) -> Vec<f32> {
+        a.astype(DType::Float32)
+            .expect("astype f32")
+            .to_float32()
+            .expect("to_float32")
+            .to_vec()
+    }
+
+    /// Max absolute elementwise difference between two same-shape arrays.
+    fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
+        let av = to_f32(a);
+        let bv = to_f32(b);
+        assert_eq!(av.len(), bv.len(), "shape mismatch in max_abs_diff");
+        av.iter()
+            .zip(&bv)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The mxfp8 forward fake-quantizes its activation input to per-tensor E4M3
+    /// when `input_amax` is set: the output matches a "fake-quant x then the
+    /// same matmul" reference, and differs from the `input_amax == None`
+    /// (bf16-activation) baseline. Proves Task 4's forward routing.
+    #[test]
+    fn forward_applies_fp8_fake_quant_when_amax_present() {
+        let (n, k) = (32i64, 64i64); // k % MXFP8_GROUP_SIZE == 0
+        let mut state = 0x0F80_1234u64;
+
+        // Random bf16 weight [N, K], mxfp8-quantized.
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp8(&w_bf16);
+
+        // Random bf16 activations [M, K] spanning [-2, 2] so amax=2.0 pushes
+        // magnitudes to the top of the E4M3 grid (meaningful quant error).
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Baseline: input_amax = None (bf16 activations, current behaviour).
+        let base = make_mxfp8_linear(&w_q, &scales).forward(&x).unwrap();
+
+        // amax path: forward should fake-quant x internally.
+        let got = make_mxfp8_linear(&w_q, &scales)
+            .with_input_amax(Some(2.0))
+            .forward(&x)
+            .unwrap();
+
+        // Reference: fake-quant x explicitly, then the plain (None) matmul.
+        let xq = fp8_fake_quant(&x, 2.0).unwrap();
+        let want = make_mxfp8_linear(&w_q, &scales).forward(&xq).unwrap();
+
+        let d_got_want = max_abs_diff(&got, &want);
+        assert!(
+            d_got_want <= 1e-3,
+            "amax forward must equal fake-quant-then-matmul reference; max|Δ|={d_got_want}"
+        );
+
+        let d_got_base = max_abs_diff(&got, &base);
+        assert!(
+            d_got_base > 1e-3,
+            "amax path must change the output vs the None baseline; max|Δ|={d_got_base}"
+        );
+    }
+
+    /// Invariant guard: a NON-mxfp8 projection that erroneously carries a
+    /// positive `input_amax` (stale / malformed / hand-edited config) must NOT
+    /// fake-quant its activations — its forward is byte-identical to the same
+    /// projection with `input_amax == None`. Only `mode == MXFP8_MODE` (the
+    /// nvidia recipe's attn/GDN activation-fp8 sites) gets FP8 activations;
+    /// mxfp4 FFN, affine gates/in_proj_ba, lm_head, and sym8 stay bf16.
+    ///
+    /// RED on the unfixed gate (before the `&& self.mode == MXFP8_MODE` guard):
+    /// this mxfp4 linear WOULD fake-quant `x` and diverge from the baseline, so
+    /// the bit-identical assert fails.
+    #[test]
+    fn forward_ignores_input_amax_on_non_mxfp8() {
+        let (n, k) = (32i64, 64i64); // k % MXFP4_GROUP_SIZE == 0
+        let mut state = 0x4F40_9AB1u64;
+
+        // Random bf16 weight [N, K], mxfp4-quantized (a NON-mxfp8 projection —
+        // stands in for the mxfp4 FFN / affine / lm_head paths).
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp4(&w_bf16);
+
+        // Random bf16 activations [M, K] spanning [-2, 2] so an amax=2.0
+        // fake-quant WOULD visibly perturb them if it were (wrongly) applied.
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Baseline: input_amax = None (bf16 activations).
+        let base = make_mxfp4_linear(&w_q, &scales).forward(&x).unwrap();
+
+        // Erroneous amax on a non-mxfp8 mode: the mode guard must ignore it, so
+        // forward stays byte-identical to the None baseline.
+        let got = make_mxfp4_linear(&w_q, &scales)
+            .with_input_amax(Some(2.0))
+            .forward(&x)
+            .unwrap();
+
+        assert_bf16_bit_identical(
+            &got,
+            &base,
+            "non-mxfp8 projection with erroneous input_amax must NOT fake-quant",
+        );
+    }
+
+    /// The calibration tap records the raw `max|x|` for an mxfp8 projection when
+    /// the CURRENT thread is armed, bucketed by `amax_key`. A NON-mxfp8
+    /// projection records nothing (mode gate), and a disarmed thread records
+    /// nothing (arm gate). Proves Task 5's forward tap.
+    #[test]
+    fn forward_tap_records_max_abs_for_mxfp8() {
+        use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+
+        // Serialize against every other test that records into the shared
+        // running-max map (this file's tap tests + the calibration module tests).
+        let _g = CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disarm_current_thread();
+        let _ = ActivationAmaxCollector::take();
+
+        let (n, k) = (32i64, 64i64); // k % MXFP8_GROUP_SIZE == 0
+        let mut state = 0x7A9_0055u64;
+
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp8(&w_bf16);
+
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        // Expected max|x| computed from the bf16-rounded values (read back via
+        // to_f32), independent of the tap's abs->max->item path.
+        let expected = to_f32(&x).iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+        // --- mxfp8 + armed thread => records max|x| under amax_key ---
+        let key = "layers.0.self_attn.q_proj";
+        let lin = make_mxfp8_linear(&w_q, &scales).with_amax_key(Some(key.to_string()));
+        ActivationAmaxCollector::arm_current_thread();
+        let _ = lin.forward(&x).unwrap();
+        ActivationAmaxCollector::disarm_current_thread();
+        let recorded = ActivationAmaxCollector::take();
+        let got = recorded
+            .get(key)
+            .copied()
+            .expect("mxfp8 tap must record under its amax_key");
+        assert!(
+            (got - expected).abs() <= 1e-4,
+            "tapped max|x| {got} vs expected {expected}"
+        );
+        assert_eq!(recorded.len(), 1, "only the tapped key; got {recorded:?}");
+
+        // --- NON-mxfp8 (mxfp4) armed => records nothing (mode gate) ---
+        // --- mxfp8 but thread disarmed => records nothing (arm gate) ---
+        let _ = ActivationAmaxCollector::take();
+        let (w_q4, scales4) = quantize_mxfp4(&w_bf16);
+        let lin4 = make_mxfp4_linear(&w_q4, &scales4)
+            .with_amax_key(Some("layers.0.mlp.gate_proj".to_string()));
+        ActivationAmaxCollector::arm_current_thread();
+        let _ = lin4.forward(&x).unwrap(); // mxfp4 while armed -> skip (mode gate)
+        ActivationAmaxCollector::disarm_current_thread();
+        let lin8 = make_mxfp8_linear(&w_q, &scales)
+            .with_amax_key(Some("layers.0.self_attn.v_proj".to_string()));
+        let _ = lin8.forward(&x).unwrap(); // mxfp8 while disarmed -> skip (arm gate)
+        let empty = ActivationAmaxCollector::take();
+        assert!(
+            empty.is_empty(),
+            "non-mxfp8 (mode gate) and disarmed-thread (arm gate) must record nothing; got {empty:?}"
+        );
+
+        ActivationAmaxCollector::disarm_current_thread();
+    }
+
+    /// Task 3 (fake-quant suppression while calibrating). An mxfp8 projection
+    /// WITH `input_amax = Some(2.0)`:
+    ///   * armed => forward SUPPRESSES the fake-quant, so its output is
+    ///     bit-identical to the RAW (`input_amax = None`) baseline AND it
+    ///     records `max|x|` under its `amax_key` (raw-bf16 measurement);
+    ///   * NOT armed => forward fake-quants (differs from the raw baseline).
+    ///
+    /// This proves a re-calibration on an already-calibrated model measures raw
+    /// bf16 (modelopt parity), and that the calibrated fake-quant is unchanged
+    /// for normal inference.
+    #[test]
+    fn forward_suppresses_fake_quant_while_calibrating() {
+        use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+
+        let _g = CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disarm_current_thread();
+        let _ = ActivationAmaxCollector::take();
+
+        let (n, k) = (32i64, 64i64); // k % MXFP8_GROUP_SIZE == 0
+        let mut state = 0x5011_C0DEu64;
+
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp8(&w_bf16);
+
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let expected = to_f32(&x).iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+        // Raw baseline: input_amax = None (no fake-quant).
+        let base = make_mxfp8_linear(&w_q, &scales).forward(&x).unwrap();
+
+        // input_amax = Some(2.0) but the thread is ARMED -> fake-quant is
+        // suppressed, so the output must equal the raw baseline, and the raw
+        // max|x| is recorded under amax_key.
+        let key = "layers.0.self_attn.o_proj";
+        let lin = make_mxfp8_linear(&w_q, &scales)
+            .with_input_amax(Some(2.0))
+            .with_amax_key(Some(key.to_string()));
+        ActivationAmaxCollector::arm_current_thread();
+        let got_armed = lin.forward(&x).unwrap();
+        ActivationAmaxCollector::disarm_current_thread();
+        let recorded = ActivationAmaxCollector::take();
+
+        assert_bf16_bit_identical(
+            &got_armed,
+            &base,
+            "armed forward must suppress fake-quant -> raw bf16 baseline",
+        );
+        let rec = recorded
+            .get(key)
+            .copied()
+            .expect("armed mxfp8 forward must record raw max|x|");
+        assert!(
+            (rec - expected).abs() <= 1e-4,
+            "recorded raw max|x| {rec} vs expected {expected}"
+        );
+
+        // Same input_amax = Some(2.0) but NOT armed -> forward fake-quants, so
+        // it must diverge from the raw baseline (proves the suppression above is
+        // the arm flag, not a broken amax path).
+        let got_unarmed = make_mxfp8_linear(&w_q, &scales)
+            .with_input_amax(Some(2.0))
+            .forward(&x)
+            .unwrap();
+        let d = max_abs_diff(&got_unarmed, &base);
+        assert!(
+            d > 1e-3,
+            "unarmed forward with input_amax must fake-quant (differ from baseline); max|Δ|={d}"
+        );
+
+        ActivationAmaxCollector::disarm_current_thread();
     }
 }

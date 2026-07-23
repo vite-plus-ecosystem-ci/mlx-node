@@ -26,6 +26,8 @@ use napi::bindgen_prelude::Uint8Array;
 
 fn cfg(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -60,6 +62,7 @@ fn user_msg(content: &str, image: Option<&[u8]>) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: image.map(|b| vec![Uint8Array::new(b.to_vec())]),
         audio: None,
     }

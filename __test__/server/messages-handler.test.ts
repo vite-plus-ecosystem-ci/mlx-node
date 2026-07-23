@@ -937,6 +937,167 @@ describe('handleCreateMessage', () => {
   // -----------------------------------------------------------------------
 
   describe('streaming (native)', () => {
+    it('returns a JSON 400 for context overflow before committing SSE or mutating native cache state', async () => {
+      const model = Object.assign(createMockStreamModel([]), {
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: 64,
+          pagedBlockCapacity: 4,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(65)),
+      });
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const { res, getStatus, getBody, getHeaders } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'too large' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      expect(getHeaders()['content-type']).toContain('application/json');
+      expect(getBody()).toContain('context_length_exceeded');
+      expect(getBody()).not.toContain('event:');
+      expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    });
+
+    it('returns JSON 400 before SSE when image expansion exceeds capacity', async () => {
+      const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
+        expect(Array.from(messages[0]?.images?.[0] ?? [])).toEqual([1, 2, 3]);
+        return 65;
+      });
+      const model = Object.assign(createMockStreamModel([]), {
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: 64,
+          pagedBlockCapacity: 4,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(4)),
+        expandedPromptTokenCount,
+      });
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const response = createMockRes();
+
+      await handleCreateMessage(
+        response.res,
+        {
+          model: 'test-model',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'describe' },
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/png', data: 'AQID' },
+                },
+              ],
+            },
+          ],
+          max_tokens: 32,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(response.getStatus()).toBe(400);
+      expect(response.getHeaders()['content-type']).toContain('application/json');
+      expect(response.getBody()).toContain('context_length_exceeded');
+      expect(response.getBody()).not.toContain('event:');
+      expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
+      expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    });
+
+    it('commits message_start before a delayed first native stream event', async () => {
+      let markEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        markEntered = resolve;
+      });
+      let releaseFirstEvent!: () => void;
+      const firstEventGate = new Promise<void>((resolve) => {
+        releaseFirstEvent = resolve;
+      });
+      let cleanedUp = false;
+      async function* delayedStream() {
+        try {
+          markEntered();
+          await firstEventGate;
+          yield {
+            text: 'Hello',
+            done: true,
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 3,
+            reasoningTokens: 0,
+            rawText: 'Hello',
+          };
+        } finally {
+          cleanedUp = true;
+        }
+      }
+      const model = createMockStreamModel([]);
+      model.chatStreamSessionStart = vi.fn(() => delayedStream());
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const { res, getStatus, getBody, getHeaders } = createMockRes();
+
+      const handling = handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+      let statusBeforeFirstEvent = 0;
+      let contentTypeBeforeFirstEvent: string | string[] | undefined;
+      let bodyBeforeFirstEvent = '';
+      let entryFailure: unknown;
+      let entryTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          entered,
+          handling.then(() => {
+            throw new Error('streaming handler completed before entering the native stream');
+          }),
+          new Promise<never>((_resolve, reject) => {
+            entryTimer = setTimeout(() => reject(new Error('timed out waiting to enter the native stream')), 1_000);
+          }),
+        ]);
+        statusBeforeFirstEvent = getStatus();
+        contentTypeBeforeFirstEvent = getHeaders()['content-type'];
+        bodyBeforeFirstEvent = getBody();
+      } catch (error) {
+        entryFailure = error;
+      } finally {
+        if (entryTimer !== undefined) clearTimeout(entryTimer);
+        releaseFirstEvent();
+      }
+      await handling;
+      if (entryFailure !== undefined) throw entryFailure;
+
+      expect(statusBeforeFirstEvent).toBe(200);
+      expect(contentTypeBeforeFirstEvent).toBe('text/event-stream');
+      expect(bodyBeforeFirstEvent).toContain('event: message_start');
+      expect(cleanedUp).toBe(true);
+    });
+
     it('emits correct SSE event sequence for text-only streaming', async () => {
       const registry = new ModelRegistry();
       const streamEvents = [

@@ -1,7 +1,12 @@
 {
   "name": "@mlx-node/core-darwin-arm64",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/core/npm/darwin-arm64"
+  },
   "files": [
     "mlx-core.darwin-arm64.node",
     "mlx.metallib",

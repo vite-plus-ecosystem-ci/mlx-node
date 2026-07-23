@@ -2,9 +2,8 @@
 //! MoE.
 //!
 //! Mirrors `qwen3_5_paged_vs_flat_parity.rs` but loads the MoE
-//! checkpoint. Same caveats apply — the compiled C++ MoE forward path
-//! is bypassed when the paged adapter is enabled, so this gate is a
-//! Rust-paged-vs-Rust-flat comparison.
+//! checkpoint. Same caveats apply — both sides are pure-Rust eager
+//! forwards, so this gate is a Rust-paged-vs-Rust-flat comparison.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH`. Run with:
 //!
@@ -78,6 +77,8 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -112,6 +113,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }

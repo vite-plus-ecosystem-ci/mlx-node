@@ -8,23 +8,27 @@ use napi_derive::napi;
 
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
-use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup,
     ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
+use crate::engine::plan::{
+    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+    SpeculativePlan,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::profiling::PerformanceMetrics;
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedKVCacheAdapter, paged_attention_v2_aux_fits,
+};
 use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
 use crate::transformer::{
     AttentionKind, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, LayerKVCacheSpec,
@@ -106,8 +110,13 @@ fn escape_gemma4_content(s: &str) -> String {
         .replace("<|think|>", "")
 }
 
+use super::attention::{
+    Gemma4PagedPrefillRoutePolicy, gemma4_paged_prefill_route_policy,
+    gemma4_paged_prefill_v2_layout_for_chunk,
+};
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
+use super::dspark::DsparkTap;
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -384,15 +393,23 @@ pub(crate) struct Gemma4Inner {
     pub(crate) cached_token_history: Vec<u32>,
     /// Content hash of the image set associated with the live cache. Used
     /// in Step 5c to detect mid-session image changes (which require a
-    /// full session restart). `None` when no session is active or the
-    /// session is text-only.
+    /// full session restart). Preserved with the ordered image-position
+    /// sidecar across successful warm text saves so subsequent registrations
+    /// retain the exact image-aware cache lineage.
     pub(crate) cached_image_key: Option<u64>,
     /// Content hash of the audio set associated with the live cache. Audio
     /// counterpart of `cached_image_key`: set after an audio prefill so a
     /// follow-up text delta is rejected (the continue path is text-only) and
-    /// a follow-up audio turn cold-restarts. `None` for text-only / image-only
-    /// sessions.
+    /// a follow-up audio turn cold-restarts. Like the image key, this is
+    /// cleared after a warm text save even though the live media KV remains;
+    /// `media_session_context` is the persistent source of truth.
     pub(crate) cached_audio_key: Option<u64>,
+    /// Ordered absolute image-placeholder positions and their raw-image hashes
+    /// for the media lineage currently represented by the live/persisted paged
+    /// request. Text continuations preserve this sidecar so every later
+    /// registration uses the same image-aware per-block keys instead of
+    /// republishing image K/V under token-only hashes.
+    cached_paged_image_token_positions: Vec<(u32, u64)>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
     /// **Opt-in via `Gemma4Config::use_block_paged_cache`**. Gemma4's
@@ -404,19 +421,161 @@ pub(crate) struct Gemma4Inner {
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Draft model for speculative decoding (`Gemma4LoadOptions::
+    /// draft_model_path`), either [`Gemma4Draft`] variant. Mutually
+    /// exclusive with `paged_adapter`: the load path hard-errors on an
+    /// explicit `use_block_paged_cache: true` conflict and forces the unset
+    /// default to flat, so `draft.is_some()` implies
+    /// `paged_adapter.is_none()`.
+    pub(crate) draft: Option<Gemma4Draft>,
+    /// Per-turn draft handoff: the whole-turn core builds the variant's
+    /// prefill-derived state (DSpark fused-context cache / assistant
+    /// last-prompt hidden) during prefill and stashes it here;
+    /// `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
+    /// stepper (the engine's `DsparkTurnSetup` carries only turn constants,
+    /// so prefill-derived state travels through this seam). Always `None`
+    /// outside a live draft whole-turn.
+    pub(crate) draft_turn_state: Option<super::dspark_decode::Gemma4DraftTurnState>,
+    /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
+    /// computed once here in `Gemma4Inner::new` instead of re-derived
+    /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
+    /// decode-step call. Pure function of the immutable `config`, so it
+    /// never changes for the lifetime of this instance. Empty when
+    /// `paged_adapter` is `None`: every paged-only call site that reads it
+    /// errors out on a `None` adapter before consuming the value.
+    pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
-    /// True only while a media (audio / non-unified image) turn left its
+    /// Media kinds causally represented by the current session's live/persisted
+    /// prefix. This survives every successful warm text continuation because
+    /// those turns extend — rather than replace — the media-derived KV. Cleared
+    /// when that session is reset, invalidated, or successfully replaced.
+    media_session_context: MediaCapabilities,
+    /// Context handed to the currently executing generic paged text turn.
+    /// `run_paged_turn` snapshots `TurnPlan::context_media` here so
+    /// `save_paged_history` can distinguish a warm media continuation from a
+    /// fresh text replacement without widening the model-neutral trait.
+    paged_text_turn_context: MediaCapabilities,
+    /// True only while a pure image turn left its
     /// global paged KV live AND a sliding history checkpoint remembered at the
     /// full kept-live prefix, so a follow-up text delta can warm-continue on
     /// the live media KV causally. Set exclusively by
     /// `finalize_vision_turn_media_state` on the continuable branch; reset to
     /// `false` at every non-continuable point (`clear_reuse_state`, both vision
     /// prefill-start blocks, the non-continuable finalize). When `false`, the
-    /// `text_delta_image_guard` rejects a media-session delta as today.
+    /// `text_delta_media_guard` rejects a media-session delta as today.
     media_session_continuable: bool,
+    /// `PagedBackend::finalize_paged_turn` is infallible at the trait seam, but
+    /// Gemma's per-block registration is not. Latch a failure here so the
+    /// immediately-following fallible `save_paged_history` refuses to publish
+    /// token/sliding history and lets the engine reset the failed session.
+    paged_finalize_failed: bool,
     pub(crate) model_id: u64,
+}
+
+/// Describe Gemma's actually wired media paths separately from inputs that
+/// must enter the family backend only to preserve a specific compatibility
+/// error.
+const fn gemma4_media_plan(
+    image_components_loaded: bool,
+    audio_embedder_loaded: bool,
+    paged_adapter_loaded: bool,
+) -> MediaPlan {
+    let images_available = image_components_loaded && paged_adapter_loaded;
+    let audio_available = audio_embedder_loaded && paged_adapter_loaded;
+    MediaPlan::with_backend_validation(
+        MediaCapabilities {
+            images: images_available,
+            audio: audio_available,
+        },
+        MediaCapabilities {
+            // Image input was historically admitted unconditionally so the
+            // Gemma core could distinguish missing vision from missing paged
+            // execution. Keep that family-owned diagnostic.
+            images: true,
+            // Audio was historically admitted only when its embedder existed.
+            // With no paged adapter, the family core owns the compatibility
+            // error; with no embedder, the engine rejects it before render.
+            audio: audio_embedder_loaded,
+        },
+    )
+}
+
+const fn gemma4_image_path_loaded(
+    image_processor_loaded: bool,
+    vision_projection_loaded: bool,
+    standard_vision_tower_loaded: bool,
+    unified_vision_embedder_loaded: bool,
+    paged_adapter_loaded: bool,
+) -> bool {
+    image_processor_loaded
+        && vision_projection_loaded
+        && (standard_vision_tower_loaded || unified_vision_embedder_loaded)
+        && paged_adapter_loaded
+}
+
+const fn gemma4_media_continuable(has_image: bool, has_audio: bool) -> bool {
+    has_image && !has_audio
+}
+
+const fn gemma4_vlm_prefix_checkpoint_eligible(
+    has_image: bool,
+    has_audio: bool,
+    reuse_cache: bool,
+) -> bool {
+    has_image && !has_audio && reuse_cache
+}
+
+fn gemma4_carries_image_lineage(
+    context_media: MediaCapabilities,
+    cached_image_key: Option<u64>,
+    cached_image_token_positions: &[(u32, u64)],
+    cached_token_history: &[u32],
+    tokens: &[u32],
+) -> bool {
+    context_media.images
+        && cached_image_key.is_some()
+        && !cached_image_token_positions.is_empty()
+        && !cached_token_history.is_empty()
+        && tokens.starts_with(cached_token_history)
+}
+
+/// Draft-model variant loaded alongside the target for speculative decoding
+/// (`Gemma4LoadOptions::draft_model_path`). The kind probe in
+/// `persistence.rs` picks the variant from the draft checkpoint's
+/// config.json identity fields, then hands the directory to that variant's
+/// strict loader.
+pub(crate) enum Gemma4Draft {
+    /// DeepSpec DSpark external draft: 5-layer cross-attending transformer
+    /// drafting whole masked blocks over a fused target-hidden context
+    /// ([`super::dspark`]).
+    Dspark(super::dspark::DsparkDraftModel),
+    /// Google assistant checkpoint draft: Q-only transformer drafting by
+    /// chained single-token AR steps over the target's committed KV caches
+    /// ([`super::assistant`]).
+    Assistant(super::assistant::AssistantDraftModel),
+}
+
+impl Gemma4Draft {
+    /// Checkpoint tensor bytes for cache-limit accounting (see the variant
+    /// loaders' `weight_bytes` docs for the measurement contract).
+    pub(crate) fn weight_bytes(&self) -> u64 {
+        match self {
+            Self::Dspark(draft) => draft.weight_bytes(),
+            Self::Assistant(draft) => draft.weight_bytes(),
+        }
+    }
+
+    /// Every checkpoint-backed tensor the draft owns, for the post-load
+    /// materialization pass (cheap array-handle clones covering exactly the
+    /// applied checkpoint set — byte-coverage pinned per variant).
+    pub(crate) fn collect_weight_arrays(&self) -> Vec<MxArray> {
+        match self {
+            Self::Dspark(draft) => draft.collect_weight_arrays(),
+            Self::Assistant(draft) => draft.collect_weight_arrays(),
+        }
+    }
 }
 
 /// Gemma 4 dense language model.
@@ -471,6 +630,30 @@ pub struct Gemma4Model {
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// Snapshot of `Gemma4Inner::draft.is_some()` captured at load time
+    /// (same mirroring pattern as `paged_active`): whether a draft model —
+    /// either [`Gemma4Draft`] variant — was loaded via
+    /// `Gemma4LoadOptions::draft_model_path` or discovered in the target's
+    /// `draft/` directory. Surfaced through the
+    /// `hasMtpWeights()` NAPI method (named for parity with the Qwen3.5
+    /// surface) so server endpoints can branch without a model-thread
+    /// roundtrip. Stubs from `new(config)` always report `false`.
+    pub(crate) draft_active: bool,
+}
+
+/// Optional load-time settings for [`Gemma4Model::load`].
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct Gemma4LoadOptions {
+    /// Directory of a draft checkpoint (config.json + safetensors) to load
+    /// alongside the target model for speculative decoding — either a
+    /// DSpark draft or a Google assistant draft; the kind is probed from
+    /// the draft config.json. When omitted, `<model_path>/draft/` is loaded
+    /// automatically when present. Draft decoding runs only on the flat
+    /// KV-cache path: setting this while the model config explicitly enables
+    /// `use_block_paged_cache` is a hard load error, and an unset
+    /// `use_block_paged_cache` is forced to `false`.
+    pub draft_model_path: Option<String>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -511,19 +694,24 @@ pub(crate) enum PrefixCacheDecision {
 const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT: usize = 16;
 const GEMMA4_SLIDING_PREFIX_CHECKPOINT_WINDOW_MULTIPLIER: usize = 2;
 const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT: usize = 128;
+const GEMMA4_IMAGE_PREFIX_CHECKPOINT_LIMIT: usize = 2;
+const GEMMA4_SLIDING_CHECKPOINT_MEMORY_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 const GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB: u32 = 256;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
+#[derive(Clone)]
 struct Gemma4SlidingPrefixCheckpoint {
     prefix_len: u32,
     block_size: u32,
     final_block_hash: u64,
+    protected_image_prompt_boundary: bool,
     tokens: Vec<u32>,
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
 }
 
 struct Gemma4SlidingHistoryCheckpoint {
     tokens: Vec<u32>,
+    image_token_positions: Vec<(u32, u64)>,
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
 }
 
@@ -554,16 +742,109 @@ struct Gemma4SlidingPrefixPreparation {
     primed_prefix_len: u32,
 }
 
+struct Gemma4VlmTurnPreparation {
+    cached_prefix_len: u32,
+    suffix_embeds: MxArray,
+    layer_kinds: Vec<Gemma4LayerKind>,
+    extra_keys_per_block: Vec<Vec<u64>>,
+    publish_prefix_checkpoints: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4VlmPrefixPolicy {
+    unified_boundary_safe: bool,
+    require_exact_checkpoint: bool,
+    may_replay_leading_text: bool,
+}
+
+fn gemma4_vlm_prefix_policy(
+    candidate_cached_prefix_len: u32,
+    first_image_position: Option<u32>,
+    unified_overlay_last_image_exclusive: Option<u32>,
+) -> Gemma4VlmPrefixPolicy {
+    let unified_boundary_safe =
+        unified_overlay_last_image_exclusive.is_none_or(|last_image_exclusive| {
+            candidate_cached_prefix_len == 0 || candidate_cached_prefix_len >= last_image_exclusive
+        });
+    let candidate_crosses_image = first_image_position
+        .is_some_and(|first_image_position| candidate_cached_prefix_len > first_image_position);
+    let require_exact_checkpoint =
+        unified_overlay_last_image_exclusive.is_some() || candidate_crosses_image;
+    Gemma4VlmPrefixPolicy {
+        unified_boundary_safe,
+        require_exact_checkpoint,
+        may_replay_leading_text: unified_boundary_safe
+            && !require_exact_checkpoint
+            && candidate_cached_prefix_len > 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemma4_vlm_prefill_chunk_end(
+    pass1_position: u32,
+    pass1_end: u32,
+    configured_chunk_size: i32,
+    overlay_active: bool,
+    leading_text_checkpoint_boundary: u32,
+    prompt_checkpoint_boundary: u32,
+    last_image_exclusive: Option<u32>,
+) -> u32 {
+    let first_overlay_chunk = overlay_active && pass1_position == 0;
+    let default_chunk_end = if first_overlay_chunk {
+        let safe_boundary = prompt_checkpoint_boundary;
+        if safe_boundary >= last_image_exclusive.unwrap_or(u32::MAX) && safe_boundary < pass1_end {
+            safe_boundary
+        } else {
+            pass1_end
+        }
+    } else if configured_chunk_size > 0 {
+        pass1_position
+            .saturating_add(configured_chunk_size as u32)
+            .min(pass1_end)
+    } else {
+        pass1_end
+    };
+
+    let mut chunk_end = default_chunk_end;
+    for boundary in [leading_text_checkpoint_boundary, prompt_checkpoint_boundary] {
+        if first_overlay_chunk && boundary < last_image_exclusive.unwrap_or(u32::MAX) {
+            continue;
+        }
+        if boundary > pass1_position && boundary < chunk_end {
+            chunk_end = boundary;
+        }
+    }
+    chunk_end
+}
+
 struct Gemma4PagedTurnPreparation {
     cached_prefix_len: u32,
     suffix_len: u32,
     sliding_primed_prefix_len: u32,
 }
 
+#[cfg(test)]
 fn compute_gemma4_paged_prefix_block_hash(
     tokens: &[u32],
     prefix_len: u32,
     block_size: u32,
+    cache_salt: u64,
+) -> Option<u64> {
+    let empty_extra_keys = vec![Vec::new(); (prefix_len / block_size.max(1)) as usize];
+    compute_gemma4_paged_prefix_block_hash_with_keys(
+        tokens,
+        prefix_len,
+        block_size,
+        &empty_extra_keys,
+        cache_salt,
+    )
+}
+
+fn compute_gemma4_paged_prefix_block_hash_with_keys(
+    tokens: &[u32],
+    prefix_len: u32,
+    block_size: u32,
+    extra_keys_per_block: &[Vec<u64>],
     cache_salt: u64,
 ) -> Option<u64> {
     if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
@@ -579,16 +860,34 @@ fn compute_gemma4_paged_prefix_block_hash(
     let num_blocks = prefix_len / block_size;
     let mut parent_hash = 0;
     for block_idx in 0..num_blocks {
+        let extra_keys = extra_keys_per_block.get(block_idx)?;
         let start = block_idx * block_size;
         let end = start + block_size;
         parent_hash = if block_idx == 0 && cache_salt != 0 {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &[cache_salt])
+            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
+            salted_keys.extend_from_slice(extra_keys);
+            salted_keys.push(cache_salt);
+            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
         } else {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &[])
+            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
         };
     }
 
     Some(parent_hash)
+}
+
+fn gemma4_prefix_uses_media_keys(
+    prefix_len: u32,
+    block_size: u32,
+    extra_keys_per_block: &[Vec<u64>],
+) -> bool {
+    if block_size == 0 {
+        return false;
+    }
+    extra_keys_per_block
+        .iter()
+        .take((prefix_len / block_size) as usize)
+        .any(|keys| !keys.is_empty())
 }
 
 fn gemma4_sliding_caches_ready_at(
@@ -603,7 +902,10 @@ fn gemma4_sliding_caches_ready_at(
         return Ok(false);
     }
     for (layer_idx, cache) in caches.iter().enumerate() {
-        if !config.is_sliding_layer(layer_idx) {
+        // KV-shared layers are aliases: SharedOnSliding consumes its physical
+        // anchor's stash and never advances the alias slot itself. Requiring an
+        // offset on that empty slot makes every E2B checkpoint impossible.
+        if !config.is_sliding_layer(layer_idx) || config.is_kv_shared_layer(layer_idx) {
             continue;
         }
         if !cache.sliding_offset_matches(offset as i32)? {
@@ -624,7 +926,7 @@ fn snapshot_gemma4_sliding_caches(
 
     let mut snapshots = Vec::with_capacity(caches.len());
     for (layer_idx, cache) in caches.iter().enumerate() {
-        if config.is_sliding_layer(layer_idx) {
+        if config.is_sliding_layer(layer_idx) && !config.is_kv_shared_layer(layer_idx) {
             let Some(snapshot) = cache.snapshot_sliding()? else {
                 return Ok(None);
             };
@@ -634,6 +936,88 @@ fn snapshot_gemma4_sliding_caches(
         }
     }
     Ok(Some(snapshots))
+}
+
+fn gemma4_sliding_snapshots_ready_at(
+    config: &Gemma4Config,
+    snapshots: &[Option<RotatingKVCacheSnapshot>],
+    expected_offset: u32,
+) -> bool {
+    if snapshots.len() != config.num_hidden_layers as usize {
+        return false;
+    }
+    snapshots.iter().enumerate().all(|(layer_idx, snapshot)| {
+        if config.is_sliding_layer(layer_idx) && !config.is_kv_shared_layer(layer_idx) {
+            snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.offset == expected_offset as i32
+                    && snapshot.max_size == config.sliding_window
+            })
+        } else {
+            snapshot.is_none()
+        }
+    })
+}
+
+fn prepare_gemma4_sliding_checkpoint_captures(
+    config: &Gemma4Config,
+    caches: &mut [Gemma4LayerCache],
+    boundaries: &[u32],
+) -> Result<()> {
+    if caches.len() != config.num_hidden_layers as usize {
+        return Err(Error::from_reason(format!(
+            "Gemma4 sliding checkpoint capture cache count mismatch: caches={} layers={}",
+            caches.len(),
+            config.num_hidden_layers
+        )));
+    }
+    for (layer_idx, cache) in caches.iter_mut().enumerate() {
+        if config.is_sliding_layer(layer_idx) && !config.is_kv_shared_layer(layer_idx) {
+            cache.prepare_sliding_checkpoint_capture(boundaries)?;
+        } else {
+            cache.prepare_sliding_checkpoint_capture(&[])?;
+        }
+    }
+    Ok(())
+}
+
+fn take_gemma4_sliding_checkpoint_captures(
+    config: &Gemma4Config,
+    caches: &mut [Gemma4LayerCache],
+    boundaries: &[u32],
+) -> Result<Vec<Vec<Option<RotatingKVCacheSnapshot>>>> {
+    let mut captures = vec![vec![None; caches.len()]; boundaries.len()];
+    for (layer_idx, cache) in caches.iter_mut().enumerate() {
+        let layer_captures = cache.take_sliding_checkpoint_captures();
+        if !config.is_sliding_layer(layer_idx) || config.is_kv_shared_layer(layer_idx) {
+            if !layer_captures.is_empty() {
+                return Err(Error::from_reason(format!(
+                    "Gemma4 non-physical sliding layer {layer_idx} produced checkpoint captures"
+                )));
+            }
+            continue;
+        }
+        if layer_captures.len() != boundaries.len() {
+            return Err(Error::from_reason(format!(
+                "Gemma4 sliding layer {layer_idx} captured {} checkpoints for {} boundaries",
+                layer_captures.len(),
+                boundaries.len()
+            )));
+        }
+        for (boundary_idx, (snapshot, &boundary)) in layer_captures
+            .into_iter()
+            .zip(boundaries.iter())
+            .enumerate()
+        {
+            if snapshot.offset != boundary as i32 {
+                return Err(Error::from_reason(format!(
+                    "Gemma4 sliding layer {layer_idx} checkpoint offset {} != boundary {boundary}",
+                    snapshot.offset
+                )));
+            }
+            captures[boundary_idx][layer_idx] = Some(snapshot);
+        }
+    }
+    Ok(captures)
 }
 
 fn materialize_gemma4_sliding_snapshots(
@@ -670,7 +1054,7 @@ fn restore_gemma4_sliding_caches(
         .enumerate()
         .take(config.num_hidden_layers as usize)
     {
-        if !config.is_sliding_layer(layer_idx) {
+        if !config.is_sliding_layer(layer_idx) || config.is_kv_shared_layer(layer_idx) {
             continue;
         }
         let Some(snapshot) = snapshots.get(layer_idx).and_then(|s| s.as_ref()) else {
@@ -971,6 +1355,27 @@ impl Gemma4Inner {
             None
         };
 
+        // Derive the per-layer paged-routing classification once here
+        // instead of on every paged prefill-chunk / decode-step call (see
+        // `compute_layer_kinds_from_kv_cache_specs`'s BTreeMap/BTreeSet
+        // grouping + sort). It's a pure function of `config`, which is
+        // immutable for the lifetime of this `Gemma4Inner`. Only meaningful
+        // when `paged_adapter` is `Some` — every caller first errors out on
+        // a `None` adapter before reading the result, so `Vec::new()` below
+        // is never read in that case. Guaranteed to succeed whenever
+        // `paged_adapter` built above, since that already validated a
+        // strictly stronger constraint (a single full-attention group) over
+        // the same specs.
+        let layer_kinds = if paged_adapter.is_some() {
+            compute_layer_kinds_from_kv_cache_specs(&config).map_err(|e| {
+                Error::from_reason(format!(
+                    "Gemma4Inner::new: failed to derive cached layer-kind routes: {e}"
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -989,13 +1394,58 @@ impl Gemma4Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             cached_audio_key: None,
+            cached_paged_image_token_positions: Vec::new(),
             paged_adapter,
+            draft: None,
+            draft_turn_state: None,
+            layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
+            media_session_context: MediaCapabilities::NONE,
+            paged_text_turn_context: MediaCapabilities::NONE,
             media_session_continuable: false,
+            paged_finalize_failed: false,
             model_id,
         })
+    }
+
+    /// Whether the complete physical image execution path is loaded.
+    ///
+    /// This is the single authority for both `ExecutionPlan.media.images` and
+    /// the NAPI `supportsImages()` snapshot. A config declaration or lone image
+    /// processor is insufficient: inference also needs one vision stack, its
+    /// projection, and the paged adapter used by Gemma's multimodal executor.
+    pub(crate) fn image_path_loaded(&self) -> bool {
+        gemma4_image_path_loaded(
+            self.image_processor.is_some(),
+            self.embed_vision.is_some(),
+            self.vision_tower.is_some(),
+            self.unified_vision_embedder.is_some(),
+            self.paged_adapter.is_some(),
+        )
+    }
+
+    /// The loaded DSpark draft, when the draft variant is DSpark.
+    pub(crate) fn dspark_draft(&self) -> Option<&super::dspark::DsparkDraftModel> {
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// The loaded assistant draft, when the draft variant is assistant.
+    pub(crate) fn assistant_draft(&self) -> Option<&super::assistant::AssistantDraftModel> {
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Assistant(draft)) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// Whether ANY draft variant is loaded (the speculative whole-turn
+    /// gate; see `mtp_turn`).
+    pub(crate) fn has_draft(&self) -> bool {
+        self.draft.is_some()
     }
 
     /// Initialize the per-turn KV caches in-place.
@@ -1024,17 +1474,17 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Build the per-layer routing list for the paged dispatch.
+    /// Return the per-layer routing list for the paged dispatch.
     ///
-    /// See [`compute_layer_kinds`] (free helper) for full semantics.
-    /// This wrapper is the on-`Gemma4Inner` entry point used by the
-    /// chat-session forward dispatch.
+    /// Cheap clone of `self.layer_kinds`, cached once in `Gemma4Inner::new`
+    /// instead of being re-derived (BTreeMap/BTreeSet grouping + a sort —
+    /// see [`compute_layer_kinds`] (free helper) and
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every call. It's a pure
+    /// function of the immutable `Gemma4Config`, so recomputing it from
+    /// scratch on every paged prefill-chunk / decode-step call was pure
+    /// waste.
     pub(crate) fn compute_layer_kinds(&self) -> Result<Vec<Gemma4LayerKind>> {
-        compute_layer_kinds_from_kv_cache_specs(&self.config).map_err(|e| {
-            Error::from_reason(format!(
-                "Gemma4 compute_layer_kinds: failed to derive KV routes: {e}"
-            ))
-        })
+        Ok(self.layer_kinds.clone())
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -1055,24 +1505,44 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Clear cached token history and image key. Called from both
+    /// Clear cached token history and media identity/context. Called from both
     /// `init_caches_sync` and `reset_caches_sync`.
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_audio_key = None;
+        self.cached_paged_image_token_positions.clear();
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
         self.media_session_continuable = false;
+        self.paged_finalize_failed = false;
+    }
+
+    /// Publish the raw media identity and the persistent causal context for a
+    /// successfully finalized multimodal turn.
+    fn publish_media_session_context(
+        &mut self,
+        new_image_key: Option<u64>,
+        new_audio_key: Option<u64>,
+    ) {
+        self.cached_image_key = new_image_key;
+        self.cached_audio_key = new_audio_key;
+        self.media_session_context = MediaCapabilities {
+            images: new_image_key.is_some(),
+            audio: new_audio_key.is_some(),
+        };
     }
 
     fn find_gemma4_sliding_history_checkpoint(
         &self,
         tokens: &[u32],
         prefix_len: u32,
+        image_token_positions: &[(u32, u64)],
     ) -> Result<Option<Vec<Gemma4LayerCache>>> {
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
             return Ok(None);
@@ -1080,7 +1550,9 @@ impl Gemma4Inner {
         let Some(checkpoint) = self.sliding_last_history_checkpoint.as_ref() else {
             return Ok(None);
         };
-        if checkpoint.tokens.as_slice() != prefix_tokens {
+        if checkpoint.tokens.as_slice() != prefix_tokens
+            || checkpoint.image_token_positions.as_slice() != image_token_positions
+        {
             return Ok(None);
         }
         restore_gemma4_sliding_caches(&self.config, &checkpoint.snapshots, prefix_len)
@@ -1132,18 +1604,40 @@ impl Gemma4Inner {
         trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
         let update_start = trace_enabled.then(std::time::Instant::now);
-        self.sliding_last_history_checkpoint =
-            Some(Gemma4SlidingHistoryCheckpoint { tokens, snapshots });
+        self.sliding_last_history_checkpoint = Some(Gemma4SlidingHistoryCheckpoint {
+            tokens,
+            image_token_positions: self.cached_paged_image_token_positions.clone(),
+            snapshots,
+        });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(test)]
     fn find_gemma4_sliding_prefix_checkpoint(
         &self,
         tokens: &[u32],
         prefix_len: u32,
         block_size: u32,
+        cache_salt: u64,
+    ) -> Result<Option<Gemma4SlidingPrefixCheckpointHit>> {
+        let extra_keys_per_block = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        self.find_gemma4_sliding_prefix_checkpoint_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            &extra_keys_per_block,
+            cache_salt,
+        )
+    }
+
+    fn find_gemma4_sliding_prefix_checkpoint_with_keys(
+        &self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<Option<Gemma4SlidingPrefixCheckpointHit>> {
         fn try_restore_checkpoint(
@@ -1152,6 +1646,7 @@ impl Gemma4Inner {
             tokens: &[u32],
             target_prefix_len: u32,
             block_size: u32,
+            extra_keys_per_block: &[Vec<u64>],
             cache_salt: u64,
         ) -> Result<Option<Gemma4SlidingPrefixCheckpointHit>> {
             if checkpoint.prefix_len > target_prefix_len || checkpoint.block_size != block_size {
@@ -1163,10 +1658,11 @@ impl Gemma4Inner {
             if checkpoint.tokens.as_slice() != prefix_tokens {
                 return Ok(None);
             }
-            let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash(
+            let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
                 tokens,
                 checkpoint.prefix_len,
                 block_size,
+                extra_keys_per_block,
                 cache_salt,
             ) else {
                 return Ok(None);
@@ -1196,6 +1692,7 @@ impl Gemma4Inner {
                 tokens,
                 prefix_len,
                 block_size,
+                extra_keys_per_block,
                 cache_salt,
             )?
         {
@@ -1215,6 +1712,7 @@ impl Gemma4Inner {
                 tokens,
                 prefix_len,
                 block_size,
+                extra_keys_per_block,
                 cache_salt,
             )? {
                 if hit.prefix_len == prefix_len {
@@ -1234,12 +1732,38 @@ impl Gemma4Inner {
         block_size: u32,
         cache_salt: u64,
     ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            tokens.len(),
+            block_size,
+            &self.cached_paged_image_token_positions,
+        );
+        self.remember_gemma4_sliding_prefix_checkpoint_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            &extra_keys_per_block,
+            cache_salt,
+        )
+    }
+
+    fn remember_gemma4_sliding_prefix_checkpoint_with_keys(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
         let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        let Some(final_block_hash) =
-            compute_gemma4_paged_prefix_block_hash(tokens, prefix_len, block_size, cache_salt)
-        else {
+        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        ) else {
             return Ok(trace.finish(total_start));
         };
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
@@ -1287,6 +1811,7 @@ impl Gemma4Inner {
                 prefix_len,
                 block_size,
                 final_block_hash,
+                protected_image_prompt_boundary: false,
                 tokens: prefix_tokens,
                 snapshots,
             });
@@ -1308,12 +1833,38 @@ impl Gemma4Inner {
         block_size: u32,
         cache_salt: u64,
     ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            tokens.len(),
+            block_size,
+            &self.cached_paged_image_token_positions,
+        );
+        self.remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            &extra_keys_per_block,
+            cache_salt,
+        )
+    }
+
+    fn remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
         let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        let Some(final_block_hash) =
-            compute_gemma4_paged_prefix_block_hash(tokens, prefix_len, block_size, cache_salt)
-        else {
+        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        ) else {
             return Ok(trace.finish(total_start));
         };
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
@@ -1357,6 +1908,7 @@ impl Gemma4Inner {
                 prefix_len,
                 block_size,
                 final_block_hash,
+                protected_image_prompt_boundary: false,
                 tokens: prefix_tokens,
                 snapshots,
             });
@@ -1371,6 +1923,71 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
+    /// Store a prefix checkpoint captured from inside a larger prefill compute
+    /// chunk. Unlike the live-cache path above, these snapshots describe an
+    /// earlier logical offset and therefore must not be re-read from
+    /// `self.caches`, which has already advanced to the chunk end.
+    fn remember_gemma4_sliding_captured_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        cache_salt: u64,
+        mut snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
+    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            tokens.len(),
+            block_size,
+            &self.cached_paged_image_token_positions,
+        );
+        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            &extra_keys_per_block,
+            cache_salt,
+        ) else {
+            return Ok(trace.finish(total_start));
+        };
+        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
+            return Ok(trace.finish(total_start));
+        };
+        if !gemma4_sliding_snapshots_ready_at(&self.config, &snapshots, prefix_len) {
+            return Err(Error::from_reason(format!(
+                "Gemma4 captured sliding snapshots are incomplete at offset {prefix_len}"
+            )));
+        }
+
+        let eval_start = trace_enabled.then(std::time::Instant::now);
+        materialize_gemma4_sliding_snapshots(&mut snapshots)?;
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_tokens = prefix_tokens.to_vec();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        upsert_gemma4_sliding_prefix_checkpoint(
+            &mut self.sliding_prefix_checkpoints,
+            Gemma4SlidingPrefixCheckpoint {
+                prefix_len,
+                block_size,
+                final_block_hash,
+                protected_image_prompt_boundary: false,
+                tokens: prefix_tokens,
+                snapshots,
+            },
+            gemma4_sliding_prefix_checkpoint_limit(&self.config, block_size),
+            trace_enabled,
+        );
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+        Ok(trace.finish(total_start))
+    }
+
     fn remember_gemma4_sliding_materialized_prompt_boundary_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1378,12 +1995,40 @@ impl Gemma4Inner {
         block_size: u32,
         cache_salt: u64,
     ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            tokens.len(),
+            block_size,
+            &self.cached_paged_image_token_positions,
+        );
+        self.remember_gemma4_sliding_materialized_prompt_boundary_checkpoint_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            &extra_keys_per_block,
+            cache_salt,
+            false,
+        )
+    }
+
+    fn remember_gemma4_sliding_materialized_prompt_boundary_checkpoint_with_keys(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        protect_image_prompt_boundary: bool,
+    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
         let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        let Some(final_block_hash) =
-            compute_gemma4_paged_prefix_block_hash(tokens, prefix_len, block_size, cache_salt)
-        else {
+        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        ) else {
             self.sliding_prompt_boundary_checkpoint = None;
             return Ok(trace.finish(total_start));
         };
@@ -1420,13 +2065,22 @@ impl Gemma4Inner {
         trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
         let update_start = trace_enabled.then(std::time::Instant::now);
-        self.sliding_prompt_boundary_checkpoint = Some(Gemma4SlidingPrefixCheckpoint {
+        let checkpoint = Gemma4SlidingPrefixCheckpoint {
             prefix_len,
             block_size,
             final_block_hash,
+            protected_image_prompt_boundary: protect_image_prompt_boundary
+                && gemma4_prefix_uses_media_keys(prefix_len, block_size, extra_keys_per_block),
             tokens: prefix_tokens,
             snapshots,
-        });
+        };
+        upsert_gemma4_sliding_prefix_checkpoint(
+            &mut self.sliding_prefix_checkpoints,
+            checkpoint.clone(),
+            gemma4_sliding_prefix_checkpoint_limit(&self.config, block_size),
+            trace_enabled,
+        );
+        self.sliding_prompt_boundary_checkpoint = Some(checkpoint);
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
@@ -1512,11 +2166,14 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    fn prepare_gemma4_sliding_prefix_state(
+    fn prepare_gemma4_sliding_prefix_state_with_keys(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         continued_live_prefix: bool,
+        extra_keys_per_block: &[Vec<u64>],
+        image_token_positions: &[(u32, u64)],
+        require_exact_checkpoint: bool,
     ) -> Result<Gemma4SlidingPrefixPreparation> {
         let trace_enabled = inference_trace_enabled();
         let prepare_start = trace_enabled.then(std::time::Instant::now);
@@ -1535,7 +2192,10 @@ impl Gemma4Inner {
             });
         }
 
+        let image_identity_matches =
+            self.cached_paged_image_token_positions.as_slice() == image_token_positions;
         if continued_live_prefix
+            && image_identity_matches
             && gemma4_sliding_caches_ready_at(
                 &self.config,
                 self.caches.as_deref(),
@@ -1555,7 +2215,8 @@ impl Gemma4Inner {
             });
         }
 
-        let matches_live_history = self.cached_token_history.len() == cached_prefix_len as usize
+        let matches_live_history = image_identity_matches
+            && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if matches_live_history
             && gemma4_sliding_caches_ready_at(
@@ -1578,9 +2239,11 @@ impl Gemma4Inner {
         }
 
         let history_lookup_start = trace_enabled.then(std::time::Instant::now);
-        if let Some(caches) =
-            self.find_gemma4_sliding_history_checkpoint(tokens, cached_prefix_len)?
-        {
+        if let Some(caches) = self.find_gemma4_sliding_history_checkpoint(
+            tokens,
+            cached_prefix_len,
+            image_token_positions,
+        )? {
             self.caches = Some(caches);
             if trace_enabled {
                 write_inference_trace(format_args!(
@@ -1602,10 +2265,21 @@ impl Gemma4Inner {
             .map(|adapter| adapter.block_size())
             .unwrap_or(0);
         let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
-        if let Some(hit) =
-            self.find_gemma4_sliding_prefix_checkpoint(tokens, cached_prefix_len, block_size, 0)?
-        {
+        if let Some(hit) = self.find_gemma4_sliding_prefix_checkpoint_with_keys(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            0,
+        )? {
             let hit_prefix_len = hit.prefix_len;
+            if require_exact_checkpoint && hit_prefix_len != cached_prefix_len {
+                self.caches = Some(init_caches_for_config(&self.config));
+                return Ok(Gemma4SlidingPrefixPreparation {
+                    state: "image_checkpoint_miss",
+                    primed_prefix_len: 0,
+                });
+            }
             self.caches = Some(hit.caches);
             let state = if hit_prefix_len == cached_prefix_len {
                 "prefix_checkpoint"
@@ -1654,14 +2328,19 @@ impl Gemma4Inner {
     ///
     /// The engine session core owns message-side image extraction
     /// (`engine::session::extract_images_from_messages`) and prompt
-    /// rendering; the raw bytes arrive via [`WholeTurnArgs::images`].
+    /// rendering; the raw bytes arrive via [`WholeTurnArgs::media`].
     /// The "no vision support" rejection surfaces from INSIDE the vision
     /// turn (after render).
     fn prepare_vision_tokens(
         &self,
         rendered_tokens: &[u32],
         raw_images: &[Vec<u8>],
-    ) -> Result<(Vec<u32>, Vec<ProcessedGemma4Image>, Option<u64>)> {
+    ) -> Result<(
+        Vec<u32>,
+        Vec<ProcessedGemma4Image>,
+        Option<u64>,
+        Vec<(u32, u64)>,
+    )> {
         let ip = self.image_processor.as_ref().ok_or_else(|| {
             Error::from_reason(
                 "Images provided but model has no vision support (no vision_config in config.json)",
@@ -1677,7 +2356,8 @@ impl Gemma4Inner {
         // Session callers inspect this field to decide whether a
         // session-continue delta is allowed (text-only) or requires
         // a fresh `chat_session_start`.
-        let new_image_key = Some(engine::compute_image_cache_key(raw_images));
+        let (combined_image_key, per_image_hashes) = engine::compute_image_cache_keys(raw_images);
+        let new_image_key = Some(combined_image_key);
 
         // Expand image tokens. Gemma4 uses: <|image>  (BOI) +
         // <|image|> × num_soft_tokens + <image|> (EOI). The chat template
@@ -1693,7 +2373,24 @@ impl Gemma4Inner {
             eoi_token_id,
         );
 
-        Ok((expanded, processed_images, new_image_key))
+        let per_image_token_counts = processed_images
+            .iter()
+            .map(|image| image.num_soft_tokens as usize)
+            .collect::<Vec<_>>();
+        let image_token_positions = engine::map_expanded_image_token_positions(
+            &expanded,
+            image_token_id,
+            &per_image_token_counts,
+            &per_image_hashes,
+        )
+        .map_err(Error::from_reason)?;
+
+        Ok((
+            expanded,
+            processed_images,
+            new_image_key,
+            image_token_positions,
+        ))
     }
 
     /// Decode raw (encoded) audio bytes and expand the rendered prompt's
@@ -1857,6 +2554,201 @@ impl Gemma4Inner {
         Ok(Some(merged))
     }
 
+    /// Build only the embeddings the effective paged suffix will forward.
+    /// When an image-aware hit already covers the complete image span, the
+    /// suffix is text-only: avoid running SigLIP/unified vision entirely and
+    /// embed just that suffix. Otherwise build the faithful full multimodal
+    /// stream once and slice it at the effective cache boundary.
+    fn build_gemma4_multimodal_suffix_embeds(
+        &self,
+        prompt: &MxArray,
+        processed_images: &[ProcessedGemma4Image],
+        audio_frames: Option<&MxArray>,
+        cached_prefix_len: u32,
+        last_image_exclusive: Option<u32>,
+    ) -> Result<MxArray> {
+        let prompt_len = u32::try_from(prompt.shape_at(1)?)
+            .map_err(|_| Error::from_reason("Gemma4 prompt length exceeds u32"))?;
+        if cached_prefix_len >= prompt_len {
+            return Err(Error::from_reason(format!(
+                "Gemma4 multimodal suffix is empty: cached_prefix_len={cached_prefix_len}, prompt_len={prompt_len}"
+            )));
+        }
+
+        let image_span_fully_cached = audio_frames.is_none()
+            && !processed_images.is_empty()
+            && last_image_exclusive
+                .is_some_and(|last_image_exclusive| cached_prefix_len >= last_image_exclusive);
+        if image_span_fully_cached {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "vlm_vision_tower_skip",
+                model = "gemma4",
+                cached_prefix_tokens = cached_prefix_len,
+                suffix_tokens = prompt_len - cached_prefix_len,
+                "skipping Gemma4 vision tower because the image span is fully cached"
+            );
+            let suffix = prompt.slice_axis(1, cached_prefix_len as i64, prompt_len as i64)?;
+            return self
+                .embed_tokens
+                .forward(&suffix)?
+                .mul_scalar((self.config.hidden_size as f64).sqrt());
+        }
+
+        let merged =
+            match self.build_gemma4_multimodal_embeds(prompt, processed_images, audio_frames)? {
+                Some(merged) => merged,
+                None => self
+                    .embed_tokens
+                    .forward(prompt)?
+                    .mul_scalar((self.config.hidden_size as f64).sqrt())?,
+            };
+        merged.slice_axis(1, cached_prefix_len as i64, prompt_len as i64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_gemma4_multimodal_paged_turn(
+        &mut self,
+        tokens: &[u32],
+        prompt: &MxArray,
+        processed_images: &[ProcessedGemma4Image],
+        audio_frames: Option<&MxArray>,
+        new_image_key: Option<u64>,
+        new_audio_key: Option<u64>,
+        image_token_positions: &[(u32, u64)],
+        reuse_cache: bool,
+    ) -> Result<Gemma4VlmTurnPreparation> {
+        let layer_kinds = self.compute_layer_kinds()?;
+        let total_budget = u32::try_from(tokens.len())
+            .map_err(|_| Error::from_reason("Gemma4 multimodal prompt exceeds u32"))?;
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| {
+                Error::from_reason("prepare_gemma4_multimodal_paged_turn: paged_adapter is None")
+            })?
+            .block_size();
+        let image_only = new_image_key.is_some() && new_audio_key.is_none();
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            tokens.len(),
+            block_size,
+            if image_only {
+                image_token_positions
+            } else {
+                &[]
+            },
+        );
+        let last_image_exclusive = image_token_positions
+            .last()
+            .map(|(position, _)| position.saturating_add(1));
+
+        let cached_prefix_len = if image_only {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+            let overlay_active = super::vision_mask::vision_overlay_active(
+                self.config.is_unified,
+                self.config.use_bidirectional_attention.as_deref() == Some("vision"),
+                !image_token_positions.is_empty(),
+                false,
+                tokens.len(),
+            );
+            let allow_live_continue = reuse_cache
+                && self.media_session_continuable
+                && self.cached_image_key == new_image_key
+                && self.cached_audio_key.is_none()
+                && self.cached_paged_image_token_positions == image_token_positions;
+            self.media_session_continuable = false;
+            let resolution = self.prepare_gemma4_vlm_paged_prefix(
+                tokens,
+                total_budget,
+                block_size,
+                &extra_keys_per_block,
+                image_token_positions,
+                reuse_cache,
+                allow_live_continue,
+                if overlay_active {
+                    last_image_exclusive
+                } else {
+                    None
+                },
+            )?;
+            // The image placeholder is load-bearing for the image-only branch;
+            // keep this check close to planning so a malformed expansion cannot
+            // accidentally take the text-only tower-skip path.
+            if !tokens.contains(&image_token_id) {
+                self.invalidate_gemma4_hybrid_session(
+                    "VLM image metadata had no expanded image placeholder",
+                );
+                return Err(Error::from_reason(
+                    "Gemma4 image prompt contains no expanded image tokens",
+                ));
+            }
+            resolution.effective_plan.cached_prefix_len
+        } else {
+            // Audio and mixed-media identity is not represented in the paged
+            // block chain yet. Keep that path deliberately cold and do not
+            // publish reusable prefix entries from its finalizer.
+            self.media_session_continuable = false;
+            let cold_plan = match self.paged_adapter.as_mut() {
+                Some(adapter) => adapter
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        0,
+                        tokens,
+                        total_budget,
+                        false,
+                        &extra_keys_per_block,
+                        0,
+                        true,
+                        0,
+                    )
+                    .map_err(Error::from_reason),
+                None => Err(Error::from_reason(
+                    "prepare_gemma4_multimodal_paged_turn: paged_adapter is None",
+                )),
+            };
+            if let Err(error) = cold_plan {
+                self.invalidate_gemma4_hybrid_session(
+                    "audio/mixed VLM cold paged preparation failure",
+                );
+                return Err(error);
+            }
+            self.caches = Some(init_caches_for_config(&self.config));
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+            self.cached_audio_key = None;
+            self.cached_paged_image_token_positions.clear();
+            self.media_session_context = MediaCapabilities::NONE;
+            self.paged_text_turn_context = MediaCapabilities::NONE;
+            self.sliding_last_history_checkpoint = None;
+            0
+        };
+
+        let suffix_embeds = match self.build_gemma4_multimodal_suffix_embeds(
+            prompt,
+            processed_images,
+            audio_frames,
+            cached_prefix_len,
+            last_image_exclusive,
+        ) {
+            Ok(embeds) => embeds,
+            Err(error) => {
+                self.invalidate_gemma4_hybrid_session("VLM suffix embedding preparation failure");
+                return Err(error);
+            }
+        };
+
+        Ok(Gemma4VlmTurnPreparation {
+            cached_prefix_len,
+            suffix_embeds,
+            layer_kinds,
+            extra_keys_per_block,
+            publish_prefix_checkpoints: gemma4_vlm_prefix_checkpoint_eligible(
+                new_image_key.is_some(),
+                new_audio_key.is_some(),
+                reuse_cache,
+            ),
+        })
+    }
+
     /// Prepare the merged multimodal prompt for a paged prefill: expand audio
     /// placeholders (when audio present) then image placeholders (when images
     /// present) on the rendered token stream, and decode/frame the audio.
@@ -1870,7 +2762,7 @@ impl Gemma4Inner {
     /// place, so content order is preserved regardless of which runs first.
     ///
     /// Returns `(tokens, processed_images, audio_frames, new_image_key,
-    /// new_audio_key)`. Image-only turns never touch the audio path and leave
+    /// new_audio_key, image_token_positions)`. Image-only turns never touch the audio path and leave
     /// `audio_frames`/`new_audio_key` as `None` (byte-identical to the old
     /// vision-only flow); audio-only turns never run the image processor and
     /// leave `processed_images` empty + `new_image_key` `None`.
@@ -1886,6 +2778,7 @@ impl Gemma4Inner {
         Option<MxArray>,
         Option<u64>,
         Option<u64>,
+        Vec<(u32, u64)>,
     )> {
         // Audio expansion first (only when audio present — keeps image-only
         // turns off the audio path and leaves `new_audio_key` None). On the
@@ -1908,11 +2801,12 @@ impl Gemma4Inner {
         // LAST so its spans precede the audio spans on the fallback path. Image
         // expansion only touches `<|image|>` ids, so the audio spans are inert
         // to it on the chat-template path.
-        let (tokens, processed_images, new_image_key) = if raw_images.is_empty() {
-            (tokens_after_audio, Vec::new(), None)
-        } else {
-            self.prepare_vision_tokens(&tokens_after_audio, raw_images)?
-        };
+        let (tokens, processed_images, new_image_key, image_token_positions) =
+            if raw_images.is_empty() {
+                (tokens_after_audio, Vec::new(), None, Vec::new())
+            } else {
+                self.prepare_vision_tokens(&tokens_after_audio, raw_images)?
+            };
 
         Ok((
             tokens,
@@ -1920,6 +2814,7 @@ impl Gemma4Inner {
             audio_frames,
             new_image_key,
             new_audio_key,
+            image_token_positions,
         ))
     }
 
@@ -1927,13 +2822,13 @@ impl Gemma4Inner {
     /// stream), so the two stay byte-identical. Resolves the session into
     /// exactly ONE of two states, never partial:
     ///
-    /// - **Continuable** (when `media_continuable` — i.e. ANY image or audio
+    /// - **Continuable** (when `media_continuable` — currently a pure image
     ///   turn, including the unified bidirectional-vision image — AND
     ///   `reuse_cache`, AND `finalize_turn_keep_live_per_block` succeeds, AND the
     ///   sliding-history checkpoint actually `stored`, AND the adapter is
     ///   `live_for_continue`): the global paged KV is kept live (full blocks
     ///   registered for content-addressed reuse) and the marker is set so
-    ///   `text_delta_image_guard` lets the next text delta through. On that delta
+    ///   `text_delta_media_guard` lets the next text delta through. On that delta
     ///   the global prefix is reused IN-PLACE (`continue_turn` keeps the block
     ///   table, `cachedTokens > 0`, only the new suffix is forwarded — it is NOT
     ///   re-walked) and the sliding caches resolve to `state="live"`
@@ -1949,19 +2844,18 @@ impl Gemma4Inner {
     ///   `reset_caches_sync` here, unlike the text/MoE path.
     ///
     /// ## Why `stored && live_for_continue` is the faithfulness gate
-    /// `gemma4_sliding_caches_ready_at` requires EVERY `is_sliding_layer` flat
-    /// cache populated. On KV-shared checkpoints (e2b: `SharedOnSliding` layers
-    /// physically store no flat K/V — they read the anchor's), that is never
-    /// satisfiable, so the checkpoint is a structural no-op (`stored == false`).
+    /// `gemma4_sliding_caches_ready_at` requires every PHYSICAL non-shared
+    /// sliding anchor cache to be populated. KV-shared alias slots (E2B's
+    /// `SharedOnSliding`) intentionally hold no flat K/V and are skipped; their
+    /// real anchor snapshots carry the state for both layers.
     /// A warm media→text continue is only numerically faithful when the media
     /// positions' sliding K/V can be reused IN PLACE: a text token's true
     /// embedding IS `embed_tokens.forward(id)` (replay-safe), but a media
     /// position's is a scattered SigLIP/audio feature that replay CANNOT rebuild
     /// from the raw special-token id. So the marker is armed ONLY when
-    /// `stored && live_for_continue`: non-KV-shared checkpoints (12B audio AND
-    /// unified image, `num_kv_shared_layers=0`) store real K/V and warm-continue
-    /// via `state="live"`; KV-shared checkpoints (e2b) store nothing, leave the
-    /// marker off, and cleanly cold-restart.
+    /// `stored && live_for_continue`: both non-shared checkpoints and E2B's
+    /// physical anchors can store real K/V and warm-continue via `state="live"`.
+    /// Missing/misaligned physical anchors still fail closed.
     ///
     /// ## R1 sliding-offset reconciliation (the length-finish materialize)
     /// The vision decode loop never forwards the final sampled token, so after
@@ -1984,6 +2878,7 @@ impl Gemma4Inner {
         finish_reason: &str,
         new_image_key: Option<u64>,
         new_audio_key: Option<u64>,
+        image_token_positions: &[(u32, u64)],
         media_continuable: bool,
         reuse_cache: bool,
     ) -> Result<()> {
@@ -2018,8 +2913,17 @@ impl Gemma4Inner {
                 Some(adapter) => {
                     let total = adapter.request_tokens().len();
                     let bs = adapter.block_size();
-                    let extra = engine::build_paged_extra_keys(total, bs, &[]);
-                    let ok = adapter.finalize_turn_keep_live_per_block(&extra, 0).is_ok();
+                    let extra = engine::build_paged_extra_keys(total, bs, image_token_positions);
+                    let ok = match adapter.finalize_turn_keep_live_per_block(&extra, 0) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "mlx_core::gemma4::paged",
+                                "Gemma4 image per-block finalize failed: {error}"
+                            );
+                            false
+                        }
+                    };
                     (ok, adapter.is_live_for_continue())
                 }
                 None => (false, false),
@@ -2029,25 +2933,31 @@ impl Gemma4Inner {
                 // Publish history FIRST: the checkpoint reads its length, and
                 // the next delta's prefix restore matches against it.
                 self.cached_token_history = full_history;
-                self.cached_image_key = new_image_key;
-                self.cached_audio_key = new_audio_key;
+                self.publish_media_session_context(new_image_key, new_audio_key);
+                self.cached_paged_image_token_positions = image_token_positions.to_vec();
                 let history_for_ckpt = self.cached_token_history.clone();
-                let stored = self
-                    .remember_gemma4_sliding_history_checkpoint(&history_for_ckpt)
-                    .map(|trace| trace.stored)
-                    .unwrap_or(false);
+                let stored =
+                    match self.remember_gemma4_sliding_history_checkpoint(&history_for_ckpt) {
+                        Ok(trace) => trace.stored,
+                        Err(error) => {
+                            self.invalidate_gemma4_hybrid_session(
+                                "VLM sliding-history checkpoint failure",
+                            );
+                            return Err(error);
+                        }
+                    };
                 // Warm continuation is only faithful when the sliding state is
                 // restorable from a stored checkpoint (or the in-place live
                 // caches it implies). A text position's true embedding IS
                 // `embed_tokens.forward(id)`, so REPLAY rebuilds it exactly. A
                 // MEDIA position's true embedding is a scattered SigLIP/audio
                 // feature that replay cannot reconstruct from the raw
-                // `<|image|>`/`<|audio|>` special-token id. On KV-shared
-                // checkpoints (e2b) the shared-on-sliding layers hold no flat
-                // K/V, so `stored == false` and the next delta would rebuild
-                // media-position sliding K/V from raw token embeddings —
-                // numerically wrong. Downgrade to a clean non-continuable state
-                // so the follow-up delta cold-restarts instead.
+                // `<|image|>`/`<|audio|>` special-token id. KV-shared alias
+                // slots hold no flat K/V, so checkpoint readiness/snapshotting
+                // intentionally skips them and persists only their physical
+                // sliding anchors. If any physical anchor is unavailable,
+                // `stored == false` and the turn downgrades to a clean
+                // non-continuable state rather than replaying media ids.
                 //
                 // `live_for_continue` guards a second gap: a keep-live with zero
                 // FULL blocks (a media turn shorter than `block_size`) returns
@@ -2066,37 +2976,23 @@ impl Gemma4Inner {
                 return Ok(());
             }
             // keep-live failed: fall through to the non-continuable teardown.
+            self.invalidate_gemma4_hybrid_session("VLM per-block finalize failure");
+            return Err(Error::from_reason(
+                "Gemma4 image paged finalize failed; reusable state was invalidated",
+            ));
         }
 
         // Non-continuable: release the global KV but keep history + media keys so
-        // a follow-up text delta reaches `text_delta_image_guard`, which rejects
+        // a follow-up text delta reaches `text_delta_media_guard`, which rejects
         // it (marker is false). Matches the vision core's prior behavior.
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
         self.cached_token_history = full_history;
-        self.cached_image_key = new_image_key;
-        self.cached_audio_key = new_audio_key;
+        self.publish_media_session_context(new_image_key, new_audio_key);
+        self.cached_paged_image_token_positions.clear();
         self.media_session_continuable = false;
         Ok(())
-    }
-
-    /// Whether this expanded prompt is a media turn eligible to warm-continue a
-    /// follow-up text delta. Eligibility is broad: ANY image or audio turn,
-    /// including the unified bidirectional-vision image. Faithfulness is NOT
-    /// decided here — the `stored && live_for_continue` gate in
-    /// `finalize_vision_turn_media_state` is the real safety net: a non-KV-shared
-    /// checkpoint (12B, `num_kv_shared_layers=0`) physically stores sliding K/V
-    /// so the delta hits `state="live"` and warm-continues; a KV-shared
-    /// checkpoint (e2b) stores nothing so the delta cold-restarts. A warm text
-    /// delta routes through the generic causal text path (no overlay), so it is
-    /// numerically faithful regardless of how the media turn built its K/V.
-    fn gemma4_media_continuable(&self, expanded_tokens: &[u32]) -> bool {
-        let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
-        let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
-        let has_image = expanded_tokens.contains(&image_token_id);
-        let has_audio = expanded_tokens.contains(&audio_token_id);
-        has_audio || has_image
     }
 
     /// Vision (VLM) whole-turn core over the BLOCK-PAGED backend,
@@ -2108,10 +3004,8 @@ impl Gemma4Inner {
     /// full-attention K/V into the paged adapter pool. Sliding layers still use
     /// the flat rotating caches.
     ///
-    /// Single-image-turn-only and cold-start by construction: the adapter is
-    /// reset with `max_cache_hit_tokens = 0` and the sliding caches are rebuilt
-    /// fresh, so `cached_prefix_len == 0` and there is no warm-continue. The
-    /// request is released on BOTH success and error; `cached_tokens` is 0.
+    /// Image-only prompts use image-aware per-block keys plus exact sliding
+    /// checkpoints. Audio and mixed-media prompts remain deliberately cold.
     fn vision_paged_turn_sync_core(
         &mut self,
         rendered_tokens: &[u32],
@@ -2122,8 +3016,14 @@ impl Gemma4Inner {
         eos_token_id: u32,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let (tokens, processed_images, audio_frames, new_image_key, new_audio_key) =
-            self.prepare_multimodal_tokens(rendered_tokens, raw_images, raw_audio)?;
+        let (
+            tokens,
+            processed_images,
+            audio_frames,
+            new_image_key,
+            new_audio_key,
+            image_token_positions,
+        ) = self.prepare_multimodal_tokens(rendered_tokens, raw_images, raw_audio)?;
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
@@ -2140,69 +3040,32 @@ impl Gemma4Inner {
         let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
         let generation_start = std::time::Instant::now();
-
-        let vision_embeds =
-            self.build_gemma4_multimodal_embeds(&prompt, &processed_images, audio_frames.as_ref())?;
-
-        // Derive layer kinds before acquiring the paged request. This reads
-        // only `self.config` (no adapter/cache dependency) and is fallible, so
-        // running it here keeps the only fallible op ahead of the request
-        // acquisition — an early Err can never leak a prepared request.
-        let layer_kinds = self.compute_layer_kinds()?;
-
-        // Cold-start the paged adapter on the expanded sequence.
-        let seq_id: u32 = 0;
-        let total_budget = tokens.len() as u32;
-        // A new media set is non-continuable until its own finalize re-arms the
-        // marker. Reset BEFORE the side-effecting prepare below, which releases
-        // any prior kept-live request and can then fail (block exhaustion) via
-        // `?` — a stale `true` would wrongly admit a later text delta.
-        self.media_session_continuable = false;
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
-            })?;
-            adapter
-                .prepare_turn_with_max_cache_hit_tokens(
-                    seq_id,
-                    &tokens,
-                    total_budget,
-                    /* reuse_cache */ false,
-                    &[],
-                    /* cache_salt */ 0,
-                    /* skip_lookup */ true,
-                    /* max_cache_hit_tokens */ 0,
-                )
-                .map_err(Error::from_reason)?;
-        }
-        // Fresh sliding flat caches + clear all reuse/checkpoint state so the
-        // cold prefill starts from an empty context.
-        self.caches = Some(init_caches_for_config(&self.config));
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        self.cached_audio_key = None;
-        self.sliding_prefix_checkpoints.clear();
-        self.sliding_prompt_boundary_checkpoint = None;
-        self.sliding_last_history_checkpoint = None;
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let turn = self.prepare_gemma4_multimodal_paged_turn(
+            &tokens,
+            &prompt,
+            &processed_images,
+            audio_frames.as_ref(),
+            new_image_key,
+            new_audio_key,
+            &image_token_positions,
+            reuse_cache,
+        )?;
+        let cached_prefix_len = turn.cached_prefix_len;
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 crate::models::gemma4::diagnostic::set_step(-1);
-                match vision_embeds {
-                    Some(ref embeds) => {
-                        self.run_paged_vlm_prefill(&tokens, embeds, &layer_kinds)?
-                    }
-                    None => {
-                        // Text-only fallback (checkpoint lacks the vision
-                        // tower): drive the same paged prefill seeded from
-                        // token embeddings.
-                        let text_embeds = self.embed_tokens.forward(&prompt)?;
-                        let text_embeds =
-                            text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-                        self.run_paged_vlm_prefill(&tokens, &text_embeds, &layer_kinds)?
-                    }
-                }
+                self.run_paged_vlm_prefill(
+                    &tokens,
+                    &turn.suffix_embeds,
+                    &turn.layer_kinds,
+                    cached_prefix_len,
+                    &turn.extra_keys_per_block,
+                    &image_token_positions,
+                    turn.publish_prefix_checkpoints,
+                )?
             };
 
             crate::array::synchronize_and_clear_cache();
@@ -2252,37 +3115,40 @@ impl Gemma4Inner {
         let (generated_tokens, finish_reason) = match forward_result {
             Ok(t) => t,
             Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
+                self.invalidate_gemma4_hybrid_session("VLM sync forward/decode failure");
                 return Err(e);
             }
         };
 
         let first_token_instant = std::time::Instant::now();
 
-        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+        let raw_text = match tokenizer.decode_sync(&generated_tokens, false) {
+            Ok(text) => text,
+            Err(error) => {
+                self.invalidate_gemma4_hybrid_session("VLM sync tokenizer decode failure");
+                return Err(error);
+            }
+        };
 
         // Two-state media finalize: keep the global paged KV live + remember a
-        // sliding history checkpoint when this is a pure-causal media turn
-        // (audio / non-unified image) under reuse, so a follow-up text delta
+        // sliding history checkpoint when this is a pure image turn under
+        // reuse, so a follow-up text delta
         // warm-continues; otherwise release + keep history/keys so the guard
         // rejects (single-shot, as today). A finalize Err means the live
         // request must be released before returning.
-        let media_continuable = self.gemma4_media_continuable(&tokens);
-        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let media_continuable =
+            gemma4_media_continuable(new_image_key.is_some(), new_audio_key.is_some());
         if let Err(e) = self.finalize_vision_turn_media_state(
             &tokens,
             &generated_tokens,
             &finish_reason,
             new_image_key,
             new_audio_key,
+            &image_token_positions,
             media_continuable,
             reuse_cache,
         ) {
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
+            self.invalidate_gemma4_hybrid_session("VLM sync finalize failure");
             return Err(e);
         }
 
@@ -2300,7 +3166,7 @@ impl Gemma4Inner {
         let performance = Some(crate::profiling::PerformanceMetrics {
             ttft_ms,
             prefill_tokens_per_second: if ttft_ms > 0.0 {
-                prefill_len as f64 / (ttft_ms / 1000.0)
+                (prefill_len.saturating_sub(cached_prefix_len as usize)) as f64 / (ttft_ms / 1000.0)
             } else {
                 0.0
             },
@@ -2334,7 +3200,7 @@ impl Gemma4Inner {
             reasoning_tokens: 0,
             finish_reason,
             raw_text,
-            cached_tokens: 0,
+            cached_tokens: cached_prefix_len,
             performance,
         })
     }
@@ -2356,8 +3222,14 @@ impl Gemma4Inner {
     ) -> Result<()> {
         let cb = StreamSender(sink);
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let (tokens, processed_images, audio_frames, new_image_key, new_audio_key) =
-            self.prepare_multimodal_tokens(rendered_tokens, raw_images, raw_audio)?;
+        let (
+            tokens,
+            processed_images,
+            audio_frames,
+            new_image_key,
+            new_audio_key,
+            image_token_positions,
+        ) = self.prepare_multimodal_tokens(rendered_tokens, raw_images, raw_audio)?;
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
@@ -2374,46 +3246,18 @@ impl Gemma4Inner {
         let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
         let generation_start = std::time::Instant::now();
-
-        let vision_embeds =
-            self.build_gemma4_multimodal_embeds(&prompt, &processed_images, audio_frames.as_ref())?;
-
-        // Derive layer kinds before acquiring the paged request (fallible, but
-        // depends only on `self.config`). Hoisting it ahead of the request
-        // acquisition keeps an early Err from leaking a prepared request.
-        let layer_kinds = self.compute_layer_kinds()?;
-
-        let seq_id: u32 = 0;
-        let total_budget = tokens.len() as u32;
-        // A new media set is non-continuable until its own finalize re-arms the
-        // marker. Reset BEFORE the side-effecting prepare below, which releases
-        // any prior kept-live request and can then fail (block exhaustion) via
-        // `?` — a stale `true` would wrongly admit a later text delta.
-        self.media_session_continuable = false;
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
-            })?;
-            adapter
-                .prepare_turn_with_max_cache_hit_tokens(
-                    seq_id,
-                    &tokens,
-                    total_budget,
-                    /* reuse_cache */ false,
-                    &[],
-                    /* cache_salt */ 0,
-                    /* skip_lookup */ true,
-                    /* max_cache_hit_tokens */ 0,
-                )
-                .map_err(Error::from_reason)?;
-        }
-        self.caches = Some(init_caches_for_config(&self.config));
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        self.cached_audio_key = None;
-        self.sliding_prefix_checkpoints.clear();
-        self.sliding_prompt_boundary_checkpoint = None;
-        self.sliding_last_history_checkpoint = None;
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let turn = self.prepare_gemma4_multimodal_paged_turn(
+            &tokens,
+            &prompt,
+            &processed_images,
+            audio_frames.as_ref(),
+            new_image_key,
+            new_audio_key,
+            &image_token_positions,
+            reuse_cache,
+        )?;
+        let cached_prefix_len = turn.cached_prefix_len;
 
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
@@ -2424,17 +3268,15 @@ impl Gemma4Inner {
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 crate::models::gemma4::diagnostic::set_step(-1);
-                match vision_embeds {
-                    Some(ref embeds) => {
-                        self.run_paged_vlm_prefill(&tokens, embeds, &layer_kinds)?
-                    }
-                    None => {
-                        let text_embeds = self.embed_tokens.forward(&prompt)?;
-                        let text_embeds =
-                            text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-                        self.run_paged_vlm_prefill(&tokens, &text_embeds, &layer_kinds)?
-                    }
-                }
+                self.run_paged_vlm_prefill(
+                    &tokens,
+                    &turn.suffix_embeds,
+                    &turn.layer_kinds,
+                    cached_prefix_len,
+                    &turn.extra_keys_per_block,
+                    &image_token_positions,
+                    turn.publish_prefix_checkpoints,
+                )?
             };
 
             crate::array::synchronize_and_clear_cache();
@@ -2500,16 +3342,20 @@ impl Gemma4Inner {
         let (generated_tokens, finish_reason) = match forward_result {
             Ok(t) => t,
             Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
+                self.invalidate_gemma4_hybrid_session("VLM stream forward/decode failure");
                 return Err(e);
             }
         };
 
         let first_token_instant = std::time::Instant::now();
 
-        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+        let raw_text = match tokenizer.decode_sync(&generated_tokens, false) {
+            Ok(text) => text,
+            Err(error) => {
+                self.invalidate_gemma4_hybrid_session("VLM stream tokenizer decode failure");
+                return Err(error);
+            }
+        };
 
         // Flush residual bytes through the stream parser.
         if raw_text.len() > streamed_text_len {
@@ -2526,20 +3372,19 @@ impl Gemma4Inner {
         // Two-state media finalize (identical to the sync core via the shared
         // helper): keep-live + sliding checkpoint for a continuable pure-causal
         // media turn, else release + keep history/keys so the guard rejects.
-        let media_continuable = self.gemma4_media_continuable(&tokens);
-        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let media_continuable =
+            gemma4_media_continuable(new_image_key.is_some(), new_audio_key.is_some());
         if let Err(e) = self.finalize_vision_turn_media_state(
             &tokens,
             &generated_tokens,
             &finish_reason,
             new_image_key,
             new_audio_key,
+            &image_token_positions,
             media_continuable,
             reuse_cache,
         ) {
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
+            self.invalidate_gemma4_hybrid_session("VLM stream finalize failure");
             return Err(e);
         }
 
@@ -2557,7 +3402,7 @@ impl Gemma4Inner {
         let performance = Some(crate::profiling::PerformanceMetrics {
             ttft_ms,
             prefill_tokens_per_second: if ttft_ms > 0.0 {
-                prefill_len as f64 / (ttft_ms / 1000.0)
+                (prefill_len.saturating_sub(cached_prefix_len as usize)) as f64 / (ttft_ms / 1000.0)
             } else {
                 0.0
             },
@@ -2593,7 +3438,7 @@ impl Gemma4Inner {
                 prompt_tokens: Some(prompt_token_count as u32),
                 reasoning_tokens: Some(0),
                 raw_text: Some(raw_text),
-                cached_tokens: Some(0),
+                cached_tokens: Some(cached_prefix_len),
                 performance,
                 is_reasoning: None,
             }),
@@ -2697,6 +3542,186 @@ impl Gemma4Inner {
         Ok(true)
     }
 
+    fn invalidate_gemma4_hybrid_session(&mut self, reason: &'static str) {
+        tracing::warn!(
+            target: "mlx_core::gemma4::paged",
+            reason,
+            "invalidating Gemma4 hybrid paged/sliding session"
+        );
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+        self.caches = None;
+        self.clear_reuse_state();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_gemma4_vlm_paged_prefix(
+        &mut self,
+        tokens: &[u32],
+        total_budget: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        image_token_positions: &[(u32, u64)],
+        reuse_cache: bool,
+        allow_live_continue: bool,
+        unified_overlay_last_image_exclusive: Option<u32>,
+    ) -> Result<engine::VlmPagedPrefixResolution> {
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let candidate_plan_result = match self.paged_adapter.as_mut() {
+            Some(adapter) => adapter
+                .prepare_turn_per_block_with_max_cache_hit_tokens(
+                    0,
+                    tokens,
+                    total_budget,
+                    allow_live_continue,
+                    extra_keys_per_block,
+                    0,
+                    !reuse_cache,
+                    max_cache_hit_tokens,
+                )
+                .map_err(Error::from_reason),
+            None => Err(Error::from_reason(
+                "prepare_gemma4_vlm_paged_prefix: paged_adapter is None",
+            )),
+        };
+        let candidate_plan = match candidate_plan_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.invalidate_gemma4_hybrid_session("VLM paged-prefix preparation failure");
+                return Err(error);
+            }
+        };
+
+        // Unified image K/V encodes the bidirectional overlay. The existing
+        // attention API can consume an already-materialized overlay prefix only
+        // when the cached boundary is after the complete expanded image run.
+        // A candidate before/inside that run must be discarded, even if its
+        // token/image block hash matches.
+        let first_image_position = image_token_positions.first().map(|(position, _)| *position);
+        let prefix_policy = gemma4_vlm_prefix_policy(
+            candidate_plan.cached_prefix_len,
+            first_image_position,
+            unified_overlay_last_image_exclusive,
+        );
+        let sliding_preparation = if prefix_policy.unified_boundary_safe {
+            self.prepare_gemma4_sliding_prefix_state_with_keys(
+                tokens,
+                candidate_plan.cached_prefix_len,
+                candidate_plan.continued_live_prefix,
+                extra_keys_per_block,
+                image_token_positions,
+                prefix_policy.require_exact_checkpoint,
+            )
+        } else {
+            self.caches = Some(init_caches_for_config(&self.config));
+            Ok(Gemma4SlidingPrefixPreparation {
+                state: "unified_image_boundary_unsafe",
+                primed_prefix_len: 0,
+            })
+        };
+        let mut sliding_preparation = match sliding_preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                self.invalidate_gemma4_hybrid_session("VLM sliding-prefix preparation failure");
+                return Err(error);
+            }
+        };
+        // A causal E2B hit ending before the first image token is pure text.
+        // Reconstruct only that missing physical sliding prefix from token
+        // embeddings; once a candidate includes an image position, replay is
+        // forbidden because the placeholder embedding is not the vision feature.
+        if prefix_policy.may_replay_leading_text
+            && sliding_preparation.primed_prefix_len < candidate_plan.cached_prefix_len
+        {
+            let replay_result = (|| -> Result<()> {
+                let replay = tokens
+                    .get(
+                        sliding_preparation.primed_prefix_len as usize
+                            ..candidate_plan.cached_prefix_len as usize,
+                    )
+                    .ok_or_else(|| {
+                        Error::from_reason("Gemma4 leading-text sliding replay range is invalid")
+                    })?;
+                let layer_kinds = self.compute_layer_kinds()?;
+                self.run_sliding_only_prefill(
+                    replay,
+                    sliding_preparation.primed_prefix_len,
+                    &layer_kinds,
+                )?;
+                self.remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
+                    tokens,
+                    candidate_plan.cached_prefix_len,
+                    block_size,
+                    extra_keys_per_block,
+                    0,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = replay_result {
+                self.invalidate_gemma4_hybrid_session("VLM leading-text replay failure");
+                return Err(error);
+            }
+            sliding_preparation.primed_prefix_len = candidate_plan.cached_prefix_len;
+            sliding_preparation.state = "leading_text_replay";
+        }
+        let sliding_prefix_exact = prefix_policy.unified_boundary_safe
+            && sliding_preparation.primed_prefix_len == candidate_plan.cached_prefix_len;
+
+        let resolution =
+            engine::resolve_vlm_paged_prefix(candidate_plan, sliding_prefix_exact, || {
+                self.paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        "prepare_gemma4_vlm_paged_prefix: adapter dropped before cold restart"
+                            .to_string()
+                    })?
+                    .restart_prepared_turn_cold_per_block(
+                        0,
+                        tokens,
+                        total_budget,
+                        extra_keys_per_block,
+                        0,
+                    )
+            });
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                self.invalidate_gemma4_hybrid_session("VLM paged cold-restart failure");
+                return Err(Error::from_reason(error));
+            }
+        };
+
+        // The prepared request now owns the new turn. Clear only live/history
+        // state; retain the bounded image-aware prefix checkpoints so A -> B -> A
+        // can restore A after B displaced the live request.
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_audio_key = None;
+        self.cached_paged_image_token_positions = image_token_positions.to_vec();
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
+        self.sliding_last_history_checkpoint = None;
+        self.media_session_continuable = false;
+
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "vlm_prefix_plan",
+            model = "gemma4",
+            prompt_tokens = tokens.len(),
+            image_tokens = image_token_positions.len(),
+            candidate_cached_prefix_tokens = resolution.candidate_cached_prefix_len,
+            effective_cached_prefix_tokens = resolution.effective_plan.cached_prefix_len,
+            continued_live_prefix = resolution.effective_plan.continued_live_prefix,
+            sliding_prefix_exact,
+            unified_boundary_safe = prefix_policy.unified_boundary_safe,
+            downgraded_to_cold = resolution.downgraded_to_cold,
+            "image-aware Gemma4 paged prefix planned"
+        );
+
+        Ok(resolution)
+    }
+
     fn prepare_gemma4_paged_turn(
         &mut self,
         trace_label: &str,
@@ -2710,6 +3735,29 @@ impl Gemma4Inner {
         let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
         let prompt_holds_media =
             prompt_holds_media_placeholders(tokens, image_token_id, audio_token_id);
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "{trace_label}: paged_adapter is None while preparing paged turn"
+                ))
+            })?
+            .block_size();
+        let carries_image_lineage = gemma4_carries_image_lineage(
+            self.paged_text_turn_context,
+            self.cached_image_key,
+            &self.cached_paged_image_token_positions,
+            &self.cached_token_history,
+            tokens,
+        );
+        let image_token_positions = if carries_image_lineage {
+            self.cached_paged_image_token_positions.clone()
+        } else {
+            Vec::new()
+        };
+        let extra_keys_per_block =
+            engine::build_paged_extra_keys(tokens.len(), block_size, &image_token_positions);
         let plan = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(format!(
@@ -2734,21 +3782,20 @@ impl Gemma4Inner {
                 ));
             }
             let max_cache_hit_tokens = total_budget.saturating_sub(1);
-            // skip_lookup is on when the prompt still carries media placeholders:
-            // any fallback that drops to a content-address prefix lookup (e.g. a
-            // continue-turn-failure reset) then re-prefills the placeholders as
-            // text instead of matching the token-only block hash of media K/V
-            // registered by another session, so it can never consume that
-            // session's stale media features.
+            // Unknown media placeholders remain lookup-disabled. A warm text
+            // continuation carrying an exact persisted image lineage uses the
+            // same per-block keys as the original image turn, so neither lookup
+            // nor finalize can republish those blocks token-only.
+            let skip_lookup = prompt_holds_media && !carries_image_lineage;
             let plan = adapter
-                .prepare_turn_with_max_cache_hit_tokens(
+                .prepare_turn_per_block_with_max_cache_hit_tokens(
                     seq_id,
                     tokens,
                     total_budget,
-                    reuse_cache,
-                    &[],
+                    reuse_cache && (!prompt_holds_media || carries_image_lineage),
+                    &extra_keys_per_block,
                     0,
-                    prompt_holds_media,
+                    skip_lookup,
                     max_cache_hit_tokens,
                 )
                 .map_err(Error::from_reason)?;
@@ -2768,11 +3815,23 @@ impl Gemma4Inner {
         };
 
         let mut cached_prefix_len = plan.cached_prefix_len;
-        let mut sliding_preparation = self.prepare_gemma4_sliding_prefix_state(
+        let mut sliding_preparation = self.prepare_gemma4_sliding_prefix_state_with_keys(
             tokens,
             cached_prefix_len,
             plan.continued_live_prefix,
+            &extra_keys_per_block,
+            &image_token_positions,
+            carries_image_lineage,
         )?;
+        if carries_image_lineage && sliding_preparation.primed_prefix_len < cached_prefix_len {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(Error::from_reason(format!(
+                "{}{trace_label} lost the exact image-aware sliding checkpoint",
+                engine::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
         if sliding_preparation.primed_prefix_len < cached_prefix_len {
             let suppressed = self.suppress_large_sliding_prefix_reuse_if_needed(
                 trace_label,
@@ -2785,8 +3844,14 @@ impl Gemma4Inner {
             if suppressed {
                 let previous_cached_prefix_len = cached_prefix_len;
                 cached_prefix_len = 0;
-                sliding_preparation =
-                    self.prepare_gemma4_sliding_prefix_state(tokens, cached_prefix_len, false)?;
+                sliding_preparation = self.prepare_gemma4_sliding_prefix_state_with_keys(
+                    tokens,
+                    cached_prefix_len,
+                    false,
+                    &extra_keys_per_block,
+                    &image_token_positions,
+                    false,
+                )?;
                 if trace_enabled {
                     write_inference_trace(format_args!(
                         "[MLX_TRACE] gemma4 {trace_label}_cached_prefix_reset previous_cached_prefix_tokens={} reason=sliding_restore_limit",
@@ -2814,6 +3879,11 @@ impl Gemma4Inner {
                 already_primed,
                 plan.continued_live_prefix
             ));
+        }
+
+        if !carries_image_lineage {
+            self.cached_image_key = None;
+            self.cached_paged_image_token_positions.clear();
         }
 
         Ok(Gemma4PagedTurnPreparation {
@@ -2942,10 +4012,9 @@ impl Gemma4Inner {
         //   Pass 2: the FINAL token (length 1). Now
         //           `cached_prefix_len_for_chunk = cached_prefix_len +
         //           suffix_len - 1`, which is > 0, so global layers
-        //           take the cache-hit `read_kv_range` branch in
-        //           `forward_paged` — the same path decode uses. This
-        //           aligns the SDPA reduction order with the flat
-        //           path's `forward_inner` dispatch.
+        //           take the graph-native single-token paged-attention branch
+        //           used by decode. This aligns the reduction order with the
+        //           paged `forward_inner` dispatch.
         let configured_chunk_size = crate::array::paged_prefill_chunk_size();
         let mut pass2_first_position = cached_prefix_len;
         if suffix_len > 1 {
@@ -2964,8 +4033,14 @@ impl Gemma4Inner {
                         self.config.effective_head_dim(true)
                     ))
                 })?;
-            let paged_attention_enabled =
-                gemma4_paged_prefill_paged_attention_enabled_for_chunking();
+            let num_kv_heads =
+                u32::try_from(self.config.effective_kv_heads(true)).map_err(|_| {
+                    Error::from_reason(format!(
+                        "Gemma4 paged prefill invalid global num_kv_heads={}",
+                        self.config.effective_kv_heads(true)
+                    ))
+                })?;
+            let route_policy = gemma4_paged_prefill_route_policy();
             let block_size = self
                 .paged_adapter
                 .as_ref()
@@ -2977,18 +4052,19 @@ impl Gemma4Inner {
                 .checked_div(block_size)
                 .map(|blocks| blocks.saturating_mul(block_size))
                 .unwrap_or(0);
-            let checkpoint_interval =
-                gemma4_sliding_decode_checkpoint_interval(&self.config, block_size);
-            let mut body_chunk_plan =
-                gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
-                    configured_chunk_size,
-                    pass1_tokens.len(),
-                    pass2_first_position,
-                    num_query_heads,
-                    global_head_size,
-                    paged_attention_enabled,
-                    checkpoint_interval,
-                )?;
+            // Compute chunks follow the configured prefill step directly, as
+            // in the authoritative mlx-lm generator. Sliding checkpoints are
+            // captured from temporal K/V views inside a chunk; they must not
+            // split a 2K matrix-prefill into 1K work.
+            let mut body_chunk_plan = gemma4_paged_prefill_body_chunk_plan(
+                configured_chunk_size,
+                pass1_tokens.len(),
+                pass2_first_position,
+                num_query_heads,
+                num_kv_heads,
+                global_head_size,
+                route_policy,
+            )?;
             gemma4_split_body_chunk_plan_at_position(
                 &mut body_chunk_plan,
                 prompt_checkpoint_boundary_len,
@@ -3011,7 +4087,7 @@ impl Gemma4Inner {
                 .count();
             if trace_enabled {
                 write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 paged_prefill_body_chunking body_tokens={} chunk_size={} configured_chunk_size={} chunks={} min_chunk_size={} max_chunk_size={} dynamic_v2_aux_caps={} paged_attention_enabled={}",
+                    "[MLX_TRACE] gemma4 paged_prefill_body_chunking body_tokens={} chunk_size={} configured_chunk_size={} chunks={} min_chunk_size={} max_chunk_size={} dynamic_v2_aux_caps={} route_policy={:?}",
                     pass1_tokens.len(),
                     first_body_chunk_size,
                     configured_chunk_size,
@@ -3019,7 +4095,7 @@ impl Gemma4Inner {
                     min_body_chunk_size,
                     max_body_chunk_size,
                     dynamic_v2_aux_caps,
-                    paged_attention_enabled
+                    route_policy
                 ));
             }
             for (chunk_idx, chunk_plan) in body_chunk_plan.iter().enumerate() {
@@ -3034,15 +4110,43 @@ impl Gemma4Inner {
                     })?;
                 let chunk_first_position = chunk_plan.first_position;
                 debug_assert_eq!(chunk_first_position, pass2_first_position);
+                let chunk_end_position = chunk_first_position
+                    .checked_add(chunk.len() as u32)
+                    .ok_or_else(|| {
+                        Error::from_reason("Gemma4 paged prefill chunk position overflow")
+                    })?;
+                let checkpoint_interval =
+                    gemma4_sliding_decode_checkpoint_interval(&self.config, block_size);
+                let mut checkpoint_boundaries = gemma4_sliding_checkpoint_boundaries_crossed(
+                    chunk_first_position,
+                    chunk_end_position,
+                    checkpoint_interval,
+                );
+                // The prompt boundary is already a real compute endpoint and
+                // is stored by the dedicated protected/prompt checkpoint path.
+                checkpoint_boundaries
+                    .retain(|&boundary| boundary != prompt_checkpoint_boundary_len);
+                if !checkpoint_boundaries.is_empty() {
+                    let caches = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason("Gemma4 paged prefill sliding checkpoint caches missing")
+                    })?;
+                    prepare_gemma4_sliding_checkpoint_captures(
+                        &self.config,
+                        caches,
+                        &checkpoint_boundaries,
+                    )?;
+                }
                 let chunk_trace_start = trace_enabled.then(std::time::Instant::now);
                 if trace_enabled {
                     write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 paged_prefill_body_chunk_start chunk={}/{} first_position={} tokens={} capped_by_v2_aux_limit={}",
+                        "[MLX_TRACE] gemma4 paged_prefill_body_chunk_start chunk={}/{} first_position={} tokens={} capped_by_v2_aux_limit={} checkpoint_interval={} captured_checkpoint_boundaries={:?}",
                         chunk_idx + 1,
                         total_body_chunks,
                         chunk_first_position,
                         chunk.len(),
-                        chunk_plan.capped_by_v2_aux_limit
+                        chunk_plan.capped_by_v2_aux_limit,
+                        checkpoint_interval,
+                        checkpoint_boundaries
                     ));
                 }
                 {
@@ -3110,22 +4214,49 @@ impl Gemma4Inner {
                 if let Some(caches) = self.caches.as_ref() {
                     eval_gemma4_caches(caches)?;
                 }
+                let captured_checkpoints = if checkpoint_boundaries.is_empty() {
+                    Vec::new()
+                } else {
+                    let caches = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "Gemma4 paged prefill sliding checkpoint caches missing post-forward",
+                        )
+                    })?;
+                    take_gemma4_sliding_checkpoint_captures(
+                        &self.config,
+                        caches,
+                        &checkpoint_boundaries,
+                    )?
+                };
+                for (&boundary, snapshots) in checkpoint_boundaries.iter().zip(captured_checkpoints)
+                {
+                    let store_trace = self.remember_gemma4_sliding_captured_prefix_checkpoint(
+                        full_tokens,
+                        boundary,
+                        block_size,
+                        0,
+                        snapshots,
+                    )?;
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 paged_prefill_sliding_captured_checkpoint boundary_tokens={} block_size={} checkpoint_interval={} stored={} materialize_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                            boundary,
+                            block_size,
+                            checkpoint_interval,
+                            store_trace.stored,
+                            store_trace.eval_ms,
+                            store_trace.token_clone_ms,
+                            store_trace.update_ms,
+                            store_trace.total_ms
+                        ));
+                    }
+                }
                 crate::array::clear_cache();
                 pass2_first_position = pass2_first_position
                     .checked_add(chunk.len() as u32)
                     .ok_or_else(|| {
                         Error::from_reason("Gemma4 paged prefill token position overflow")
                     })?;
-                // Global paged-cache hits can land at any prior full-block
-                // prefix, not just the previous prompt boundary. Persist
-                // sliding snapshots at the normal window stride during
-                // prefill too, so a later branch switch can restore from a
-                // nearby sliding state instead of replaying tens of thousands
-                // of sliding tokens or falling back to a full cold prefill.
-                self.maybe_remember_gemma4_sliding_decode_boundary_checkpoint(
-                    "paged_prefill",
-                    trace_enabled,
-                )?;
                 if pass2_first_position == prompt_checkpoint_boundary_len {
                     self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
                         "paged_prefill",
@@ -3261,11 +4392,11 @@ impl Gemma4Inner {
     /// `chunk_tokens[0]` in the request (used as the RoPE offset and
     /// the slot-mapping anchor). `cached_prefix_len_for_chunk` is the
     /// number of K/V tokens already in the paged pool BEFORE this
-    /// chunk's writes — when this is > 0 the global-layer SDPA takes
-    /// the `read_kv_range` cache-hit branch, matching decode's
-    /// reduction order. `layer_kinds` is the per-layer routing
-    /// classification (Sliding / GlobalPaged / SharedOnGlobal /
-    /// SharedOnSliding).
+    /// chunk's writes — when this is > 0 global attention adaptively chooses
+    /// graph-native pool gather + SDPA or compact varlen PagedAttention while
+    /// retaining the same physical paged storage. `layer_kinds` is the
+    /// per-layer routing classification (Sliding / GlobalPaged /
+    /// SharedOnGlobal / SharedOnSliding).
     ///
     /// Caller must have already called `record_tokens(chunk_tokens)`
     /// on the paged adapter so `update_keys_values`'s alignment check
@@ -3757,8 +4888,12 @@ impl Gemma4Inner {
     fn run_paged_vlm_prefill(
         &mut self,
         expanded_tokens: &[u32],
-        inputs_embeds: &MxArray,
+        suffix_embeds: &MxArray,
         layer_kinds: &[Gemma4LayerKind],
+        cached_prefix_len: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        image_token_positions: &[(u32, u64)],
+        publish_prefix_checkpoints: bool,
     ) -> Result<MxArray> {
         if expanded_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -3766,6 +4901,18 @@ impl Gemma4Inner {
             ));
         }
         let prompt_len = expanded_tokens.len() as u32;
+        if cached_prefix_len >= prompt_len {
+            return Err(Error::from_reason(format!(
+                "run_paged_vlm_prefill requires a non-empty suffix: cached_prefix_len={cached_prefix_len}, prompt_len={prompt_len}"
+            )));
+        }
+        let suffix_len = prompt_len - cached_prefix_len;
+        if suffix_embeds.shape_at(1)? != suffix_len as i64 {
+            return Err(Error::from_reason(format!(
+                "run_paged_vlm_prefill suffix embedding length {} does not match suffix token length {suffix_len}",
+                suffix_embeds.shape_at(1)?
+            )));
+        }
 
         crate::models::gemma4::diagnostic::set_path("paged");
         crate::models::gemma4::diagnostic::set_step(-1);
@@ -3780,13 +4927,14 @@ impl Gemma4Inner {
         let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
         let has_image = expanded_tokens.contains(&image_token_id);
         let has_audio = expanded_tokens.contains(&audio_token_id);
-        let overlay_full_type_ids: Option<MxArray> = if super::vision_mask::vision_overlay_active(
-            self.config.is_unified,
-            self.config.use_bidirectional_attention.as_deref() == Some("vision"),
-            has_image,
-            has_audio,
-            prompt_len as usize,
-        ) {
+        let overlay_full_type_ids: Option<MxArray> = if cached_prefix_len == 0
+            && super::vision_mask::vision_overlay_active(
+                self.config.is_unified,
+                self.config.use_bidirectional_attention.as_deref() == Some("vision"),
+                has_image,
+                has_audio,
+                prompt_len as usize,
+            ) {
             Some(super::vision_mask::build_image_token_type_ids(
                 expanded_tokens,
                 image_token_id,
@@ -3808,34 +4956,63 @@ impl Gemma4Inner {
             ));
         }
 
-        // Pass 1: tokens [0..prompt_len-1] in bounded chunks. Pass 2: the
-        // FINAL token, run with cached_prefix_len_for_chunk > 0 so global
-        // layers take the same cache-hit reduction order decode uses.
-        let mut pass1_position: u32 = 0;
-        if prompt_len > 1 {
-            let pass1_len = (prompt_len - 1) as usize;
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("run_paged_vlm_prefill: paged_adapter is None"))?
+            .block_size();
+        let prompt_checkpoint_boundary = prompt_len
+            .saturating_sub(1)
+            .checked_div(block_size)
+            .map(|blocks| blocks.saturating_mul(block_size))
+            .unwrap_or(0);
+        let first_image_position = image_token_positions.first().map(|(position, _)| *position);
+        let last_image_exclusive = image_token_positions
+            .last()
+            .map(|(position, _)| position.saturating_add(1));
+        // SigLIP/E2B is causal, so a changed image may still reuse complete
+        // leading-text blocks. Unified overlay cannot split before its image.
+        let leading_text_checkpoint_boundary = if overlay_active {
+            0
+        } else {
+            first_image_position
+                .and_then(|position| position.checked_div(block_size))
+                .map(|blocks| blocks.saturating_mul(block_size))
+                .unwrap_or(0)
+        };
+
+        // Pass 1: uncached suffix except its final token. Pass 2: the final
+        // token alone, preserving the prefill/decode reduction boundary.
+        let pass1_end = prompt_len - 1;
+        let mut pass1_position = cached_prefix_len;
+        if pass1_position < pass1_end {
             let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-            // Force a single chunk when the overlay is active: a split would put
-            // part of the image block in a later (cache-hit) chunk that no
-            // longer carries the bidirectional mask.
-            let chunk_size = if overlay_active || configured_chunk_size <= 0 {
-                pass1_len
-            } else {
-                (configured_chunk_size as usize).max(1)
-            };
-            let mut offset: usize = 0;
-            while offset < pass1_len {
-                let end = (offset + chunk_size).min(pass1_len);
-                let chunk_tokens = &expanded_tokens[offset..end];
-                let chunk_len = (end - offset) as i64;
+            while pass1_position < pass1_end {
+                // The first unified chunk must include the complete image
+                // overlay. Boundaries before the end of that span are ignored;
+                // otherwise the later chunk would receive no overlay ids and
+                // silently run half of the image causally.
+                let chunk_end = gemma4_vlm_prefill_chunk_end(
+                    pass1_position,
+                    pass1_end,
+                    configured_chunk_size,
+                    overlay_active,
+                    leading_text_checkpoint_boundary,
+                    prompt_checkpoint_boundary,
+                    last_image_exclusive,
+                );
+                let chunk_start = pass1_position as usize;
+                let chunk_end_usize = chunk_end as usize;
+                let chunk_tokens = &expanded_tokens[chunk_start..chunk_end_usize];
+                let relative_start = pass1_position - cached_prefix_len;
+                let relative_end = chunk_end - cached_prefix_len;
                 let chunk_embeds =
-                    inputs_embeds.slice_axis(1, offset as i64, offset as i64 + chunk_len)?;
-                // Per-chunk type-ids slice. With the forced single chunk this is
-                // the whole pass-1 span; the explicit slice keeps the code
-                // correct even if a future chunking path is added.
+                    suffix_embeds.slice_axis(1, relative_start as i64, relative_end as i64)?;
                 let chunk_type_ids: Option<MxArray> = match &overlay_full_type_ids {
-                    Some(ids) => Some(ids.slice_axis(1, offset as i64, end as i64)?),
-                    None => None,
+                    Some(ids) if pass1_position == 0 => {
+                        Some(ids.slice_axis(1, 0, chunk_end as i64)?)
+                    }
+                    _ => None,
                 };
                 {
                     let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -3861,20 +5038,40 @@ impl Gemma4Inner {
                 if let Some(caches) = self.caches.as_ref() {
                     eval_gemma4_caches(caches)?;
                 }
+                if publish_prefix_checkpoints && chunk_end == prompt_checkpoint_boundary {
+                    self.remember_gemma4_sliding_materialized_prompt_boundary_checkpoint_with_keys(
+                        expanded_tokens,
+                        chunk_end,
+                        block_size,
+                        extra_keys_per_block,
+                        0,
+                        true,
+                    )?;
+                } else if publish_prefix_checkpoints
+                    && chunk_end == leading_text_checkpoint_boundary
+                {
+                    self.remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
+                        expanded_tokens,
+                        chunk_end,
+                        block_size,
+                        extra_keys_per_block,
+                        0,
+                    )?;
+                }
                 crate::array::clear_cache();
-                pass1_position = pass1_position
-                    .checked_add((end - offset) as u32)
-                    .ok_or_else(|| {
-                        Error::from_reason("run_paged_vlm_prefill: token position overflow")
-                    })?;
-                offset = end;
+                pass1_position = chunk_end;
             }
         }
 
         // Pass 2: the FINAL token (length 1).
         let last_idx = (prompt_len - 1) as usize;
         let pass2_tokens = &expanded_tokens[last_idx..];
-        let pass2_embeds = inputs_embeds.slice_axis(1, last_idx as i64, prompt_len as i64)?;
+        let pass2_relative_idx = last_idx - cached_prefix_len as usize;
+        let pass2_embeds = suffix_embeds.slice_axis(
+            1,
+            pass2_relative_idx as i64,
+            pass2_relative_idx as i64 + 1,
+        )?;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_vlm_prefill: paged_adapter is None")
@@ -4129,14 +5326,21 @@ impl Gemma4Inner {
                     self.config.effective_head_dim(true)
                 ))
             })?;
-        let paged_attention_enabled = gemma4_paged_prefill_paged_attention_enabled_for_chunking();
+        let num_kv_heads = u32::try_from(self.config.effective_kv_heads(true)).map_err(|_| {
+            Error::from_reason(format!(
+                "Gemma4 sliding restore invalid global num_kv_heads={}",
+                self.config.effective_kv_heads(true)
+            ))
+        })?;
+        let route_policy = gemma4_paged_prefill_route_policy();
         let mut chunk_plan = gemma4_paged_prefill_body_chunk_plan(
             configured_chunk_size,
             prefix_tokens.len(),
             first_logical_position,
             num_query_heads,
+            num_kv_heads,
             global_head_size,
-            paged_attention_enabled,
+            route_policy,
         )?;
         gemma4_coalesce_single_token_restore_chunks(&mut chunk_plan);
 
@@ -4421,7 +5625,7 @@ impl Gemma4Inner {
     //
     // Image-change invariant: `chat_session_continue` / `_tool` run on
     // top of the live caches, so they MUST be text-only. If the session
-    // currently carries image state (i.e. `cached_image_key.is_some()`)
+    // currently carries image or audio state (`session_media()` non-empty)
     // we surface an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed
     // error so the TS `ChatSession` layer can route the caller back
     // through a fresh `chat_session_start`.
@@ -4456,10 +5660,10 @@ impl Gemma4Inner {
         Ok(ids[0])
     }
 
-    /// Vision whole-turn dispatch for the engine's
-    /// [`ChatBackend::vision_turn`] probe. Only fresh turns carry
-    /// images (the engine's delta inputs are text-only by construction
-    /// and the delta image guard rejects image-holding sessions), so
+    /// Multimodal whole-turn dispatch for the engine's
+    /// [`ChatBackend::run_multimodal_turn`] handler. Only fresh turns carry
+    /// media (the engine's delta inputs are text-only by construction
+    /// and the delta media guard rejects media-holding sessions), so
     /// the paged cores cold-start unconditionally —
     /// `verify_cache_prefix(.., has_images = true)` forces a miss.
     ///
@@ -4467,7 +5671,7 @@ impl Gemma4Inner {
     /// no paged adapter (explicit `use_block_paged_cache: false`, a
     /// non-Metal build, or paged init failure) has no vision path and
     /// returns an error instead of silently falling back.
-    fn vision_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    fn multimodal_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if self.paged_adapter.is_none() {
             return Err(Error::from_reason(
                 "gemma4 image turns require the block-paged KV backend; the model was loaded \
@@ -4480,8 +5684,8 @@ impl Gemma4Inner {
             (Some(sink), Some(cancelled)) => {
                 self.vision_paged_turn_stream_core(
                     args.tokens,
-                    args.images,
-                    args.audio,
+                    args.media.images,
+                    args.media.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4493,8 +5697,8 @@ impl Gemma4Inner {
             _ => {
                 let result = self.vision_paged_turn_sync_core(
                     args.tokens,
-                    args.images,
-                    args.audio,
+                    args.media.images,
+                    args.media.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4538,6 +5742,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
         // forward returns `[1, 1, vocab]`.
@@ -4573,6 +5778,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         Ok(())
     }
@@ -4755,13 +5961,40 @@ impl PagedBackend for Gemma4Inner {
         // partial trailing block's live K/V; otherwise register full blocks
         // for reuse + release. Infallible (`let _ =` every call — a teardown
         // failure must not mask the turn result).
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], 0);
-            } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        self.paged_finalize_failed = false;
+        let finalize_error = match self.paged_adapter.as_mut() {
+            Some(adapter) => {
+                let total_tokens = adapter.request_tokens().len();
+                let block_size = adapter.block_size();
+                let extra_keys = engine::build_paged_extra_keys(
+                    total_tokens,
+                    block_size,
+                    &self.cached_paged_image_token_positions,
+                );
+                if reuse_cache {
+                    adapter
+                        .finalize_turn_keep_live_per_block(&extra_keys, 0)
+                        .err()
+                } else {
+                    let register_error = adapter
+                        .register_full_blocks_for_reuse_per_block(&extra_keys, 0)
+                        .err();
+                    let release_error = adapter.release_request().err();
+                    register_error.or(release_error)
+                }
+            }
+            None => Some("Gemma4 paged adapter missing during finalize".to_string()),
+        };
+        if let Some(error) = finalize_error {
+            tracing::warn!(
+                target: "mlx_core::gemma4::paged",
+                "Gemma4 paged finalize failed: {error}"
+            );
+            self.paged_finalize_failed = true;
+            if let Some(adapter) = self.paged_adapter.as_mut() {
                 let _ = adapter.release_request();
             }
+            self.media_session_continuable = false;
         }
     }
 
@@ -4771,6 +6004,8 @@ impl PagedBackend for Gemma4Inner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+        self.caches = None;
+        self.clear_reuse_state();
     }
 
     fn save_paged_history(
@@ -4780,6 +6015,18 @@ impl PagedBackend for Gemma4Inner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        if self.paged_finalize_failed {
+            self.cached_token_history.clear();
+            self.sliding_last_history_checkpoint = None;
+            self.media_session_continuable = false;
+            return Err(Error::from_reason(
+                "Gemma4 paged finalize failed; refusing to publish reusable history",
+            ));
+        }
+        // `run_paged_turn` snapshots the request planner's context here for
+        // the duration of the executor. Empty means this text turn is a fresh
+        // replacement; non-empty means it extended a media-derived session.
+        let continued_media_context = self.paged_text_turn_context;
         // Save token history ONLY — the adapter's pool owns the K/V.
         // `keep_all` is the flat rule (engine: `finish_reason ==
         // "length"`); when it is false the terminal stop token is dropped
@@ -4796,12 +6043,23 @@ impl PagedBackend for Gemma4Inner {
             };
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
-            // A text save is text-only, so drop any stale media key — mirrors
-            // the flat `save_cache_state` fresh-turn clear. On a warm reuse the
-            // delta image guard already kept these `None`, so this is a no-op;
-            // on a fresh start it clears a key a prior media turn left behind.
-            self.cached_image_key = None;
-            self.cached_audio_key = None;
+            if continued_media_context.is_empty() {
+                // A successful fresh text turn replaced any previous media
+                // session. Its saved/live KV is now genuinely text-only.
+                self.cached_image_key = None;
+                self.cached_audio_key = None;
+                self.cached_paged_image_token_positions.clear();
+                self.media_session_context = MediaCapabilities::NONE;
+                self.media_session_continuable = false;
+            } else {
+                // A warm text delta extended the same live media prefix.
+                // Preserve the exact image key and ordered placeholder sidecar:
+                // subsequent text blocks must keep registering under the same
+                // image-aware lineage, and live continuation needs raw identity.
+                self.cached_audio_key = None;
+                debug_assert!(self.media_session_continuable);
+                self.media_session_context = continued_media_context;
+            }
             // Sliding-window warm-continue checkpoint keyed on the freshly
             // set history (post-reconcile `request_tokens()` == the trimmed
             // history). Fallible: a checkpoint/eval error aborts the turn so
@@ -4821,6 +6079,9 @@ impl PagedBackend for Gemma4Inner {
             // force an "audio state" restart on the text-only session.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            self.cached_paged_image_token_positions.clear();
+            self.media_session_context = MediaCapabilities::NONE;
+            self.media_session_continuable = false;
         }
         Ok(())
     }
@@ -4912,6 +6173,37 @@ impl ChatBackend for Gemma4Inner {
         // channel segments itself). Defensive: pin `true` so the engine's
         // emitter gate can never suppress.
         p.include_reasoning = true;
+        // Draft depth: with a draft model loaded, `mtpDepth` resolves per
+        // variant — a family-local post-edit of the engine's central
+        // `[1, 5]` clamp (an MTP-head contract that does not apply to
+        // external drafts), always clamping from the RAW config value.
+        //   * DSpark: unset runs full draft blocks (`block_size`, 7 on the
+        //     v1 checkpoint) with the measured target-AR break-even guard;
+        //     explicit depth pins the cap and disables that guard unless
+        //     `mtpAdaptiveDepth: true` explicitly opts it back in.
+        //   * Assistant: chained AR drafting has no checkpoint-pinned block
+        //     size — unset resolves to `ASSISTANT_DEFAULT_DEPTH`; explicit
+        //     values clamp to `[1, ASSISTANT_MAX_DEPTH]`.
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => {
+                let block_size = draft.config.block_size;
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(block_size),
+                    None => block_size,
+                };
+                p.mtp_adaptive_depth = match config.mtp_adaptive_depth {
+                    Some(enabled) => enabled,
+                    None => config.mtp_depth.is_none(),
+                };
+            }
+            Some(Gemma4Draft::Assistant(_)) => {
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(super::assistant::ASSISTANT_MAX_DEPTH),
+                    None => super::assistant::ASSISTANT_DEFAULT_DEPTH,
+                };
+            }
+            None => {}
+        }
         p
     }
 
@@ -5055,10 +6347,10 @@ impl ChatBackend for Gemma4Inner {
         Ok(())
     }
 
-    /// Prefix-reuse check. The engine routes every image-bearing turn
-    /// through `vision_turn` BEFORE this check, so only the session-side
-    /// image gate (`cached_image_key.is_some()` → miss) is needed here;
-    /// there is no `has_images` parameter.
+    /// Prefix-reuse check. The engine routes every media-bearing turn
+    /// through the multimodal executor BEFORE this check, so only the
+    /// session-side media gate (`session_media()` non-empty → miss) is needed
+    /// here; there is no `has_images` parameter.
     ///
     /// All-or-nothing: returns `0` or `cached.len()` (exact-match falls
     /// through the `hit == tokens.len()` branch in the session core to
@@ -5074,10 +6366,12 @@ impl ChatBackend for Gemma4Inner {
         // keeps prefix reuse strictly aligned with text-only sessions and
         // sidesteps the media-key coordination the Qwen3.5 shared helper
         // handles, while letting a continuable media session reuse an
-        // exactly-cached prefix.
-        if (self.cached_image_key.is_some() || self.cached_audio_key.is_some())
-            && !self.media_session_continuable
-        {
+        // exactly-cached prefix. Held state is `session_media()` (raw keys ∪
+        // persistent `media_session_context`), not the raw keys alone: after a
+        // failed media prepare on a warm-continued session only the context
+        // survives, and the media-expanded cached history must not seed a
+        // text-only prefix hit.
+        if !self.session_media().is_empty() && !self.media_session_continuable {
             return 0;
         }
         // The live KV caches must exist — `cached_token_history` can
@@ -5125,6 +6419,8 @@ impl ChatBackend for Gemma4Inner {
             // structurally `None`.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            self.media_session_context = MediaCapabilities::NONE;
+            self.media_session_continuable = false;
         }
     }
 
@@ -5173,6 +6469,7 @@ impl ChatBackend for Gemma4Inner {
                 &self.final_norm,
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?;
         }
         eval_gemma4_caches(
@@ -5201,6 +6498,7 @@ impl ChatBackend for Gemma4Inner {
                 self.embed_weight_t.as_ref(),
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?
         };
         logits.squeeze(Some(&[1]))
@@ -5250,31 +6548,26 @@ impl ChatBackend for Gemma4Inner {
         })
     }
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
-    }
-
-    /// UNCONDITIONALLY `true` — even for checkpoints without a vision
-    /// tower. Image-bearing messages are accepted on every entry point and
-    /// surface the exact "Images provided but model has no vision support
-    /// (no vision_config in config.json)" error from INSIDE the turn (after
-    /// template rendering); returning `false` here would replace that with
-    /// the engine's typed pre-render restart-prefix error. The error
-    /// surfaces from inside `vision_turn` instead (see
-    /// `prepare_vision_tokens`).
-    fn supports_images(&self) -> bool {
-        true
-    }
-
-    /// Audio support is gated on the unified `embed_audio` projection being
-    /// built at load time (`config.has_audio`). Unlike `supports_images`
-    /// (which is unconditionally `true` so the "no vision support" error
-    /// surfaces from inside the turn), audio is rejected at the pre-render
-    /// guard for non-audio checkpoints: there is no audio entry inside the
-    /// turn to surface a clearer message, and the engine's typed restart
-    /// prefix is the correct contract.
-    fn supports_audio(&self) -> bool {
-        self.embed_audio.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        let paged_available = self.paged_adapter.is_some();
+        let image_components_loaded = self.image_path_loaded();
+        let audio_embedder_loaded = self.embed_audio.is_some();
+        ExecutionPlan {
+            media: gemma4_media_plan(
+                image_components_loaded,
+                audio_embedder_loaded,
+                paged_available,
+            ),
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: self.has_draft().then_some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: false,
+            }),
+        }
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {
@@ -5302,15 +6595,15 @@ impl ChatBackend for Gemma4Inner {
         Box::new(Gemma4Emitter::new())
     }
 
-    /// REJECT text deltas on image-holding sessions despite
-    /// `supports_images() == true`: gemma4's prefix reuse is text-only, so
+    /// REJECT text deltas on media-holding sessions despite the declared
+    /// image capability: gemma4's prefix reuse is text-only, so
     /// a delta on top of an image session would prefill on caches whose
     /// positions include expanded image tokens the history bookkeeping
     /// does not model. The message has NO space after the prefix:
     /// `"{PREFIX}{entry_fn} is text-only; session currently holds image
     /// state"`.
-    fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
-        // Warm-continue: a continuable media turn (audio / non-unified image)
+    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
+        // Warm-continue: a continuable pure image turn
         // kept its global paged KV live + a sliding history checkpoint at the
         // full prefix, so a text delta restores causally on the live media KV.
         // The marker ALONE is insufficient: the live paged request must STILL
@@ -5334,12 +6627,12 @@ impl ChatBackend for Gemma4Inner {
         }
         // A continuable media session whose paged request is no longer live
         // must cold-restart, not warm-continue against a released request.
-        // A warm text delta clears `cached_image_key` but leaves the marker
-        // armed, so the key checks below would silently fall through to `None`;
-        // gate on the marker (the true media-held signal) and emit the audio /
-        // image restart message that matches whichever media key still remains.
+        // Gate on the marker (the media-held signal while a continuation is
+        // armed) and use the persistent media context so the image/audio
+        // diagnostic stays correct across repeated continuations, whose warm
+        // text saves cleared the raw `cached_image_key`/`cached_audio_key`.
         if self.media_session_continuable {
-            let media_state = if self.cached_audio_key.is_some() {
+            let media_state = if self.session_media().audio {
                 "audio"
             } else {
                 "image"
@@ -5349,12 +6642,20 @@ impl ChatBackend for Gemma4Inner {
                 engine::IMAGE_CHANGE_RESTART_PREFIX
             ));
         }
-        if self.cached_image_key.is_some() {
+        // Non-continuable media hold: read `session_media()` (raw keys ∪
+        // persistent `media_session_context`), not the raw keys alone. A paged
+        // media prepare that fails AFTER a warm text continuation leaves the
+        // keys `None` (warm saves drop them) and the marker disarmed (the
+        // vision cores reset it ahead of the fallible prepare); the surviving
+        // context is then the only signal that the cached history still holds
+        // media-expanded positions a text-only prefill cannot rebuild.
+        let held = self.session_media();
+        if held.images {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds image state",
                 engine::IMAGE_CHANGE_RESTART_PREFIX
             ))
-        } else if self.cached_audio_key.is_some() {
+        } else if held.audio {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds audio state",
                 engine::IMAGE_CHANGE_RESTART_PREFIX
@@ -5364,11 +6665,11 @@ impl ChatBackend for Gemma4Inner {
         }
     }
 
-    fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
-        // No-op: gemma4 has no MTP heads (acceptance fields stay None) and
-        // its metrics carry no `profile_phases`. The default would only add
-        // profiling-gated extras; keep the payload byte-stable instead.
-    }
+    // `augment_performance` deliberately NOT overridden: the default
+    // (`profiler.fill_mtp_acceptance`) fills the `mtp_*` acceptance fields
+    // after a DSpark turn (and copies `profile_phases` when profiling is
+    // enabled). AR turns record no MTP cycle, so their acceptance fields
+    // stay `None` as before.
 
     fn has_live_session(&self) -> bool {
         // Requires an initialized session: a non-empty
@@ -5376,20 +6677,45 @@ impl ChatBackend for Gemma4Inner {
         !self.cached_token_history.is_empty() && self.caches.is_some()
     }
 
-    fn session_holds_images(&self) -> bool {
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // Keys cover a just-finalized media turn and direct/transitional test
+        // states. `media_session_context` remains authoritative after warm
+        // text saves clear those keys while preserving the same live media KV.
+        self.media_session_context.union(MediaCapabilities {
+            images: self.cached_image_key.is_some(),
+            audio: self.cached_audio_key.is_some(),
+        })
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // Gated on `has_paged_adapter()`; with the adapter live EVERY
-        // text turn (fresh + delta, sync + streaming) takes the generic
-        // paged engine, which drives the adapter lifecycle via
-        // [`PagedBackend`] and reuses the shared `run_decode_loop`.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The execution plan admits every text turn shape (fresh + delta,
+        // sync + streaming) when the adapter is loaded. The generic paged
+        // engine drives the lifecycle via [`PagedBackend`].
+        debug_assert!(args.plan.use_paged_attention);
+        debug_assert!(self.paged_adapter.is_some());
+        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
+        debug_assert!(self.paged_text_turn_context.is_empty());
+        self.paged_text_turn_context = args.plan.context_media;
+        let result = crate::engine::paged_turn::run_paged_turn(self, args);
+        self.paged_text_turn_context = MediaCapabilities::NONE;
+        result
     }
 
-    fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        Some(self.vision_chat_turn(args))
+    /// Draft speculative-decode whole-turn path (either [`Gemma4Draft`]
+    /// variant). The execution plan admits this handler only after request
+    /// opt-in, with a loaded draft, flat KV, and text-only input.
+    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(args.media.is_empty());
+        debug_assert!(matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ));
+        self.draft_chat_turn(args)
+    }
+
+    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(!args.media.is_empty());
+        self.multimodal_chat_turn(args)
     }
 }
 
@@ -5485,6 +6811,7 @@ impl Gemma4Model {
             initialized: false,
             paged_active: false,
             _cache_limit_guard: None,
+            draft_active: false,
         }
     }
 
@@ -5510,15 +6837,73 @@ impl Gemma4Model {
         self.paged_active
     }
 
+    /// Whether this loaded instance can execute image-bearing chat turns.
+    /// Config-only stubs and incomplete/non-paged physical paths return false.
+    #[napi]
+    pub fn supports_images(&self) -> bool {
+        self.initialized && self.paged_active && self.has_vision
+    }
+
     #[napi]
     pub fn model_id(&self) -> u32 {
         self.model_id as u32
     }
 
+    /// Whether a draft model — DSpark or Google assistant — is loaded on
+    /// this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+    /// the speculative-decode whole-turn path.
+    ///
+    /// Note: this only reports draft availability. Whether speculative
+    /// decoding actually runs on a given call also requires the per-request
+    /// `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+    /// surface, but it reports an external draft model (either variant),
+    /// not in-checkpoint MTP heads. Stubs from `new(config)` always return
+    /// `false`.
+    #[napi]
+    pub fn has_mtp_weights(&self) -> bool {
+        self.draft_active
+    }
+
     /// Load a Gemma4 model from a directory.
     #[napi]
-    pub async fn load(model_path: String) -> Result<Gemma4Model> {
-        Self::load_from_dir(&model_path).await
+    pub async fn load(
+        model_path: String,
+        options: Option<Gemma4LoadOptions>,
+    ) -> Result<Gemma4Model> {
+        Self::load_from_dir(&model_path, options).await
+    }
+
+    /// Test-only entry point that dispatches `ChatCmd::StreamSessionStart`
+    /// and returns the raw mpsc receiver the model thread writes into, so a
+    /// pure-Rust integration test can exercise the streaming path without a
+    /// NAPI host (same pattern as `Qwen3_5Model::chat_stream_session_start_for_test`).
+    #[doc(hidden)]
+    pub fn chat_stream_session_start_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        thread.send(ChatCmd::StreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
     }
 }
 
@@ -5723,7 +7108,11 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 ///
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
-fn forward_body(
+///
+/// When `tap` is provided, the residual-stream hidden of each tapped layer
+/// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
+/// `layer_ids` order; the compute graph is otherwise unchanged.
+pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
     inputs_embeds: Option<MxArray>,
     embedding: &Embedding,
@@ -5733,7 +7122,22 @@ fn forward_body(
     ple: Option<&PleComponents>,
     per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
+    if let Some(t) = tap.as_deref() {
+        let mut previous: Option<usize> = None;
+        for &id in t.layer_ids {
+            if id >= layers.len() || previous.is_some_and(|prev| id <= prev) {
+                return Err(Error::from_reason(format!(
+                    "forward_body: tap layer_ids {:?} must be strictly ascending decoder indices below {}",
+                    t.layer_ids,
+                    layers.len()
+                )));
+            }
+            previous = Some(id);
+        }
+    }
+
     // Step 1: Embedding (or use pre-computed embeddings)
     let mut h = if let Some(embeds) = inputs_embeds {
         embeds
@@ -5884,6 +7288,15 @@ fn forward_body(
                 shared_kv.insert(i, (keys, values));
             }
         }
+
+        // Residual-stream hidden of layer i (post residual add, pre
+        // final-norm — HF `hidden_states[i + 1]`), captured for both the
+        // regular and the KV-shared branch.
+        if let Some(t) = tap.as_deref_mut()
+            && t.layer_ids.contains(&i)
+        {
+            t.captured.push(h.clone());
+        }
     }
 
     // Final norm
@@ -5893,7 +7306,7 @@ fn forward_body(
 /// Full forward pass: transformer body + lm_head + logit softcapping.
 ///
 /// Used for the final prefill chunk and for each decode step.
-fn forward_inner(
+pub(crate) fn forward_inner(
     input_ids: &MxArray,
     embedding: &Embedding,
     layers: &[Gemma4DecoderLayer],
@@ -5903,6 +7316,7 @@ fn forward_inner(
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
     let h = forward_body(
         Some(input_ids),
@@ -5914,17 +7328,34 @@ fn forward_inner(
         ple,
         None,
         config,
+        tap,
     )?;
+    lm_head_logits(&h, embedding, lm_head, embed_weight_t, config)
+}
 
-    crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &h, None);
+/// LM head + logit softcapping over a post-final-norm hidden state — the
+/// tail `forward_inner` runs after `forward_body`.
+///
+/// Projects through the explicit lm_head when present, otherwise through the
+/// tied embedding table (packed-quantized, pre-transposed, or dense
+/// transpose fallback), then applies `final_logit_softcapping` when the
+/// config sets it.
+pub(crate) fn lm_head_logits(
+    h: &MxArray,
+    embedding: &Embedding,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    config: &Gemma4Config,
+) -> Result<MxArray> {
+    crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", h, None);
 
     // LM head or tied embeddings
     let logits = if let Some(head) = lm_head {
-        head.forward(&h)?
+        head.forward(h)?
     } else if embedding.is_packed_quantized() {
         // Packed tied lm_head: project through the quantized matmul without
         // materializing the dense table.
-        embedding.as_linear(&h)?
+        embedding.as_linear(h)?
     } else if let Some(w_t) = embed_weight_t {
         h.matmul(w_t)?
     } else {
@@ -5947,9 +7378,135 @@ fn forward_inner(
     }
 }
 
+/// Run the target over a `[1, T]` verify block at the current cache offset,
+/// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
+///
+/// This is exactly the existing T>1-at-offset forward (`forward_inner`, with
+/// the same masks/rope the chunked prefill uses). It does not sample and
+/// touches no history bookkeeping; caches advance by T. Callers pair it with
+/// `snapshot_before_verify` / `commit_after_verify` for rollback.
+pub(crate) fn dspark_verify_forward(
+    block_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+    tap: &mut DsparkTap<'_>,
+) -> Result<MxArray> {
+    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
+        return Err(Error::from_reason(format!(
+            "dspark_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
+            block_ids.shape()?.as_ref()
+        )));
+    }
+    forward_inner(
+        block_ids,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embed_weight_t,
+        ple,
+        config,
+        Some(tap),
+    )
+}
+
+/// Run the target over a `[1, T]` verify block at the current cache offset
+/// and return the `[1, T, vocab]` softcapped logits together with the
+/// `[1, T, hidden]` post-final-norm hidden state (the assistant draft chains
+/// its next round's `h_prev` from the hidden at the last kept slot).
+///
+/// Same forward as [`dspark_verify_forward`] minus the residual-stream tap:
+/// it does not sample and touches no history bookkeeping; caches advance by
+/// T. Callers pair it with `snapshot_before_verify` / `commit_after_verify`
+/// for rollback.
+pub(crate) fn assistant_verify_forward(
+    block_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+) -> Result<(MxArray, MxArray)> {
+    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
+        return Err(Error::from_reason(format!(
+            "assistant_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
+            block_ids.shape()?.as_ref()
+        )));
+    }
+    let hidden = forward_body(
+        Some(block_ids),
+        None,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        ple,
+        None,
+        config,
+        None,
+    )?;
+    let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
+    Ok((logits, hidden))
+}
+
+/// Shared-slot mask for `snapshot_before_verify`, index-aligned with the
+/// per-layer caches vec: entry i is true iff decoder layer i is KV-shared.
+/// Shared layers read their anchor layer's cache; their own vec entry is
+/// never written by a forward pass.
+pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
+    (0..config.num_hidden_layers as usize)
+        .map(|i| config.is_kv_shared_layer(i))
+        .collect()
+}
+
+/// Target-layer indices whose KV caches the assistant draft reads: one
+/// source per attention type, index-aligned with the per-layer caches vec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssistantKvSources {
+    pub sliding: usize,
+    pub full: usize,
+}
+
+/// Resolve the assistant draft's K/V source layers: for each attention type,
+/// the LAST non-KV-shared target layer of that type — the max index
+/// `i < config.first_kv_shared_layer()` whose `layer_types` entry equals the
+/// type string exactly, the same matching `should_store_shared_kv` uses to
+/// mark anchors. Layers with a missing or unrecognized `layer_types` entry
+/// match neither type. With KV sharing enabled these are exactly the anchor
+/// layers `should_store_shared_kv` marks; without sharing they are simply
+/// the last layer of each type. Errors when the non-shared prefix lacks
+/// either attention type — the draft needs one K/V source per type.
+pub(crate) fn assistant_kv_source_indices(config: &Gemma4Config) -> Result<AssistantKvSources> {
+    let first_shared = config.first_kv_shared_layer();
+    let last_below_boundary = |layer_type: &str| {
+        (0..first_shared).rfind(|&i| config.layer_types.get(i).is_some_and(|t| t == layer_type))
+    };
+    let sliding = last_below_boundary("sliding_attention").ok_or_else(|| {
+        Error::from_reason(format!(
+            "assistant KV source mapping: no non-KV-shared sliding_attention layer in layers 0..{first_shared}"
+        ))
+    })?;
+    let full = last_below_boundary("full_attention").ok_or_else(|| {
+        Error::from_reason(format!(
+            "assistant KV source mapping: no non-KV-shared full_attention layer in layers 0..{first_shared}"
+        ))
+    })?;
+    Ok(AssistantKvSources { sliding, full })
+}
+
 /// Compute PLE (per-layer embeddings) from input_ids.
 /// Returns shape [B, T, num_layers, ple_dim].
-fn compute_ple(
+pub(crate) fn compute_ple(
     input_ids: &MxArray,
     h: &MxArray,
     ple: &PleComponents,
@@ -6214,9 +7771,7 @@ fn gemma4_default_paged_cache_memory_mb(
 /// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
 /// which can GPU-timeout with very large graphs. Using 512 keeps individual
 /// command buffers under Metal's timeout limit.
-const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
-const GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
-const GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
+pub(crate) const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gemma4SlidingRestoreLimitOverride {
@@ -6321,13 +7876,40 @@ fn gemma4_sliding_prefix_checkpoint_limit_for_override(
     if sliding_window == 0 || block_size == 0 {
         return GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT;
     }
-    sliding_window
+    let logical_limit = sliding_window
         .div_ceil(block_size)
         .saturating_mul(GEMMA4_SLIDING_PREFIX_CHECKPOINT_WINDOW_MULTIPLIER)
         .clamp(
             GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT,
             GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT,
-        )
+        );
+    let checkpoint_bytes = gemma4_sliding_checkpoint_estimated_bytes(config);
+    if checkpoint_bytes == 0 {
+        return logical_limit;
+    }
+    let memory_limit = (GEMMA4_SLIDING_CHECKPOINT_MEMORY_BUDGET_BYTES / checkpoint_bytes)
+        .max(GEMMA4_IMAGE_PREFIX_CHECKPOINT_LIMIT as u64);
+    logical_limit.min(usize::try_from(memory_limit).unwrap_or(usize::MAX))
+}
+
+fn gemma4_sliding_checkpoint_estimated_bytes(config: &Gemma4Config) -> u64 {
+    let physical_sliding_layers = (0..config.num_hidden_layers.max(0) as usize)
+        .filter(|&layer_idx| {
+            config.is_sliding_layer(layer_idx) && !config.is_kv_shared_layer(layer_idx)
+        })
+        .count() as u64;
+    if physical_sliding_layers == 0 {
+        return 0;
+    }
+    // Conservatively budget four bytes per element. Most shipped checkpoints
+    // use BF16 caches, but the snapshot type does not promise that dtype and an
+    // f32 load must not multiply a 128-entry logical limit into an OOM.
+    physical_sliding_layers
+        .saturating_mul(config.sliding_window.max(0) as u64)
+        .saturating_mul(config.num_key_value_heads.max(0) as u64)
+        .saturating_mul(config.head_dim.max(0) as u64)
+        .saturating_mul(2) // K + V
+        .saturating_mul(4) // conservative bytes per element
 }
 
 fn gemma4_sliding_prefix_checkpoint_limit(config: &Gemma4Config, block_size: u32) -> usize {
@@ -6347,6 +7929,32 @@ fn gemma4_sliding_decode_checkpoint_interval(config: &Gemma4Config, block_size: 
     target.div_ceil(block_size).saturating_mul(block_size)
 }
 
+fn gemma4_sliding_checkpoint_boundaries_crossed(
+    start_offset: u32,
+    end_offset: u32,
+    checkpoint_interval: u32,
+) -> Vec<u32> {
+    if checkpoint_interval == 0 || end_offset <= start_offset {
+        return Vec::new();
+    }
+    let Some(mut boundary) = start_offset
+        .checked_div(checkpoint_interval)
+        .and_then(|bucket| bucket.checked_add(1))
+        .and_then(|bucket| bucket.checked_mul(checkpoint_interval))
+    else {
+        return Vec::new();
+    };
+    let mut boundaries = Vec::new();
+    while boundary <= end_offset {
+        boundaries.push(boundary);
+        let Some(next) = boundary.checked_add(checkpoint_interval) else {
+            break;
+        };
+        boundary = next;
+    }
+    boundaries
+}
+
 fn trim_gemma4_sliding_prefix_checkpoints(
     checkpoints: &mut VecDeque<Gemma4SlidingPrefixCheckpoint>,
     limit: usize,
@@ -6358,8 +7966,34 @@ fn trim_gemma4_sliding_prefix_checkpoints(
     let mut evicted = 0usize;
     let mut first_prefix_len = None;
     let mut last_prefix_len = None;
+
+    while checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.protected_image_prompt_boundary)
+        .count()
+        > GEMMA4_IMAGE_PREFIX_CHECKPOINT_LIMIT
+    {
+        let Some(index) = checkpoints
+            .iter()
+            .position(|checkpoint| checkpoint.protected_image_prompt_boundary)
+        else {
+            break;
+        };
+        if let Some(checkpoint) = checkpoints.remove(index) {
+            first_prefix_len.get_or_insert(checkpoint.prefix_len);
+            last_prefix_len = Some(checkpoint.prefix_len);
+            evicted += 1;
+        }
+    }
     while checkpoints.len() > limit {
-        if let Some(checkpoint) = checkpoints.pop_front() {
+        // Decode/text checkpoints are reproducible from token embeddings. Keep
+        // the two most recent image-aware prompt boundaries preferentially so
+        // an A -> B -> A branch can restore A without retaining every image.
+        let removable = checkpoints
+            .iter()
+            .position(|checkpoint| !checkpoint.protected_image_prompt_boundary)
+            .unwrap_or(0);
+        if let Some(checkpoint) = checkpoints.remove(removable) {
             first_prefix_len.get_or_insert(checkpoint.prefix_len);
             last_prefix_len = Some(checkpoint.prefix_len);
             evicted += 1;
@@ -6377,6 +8011,22 @@ fn trim_gemma4_sliding_prefix_checkpoints(
     }
 }
 
+fn upsert_gemma4_sliding_prefix_checkpoint(
+    checkpoints: &mut VecDeque<Gemma4SlidingPrefixCheckpoint>,
+    checkpoint: Gemma4SlidingPrefixCheckpoint,
+    limit: usize,
+    trace_enabled: bool,
+) {
+    checkpoints.retain(|existing| {
+        !(existing.prefix_len == checkpoint.prefix_len
+            && existing.block_size == checkpoint.block_size
+            && existing.final_block_hash == checkpoint.final_block_hash
+            && existing.tokens == checkpoint.tokens)
+    });
+    checkpoints.push_back(checkpoint);
+    trim_gemma4_sliding_prefix_checkpoints(checkpoints, limit, trace_enabled);
+}
+
 fn gemma4_paged_prefill_group_max_chunk() -> u32 {
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
     if configured_chunk_size > 0 {
@@ -6390,18 +8040,8 @@ fn gemma4_paged_prefill_body_chunk_size(configured_chunk_size: i32, body_tokens:
     if configured_chunk_size > 0 {
         configured_chunk_size as usize
     } else {
-        body_tokens
+        body_tokens.min(GEMMA4_PREFILL_STEP_SIZE as usize)
     }
-}
-
-fn gemma4_paged_prefill_paged_attention_enabled_for_chunking() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default(
-            "MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION",
-            true,
-        )
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6471,29 +8111,42 @@ fn gemma4_split_body_chunk_plan_at_position(
     chunks.insert(idx + 1, after_chunk);
 }
 
-fn gemma4_paged_attention_v2_aux_fits(
+fn gemma4_paged_prefill_chunk_route_is_aux_safe(
     num_new_tokens: usize,
     first_position: u32,
     num_query_heads: u32,
+    num_kv_heads: u32,
     head_size: u32,
+    route_policy: Gemma4PagedPrefillRoutePolicy,
 ) -> bool {
     if num_new_tokens == 0 || num_query_heads == 0 || head_size == 0 {
         return false;
     }
-
-    let max_context_len = first_position as u64 + num_new_tokens as u64;
-    if max_context_len <= GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE {
+    let Ok(num_new_tokens) = u32::try_from(num_new_tokens) else {
+        return false;
+    };
+    let Some(total_context) = first_position.checked_add(num_new_tokens) else {
+        return false;
+    };
+    let Some(layout) = gemma4_paged_prefill_v2_layout_for_chunk(
+        route_policy,
+        num_new_tokens,
+        total_context,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+    ) else {
+        // SDPA and host-read routes do not allocate V2 auxiliary buffers.
         return true;
-    }
-
-    let max_num_partitions = max_context_len.div_ceil(GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE);
-    let exp_sums_size = (num_new_tokens as u128)
-        .saturating_mul(num_query_heads as u128)
-        .saturating_mul(max_num_partitions as u128);
-    let tmp_out_size = exp_sums_size.saturating_mul(head_size as u128);
-
-    exp_sums_size <= GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
-        && tmp_out_size <= GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
+    };
+    paged_attention_v2_aux_fits(
+        layout,
+        num_new_tokens,
+        num_query_heads,
+        num_kv_heads,
+        total_context,
+        head_size,
+    )
 }
 
 fn gemma4_paged_prefill_aux_limited_chunk_size(
@@ -6501,16 +8154,22 @@ fn gemma4_paged_prefill_aux_limited_chunk_size(
     remaining_tokens: usize,
     first_position: u32,
     num_query_heads: u32,
+    num_kv_heads: u32,
     head_size: u32,
-    paged_attention_enabled: bool,
+    route_policy: Gemma4PagedPrefillRoutePolicy,
 ) -> (usize, bool) {
     let base = gemma4_paged_prefill_body_chunk_size(configured_chunk_size, remaining_tokens)
         .min(remaining_tokens)
         .max(1);
 
-    if !paged_attention_enabled
-        || gemma4_paged_attention_v2_aux_fits(base, first_position, num_query_heads, head_size)
-    {
+    if gemma4_paged_prefill_chunk_route_is_aux_safe(
+        base,
+        first_position,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        route_policy,
+    ) {
         return (base, false);
     }
 
@@ -6518,7 +8177,14 @@ fn gemma4_paged_prefill_aux_limited_chunk_size(
     let mut hi = base.saturating_sub(1).max(1);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
-        if gemma4_paged_attention_v2_aux_fits(mid, first_position, num_query_heads, head_size) {
+        if gemma4_paged_prefill_chunk_route_is_aux_safe(
+            mid,
+            first_position,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            route_policy,
+        ) {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -6533,37 +8199,18 @@ fn gemma4_paged_prefill_body_chunk_plan(
     body_tokens: usize,
     first_position: u32,
     num_query_heads: u32,
+    num_kv_heads: u32,
     head_size: u32,
-    paged_attention_enabled: bool,
+    route_policy: Gemma4PagedPrefillRoutePolicy,
 ) -> Result<Vec<Gemma4PagedPrefillBodyChunk>> {
     gemma4_paged_prefill_body_chunk_plan_inner(
         configured_chunk_size,
         body_tokens,
         first_position,
         num_query_heads,
+        num_kv_heads,
         head_size,
-        paged_attention_enabled,
-        0,
-    )
-}
-
-fn gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
-    configured_chunk_size: i32,
-    body_tokens: usize,
-    first_position: u32,
-    num_query_heads: u32,
-    head_size: u32,
-    paged_attention_enabled: bool,
-    checkpoint_interval: u32,
-) -> Result<Vec<Gemma4PagedPrefillBodyChunk>> {
-    gemma4_paged_prefill_body_chunk_plan_inner(
-        configured_chunk_size,
-        body_tokens,
-        first_position,
-        num_query_heads,
-        head_size,
-        paged_attention_enabled,
-        checkpoint_interval,
+        route_policy,
     )
 }
 
@@ -6572,40 +8219,24 @@ fn gemma4_paged_prefill_body_chunk_plan_inner(
     body_tokens: usize,
     first_position: u32,
     num_query_heads: u32,
+    num_kv_heads: u32,
     head_size: u32,
-    paged_attention_enabled: bool,
-    checkpoint_interval: u32,
+    route_policy: Gemma4PagedPrefillRoutePolicy,
 ) -> Result<Vec<Gemma4PagedPrefillBodyChunk>> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     let mut position = first_position;
     while start < body_tokens {
         let remaining = body_tokens - start;
-        let (mut len, capped_by_v2_aux_limit) = gemma4_paged_prefill_aux_limited_chunk_size(
+        let (len, capped_by_v2_aux_limit) = gemma4_paged_prefill_aux_limited_chunk_size(
             configured_chunk_size,
             remaining,
             position,
             num_query_heads,
+            num_kv_heads,
             head_size,
-            paged_attention_enabled,
+            route_policy,
         );
-        if checkpoint_interval > 0 {
-            let position_u64 = position as u64;
-            let interval_u64 = checkpoint_interval as u64;
-            let chunk_end = position_u64
-                .checked_add(len as u64)
-                .ok_or_else(|| Error::from_reason("Gemma4 paged prefill chunk end overflow"))?;
-            let next_checkpoint = ((position_u64 / interval_u64) + 1)
-                .checked_mul(interval_u64)
-                .ok_or_else(|| {
-                    Error::from_reason("Gemma4 paged prefill checkpoint boundary overflow")
-                })?;
-            if next_checkpoint > position_u64 && next_checkpoint < chunk_end {
-                len = usize::try_from(next_checkpoint - position_u64).map_err(|_| {
-                    Error::from_reason("Gemma4 paged prefill checkpoint chunk length overflow")
-                })?;
-            }
-        }
         if len == 0 {
             return Err(Error::from_reason(
                 "Gemma4 paged prefill dynamic chunking produced an empty chunk",
@@ -6629,7 +8260,7 @@ fn gemma4_paged_prefill_body_chunk_plan_inner(
 
 /// Evaluate all Gemma4 cache arrays to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
+pub(crate) fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
     let mut arrays: Vec<&MxArray> = Vec::new();
     for cache in caches {
         cache.collect_cache_arrays(&mut arrays);
@@ -6672,6 +8303,7 @@ fn prefill_body_gemma4(
     final_norm: &RMSNorm,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
 
@@ -6717,6 +8349,7 @@ fn prefill_body_gemma4(
             ple,
             chunk_ple.as_ref(),
             config,
+            tap.as_deref_mut(),
         )?;
         eval_gemma4_caches(caches)?;
         crate::array::clear_cache();
@@ -6741,6 +8374,7 @@ fn prefill_body_gemma4(
             ple,
             remaining_ple.as_ref(),
             config,
+            tap,
         )?;
     }
 
@@ -6916,6 +8550,236 @@ mod tests {
             image_token_id,
             audio_token_id
         ));
+    }
+
+    #[test]
+    fn gemma4_media_plan_separates_availability_from_backend_validation() {
+        let text_only_flat = gemma4_media_plan(false, false, false);
+        assert_eq!(text_only_flat.available, MediaCapabilities::NONE);
+        assert_eq!(text_only_flat.backend_validated, MediaCapabilities::IMAGES);
+
+        let image_flat = gemma4_media_plan(true, false, false);
+        assert_eq!(image_flat.available, MediaCapabilities::NONE);
+        assert_eq!(image_flat.backend_validated, MediaCapabilities::IMAGES);
+
+        let audio_flat = gemma4_media_plan(false, true, false);
+        assert_eq!(audio_flat.available, MediaCapabilities::NONE);
+        assert_eq!(
+            audio_flat.backend_validated,
+            MediaCapabilities::IMAGES_AND_AUDIO
+        );
+
+        let media_paged = gemma4_media_plan(true, true, true);
+        assert_eq!(media_paged.available, MediaCapabilities::IMAGES_AND_AUDIO);
+        assert_eq!(media_paged.backend_validated, MediaCapabilities::NONE);
+
+        let missing_image_components_paged = gemma4_media_plan(false, true, true);
+        assert_eq!(
+            missing_image_components_paged.available,
+            MediaCapabilities {
+                images: false,
+                audio: true,
+            }
+        );
+        assert_eq!(
+            missing_image_components_paged.backend_validated,
+            MediaCapabilities::IMAGES
+        );
+    }
+
+    #[test]
+    fn gemma4_image_capability_requires_one_complete_paged_path() {
+        assert!(gemma4_image_path_loaded(true, true, true, false, true));
+        assert!(gemma4_image_path_loaded(true, true, false, true, true));
+
+        assert!(!gemma4_image_path_loaded(false, true, true, false, true));
+        assert!(!gemma4_image_path_loaded(true, false, true, false, true));
+        assert!(!gemma4_image_path_loaded(true, true, false, false, true));
+        assert!(!gemma4_image_path_loaded(true, true, true, false, false));
+    }
+
+    #[test]
+    fn gemma4_vlm_checkpoint_publication_is_image_only_and_opt_in() {
+        assert!(gemma4_vlm_prefix_checkpoint_eligible(true, false, true));
+        assert!(!gemma4_vlm_prefix_checkpoint_eligible(true, false, false));
+        assert!(!gemma4_vlm_prefix_checkpoint_eligible(false, true, true));
+        assert!(!gemma4_vlm_prefix_checkpoint_eligible(true, true, true));
+        assert!(!gemma4_vlm_prefix_checkpoint_eligible(false, false, true));
+    }
+
+    #[test]
+    fn gemma4_image_lineage_requires_declared_media_context() {
+        let history = [1, 2, 3, 4];
+        let extended = [1, 2, 3, 4, 5];
+        let image_positions = [(1, 0xAAAA)];
+
+        assert!(gemma4_carries_image_lineage(
+            MediaCapabilities::IMAGES,
+            Some(0xAAAA),
+            &image_positions,
+            &history,
+            &extended,
+        ));
+        assert!(!gemma4_carries_image_lineage(
+            MediaCapabilities::NONE,
+            Some(0xAAAA),
+            &image_positions,
+            &history,
+            &extended,
+        ));
+        assert!(!gemma4_carries_image_lineage(
+            MediaCapabilities::IMAGES,
+            Some(0xAAAA),
+            &image_positions,
+            &history,
+            &[1, 2, 9],
+        ));
+    }
+
+    #[test]
+    fn gemma4_causal_leading_text_hit_replays_only_before_image() {
+        let before_image = gemma4_vlm_prefix_policy(16, Some(32), None);
+        assert!(before_image.unified_boundary_safe);
+        assert!(!before_image.require_exact_checkpoint);
+        assert!(before_image.may_replay_leading_text);
+
+        let at_image_boundary = gemma4_vlm_prefix_policy(32, Some(32), None);
+        assert!(!at_image_boundary.require_exact_checkpoint);
+        assert!(at_image_boundary.may_replay_leading_text);
+
+        let crosses_image = gemma4_vlm_prefix_policy(48, Some(32), None);
+        assert!(crosses_image.require_exact_checkpoint);
+        assert!(!crosses_image.may_replay_leading_text);
+
+        let unified_inside_image = gemma4_vlm_prefix_policy(48, Some(32), Some(80));
+        assert!(!unified_inside_image.unified_boundary_safe);
+        assert!(unified_inside_image.require_exact_checkpoint);
+        assert!(!unified_inside_image.may_replay_leading_text);
+
+        let unified_after_image = gemma4_vlm_prefix_policy(80, Some(32), Some(80));
+        assert!(unified_after_image.unified_boundary_safe);
+        assert!(unified_after_image.require_exact_checkpoint);
+        assert!(!unified_after_image.may_replay_leading_text);
+    }
+
+    #[test]
+    fn gemma4_unified_first_chunk_never_splits_inside_image_overlay() {
+        assert_eq!(
+            gemma4_vlm_prefill_chunk_end(0, 128, 32, true, 0, 48, Some(80)),
+            128,
+            "an inside-image prompt checkpoint must be ignored"
+        );
+        assert_eq!(
+            gemma4_vlm_prefill_chunk_end(0, 128, 32, true, 0, 96, Some(80)),
+            96,
+            "a checkpoint after the complete image span is safe"
+        );
+        assert_eq!(
+            gemma4_vlm_prefill_chunk_end(0, 128, 32, false, 16, 48, Some(80)),
+            16,
+            "causal E2B may still split at a leading-text checkpoint"
+        );
+    }
+
+    #[test]
+    fn gemma4_large_sliding_snapshots_are_memory_bounded() {
+        let mut config = paged_tiny_config(None);
+        config.num_hidden_layers = 40;
+        config.layer_types = vec!["sliding_attention".to_string(); 40];
+        config.num_kv_shared_layers = None;
+        config.sliding_window = 1024;
+        config.num_key_value_heads = 8;
+        config.head_dim = 256;
+
+        assert_eq!(
+            gemma4_sliding_checkpoint_estimated_bytes(&config),
+            40 * 1024 * 8 * 256 * 2 * 4
+        );
+        assert_eq!(
+            gemma4_sliding_prefix_checkpoint_limit_for_override(&config, 16, None),
+            2,
+            "the default byte budget must not retain 128 huge unified snapshots"
+        );
+    }
+
+    #[test]
+    fn gemma4_prompt_boundary_retains_a_across_a_b_a_image_identity() {
+        let tokens: Vec<u32> = (1..=12).collect();
+        let block_size = 4;
+        let prefix_len = 8;
+        let a_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[(4, 0xAAAA)]);
+        let b_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[(4, 0xBBBB)]);
+        let a_hash = compute_gemma4_paged_prefix_block_hash_with_keys(
+            &tokens, prefix_len, block_size, &a_keys, 0,
+        )
+        .expect("A image-aware prefix hash");
+        let b_hash = compute_gemma4_paged_prefix_block_hash_with_keys(
+            &tokens, prefix_len, block_size, &b_keys, 0,
+        )
+        .expect("B image-aware prefix hash");
+        assert_ne!(a_hash, b_hash);
+
+        let checkpoint = |final_block_hash| Gemma4SlidingPrefixCheckpoint {
+            prefix_len,
+            block_size,
+            final_block_hash,
+            protected_image_prompt_boundary: true,
+            tokens: tokens[..prefix_len as usize].to_vec(),
+            snapshots: Vec::new(),
+        };
+        let mut retained = VecDeque::new();
+        upsert_gemma4_sliding_prefix_checkpoint(&mut retained, checkpoint(a_hash), 8, false);
+        let mut latest_prompt_boundary = checkpoint(a_hash);
+        assert_eq!(latest_prompt_boundary.final_block_hash, a_hash);
+        upsert_gemma4_sliding_prefix_checkpoint(&mut retained, checkpoint(b_hash), 8, false);
+        latest_prompt_boundary = checkpoint(b_hash);
+
+        assert_eq!(latest_prompt_boundary.final_block_hash, b_hash);
+        assert!(
+            retained
+                .iter()
+                .any(|entry| entry.final_block_hash == a_hash)
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|entry| entry.final_block_hash == b_hash)
+        );
+        upsert_gemma4_sliding_prefix_checkpoint(
+            &mut retained,
+            Gemma4SlidingPrefixCheckpoint {
+                prefix_len,
+                block_size,
+                final_block_hash: 0xDEC0DE,
+                protected_image_prompt_boundary: false,
+                tokens: tokens[..prefix_len as usize].to_vec(),
+                snapshots: Vec::new(),
+            },
+            2,
+            false,
+        );
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .any(|entry| entry.final_block_hash == a_hash),
+            "decode checkpoints must not evict protected image A"
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|entry| entry.final_block_hash == b_hash),
+            "decode checkpoints must not evict protected image B"
+        );
+        let restored_a = retained.iter().rev().find(|entry| {
+            entry.prefix_len == prefix_len
+                && entry.tokens == tokens[..prefix_len as usize]
+                && entry.final_block_hash == a_hash
+        });
+        assert!(
+            restored_a.is_some(),
+            "A must remain restorable after B replaces the latest singleton boundary"
+        );
     }
 
     /// Pins the composition order `prepare_multimodal_tokens` relies on: on the
@@ -7114,14 +8978,27 @@ mod tests {
         );
         assert_eq!(
             super::gemma4_paged_prefill_body_chunk_size(0, 27_938),
-            27_938
+            super::GEMMA4_PREFILL_STEP_SIZE as usize
+        );
+        assert_eq!(
+            super::gemma4_paged_prefill_body_chunk_size(0, 127),
+            127,
+            "the default bound must not pad a short final chunk"
         );
     }
 
     #[test]
     fn test_gemma4_paged_prefill_body_chunk_plan_caps_v2_aux() {
-        let plan =
-            super::gemma4_paged_prefill_body_chunk_plan(8192, 27_938, 16, 16, 512, true).unwrap();
+        let plan = super::gemma4_paged_prefill_body_chunk_plan(
+            8192,
+            27_938,
+            16,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::ForceVarlen,
+        )
+        .unwrap();
         assert_eq!(plan.first().unwrap().len, 8192);
         assert!(plan.iter().any(|chunk| chunk.capped_by_v2_aux_limit));
 
@@ -7130,27 +9007,66 @@ mod tests {
         for chunk in &plan {
             assert_eq!(chunk.start, expected_start);
             assert_eq!(chunk.first_position, expected_position);
-            assert!(super::gemma4_paged_attention_v2_aux_fits(
+            assert!(super::gemma4_paged_prefill_chunk_route_is_aux_safe(
                 chunk.len,
                 chunk.first_position,
                 16,
-                512
+                1,
+                512,
+                super::Gemma4PagedPrefillRoutePolicy::ForceVarlen,
             ));
             expected_start += chunk.len;
             expected_position += chunk.len as u32;
         }
         assert_eq!(expected_start, 27_938);
 
-        let uncapped =
-            super::gemma4_paged_prefill_body_chunk_plan(8192, 27_938, 16, 16, 512, false).unwrap();
-        assert_eq!(uncapped.len(), 4);
-        assert!(uncapped.iter().all(|chunk| !chunk.capped_by_v2_aux_limit));
+        let forced_sdpa = super::gemma4_paged_prefill_body_chunk_plan(
+            8192,
+            27_938,
+            16,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::NonV2,
+        )
+        .unwrap();
+        assert_eq!(forced_sdpa.len(), 4);
+        assert_eq!(forced_sdpa[0].len, 8192);
+        assert!(
+            forced_sdpa
+                .iter()
+                .all(|chunk| !chunk.capped_by_v2_aux_limit)
+        );
+
+        let auto = super::gemma4_paged_prefill_body_chunk_plan(
+            8192,
+            27_938,
+            16,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::Auto,
+        )
+        .unwrap();
+        assert_eq!(auto.len(), 4);
+        assert!(
+            auto.iter().all(|chunk| !chunk.capped_by_v2_aux_limit),
+            "auto must keep full compute chunks when its safe pre-plan selects SDPA"
+        );
     }
 
     #[test]
     fn test_gemma4_sliding_restore_chunk_plan_avoids_singletons() {
-        let mut plan =
-            super::gemma4_paged_prefill_body_chunk_plan(4, 9, 0, 16, 512, false).unwrap();
+        let mut plan = super::gemma4_paged_prefill_body_chunk_plan(
+            4,
+            9,
+            0,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::NonV2,
+        )
+        .unwrap();
         assert_eq!(
             plan.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
             vec![4, 4, 1]
@@ -7164,8 +9080,16 @@ mod tests {
         assert_eq!(plan[1].start, 4);
         assert_eq!(plan[1].first_position, 4);
 
-        let mut one_token_chunks =
-            super::gemma4_paged_prefill_body_chunk_plan(1, 5, 0, 16, 512, false).unwrap();
+        let mut one_token_chunks = super::gemma4_paged_prefill_body_chunk_plan(
+            1,
+            5,
+            0,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::NonV2,
+        )
+        .unwrap();
         super::gemma4_coalesce_single_token_restore_chunks(&mut one_token_chunks);
         assert_eq!(
             one_token_chunks
@@ -7179,9 +9103,16 @@ mod tests {
 
     #[test]
     fn test_gemma4_paged_prefill_chunk_plan_splits_prompt_cache_boundary() {
-        let mut plan =
-            super::gemma4_paged_prefill_body_chunk_plan(1024, 1432, 44_320, 16, 512, false)
-                .unwrap();
+        let mut plan = super::gemma4_paged_prefill_body_chunk_plan(
+            1024,
+            1432,
+            44_320,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::NonV2,
+        )
+        .unwrap();
         super::gemma4_split_body_chunk_plan_at_position(&mut plan, 45_744);
         assert_eq!(
             plan.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
@@ -7204,36 +9135,65 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_paged_prefill_chunk_plan_splits_decode_checkpoint_boundaries() {
-        let plan = super::gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
-            1024, 3000, 16, 16, 512, false, 1024,
+    fn test_gemma4_paged_prefill_chunk_plan_is_independent_of_checkpoint_cadence() {
+        let plan = super::gemma4_paged_prefill_body_chunk_plan(
+            2048,
+            3000,
+            16,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::NonV2,
         )
         .unwrap();
 
         assert_eq!(
             plan.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
-            vec![1008, 1024, 968]
+            vec![2048, 952]
         );
         assert_eq!(
             plan.iter()
                 .map(|chunk| chunk.first_position)
                 .collect::<Vec<_>>(),
-            vec![16, 1024, 2048]
+            vec![16, 2064]
         );
         assert_eq!(
             plan.iter().map(|chunk| chunk.start).collect::<Vec<_>>(),
-            vec![0, 1008, 2032]
+            vec![0, 2048]
         );
 
-        let capped = super::gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
-            512, 1600, 768, 16, 512, false, 1024,
+        let capped = super::gemma4_paged_prefill_body_chunk_plan(
+            512,
+            1600,
+            768,
+            16,
+            1,
+            512,
+            super::Gemma4PagedPrefillRoutePolicy::NonV2,
         )
         .unwrap();
         assert_eq!(
             capped.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
-            vec![256, 512, 512, 320]
+            vec![512, 512, 512, 64]
         );
         assert!(capped.iter().all(|chunk| chunk.len <= 512));
+    }
+
+    #[test]
+    fn test_gemma4_sliding_checkpoint_cadence_crosses_unaligned_compute_chunk() {
+        assert_eq!(
+            super::gemma4_sliding_checkpoint_boundaries_crossed(16, 2064, 1024),
+            vec![1024, 2048],
+            "a cache hit at 16 followed by one 2K compute chunk must publish both cadence points"
+        );
+        assert_eq!(
+            super::gemma4_sliding_checkpoint_boundaries_crossed(2064, 3016, 1024),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            super::gemma4_sliding_checkpoint_boundaries_crossed(2064, 4096, 1024),
+            vec![3072, 4096]
+        );
     }
 
     #[test]
@@ -7792,7 +9752,7 @@ mod tests {
         inner.media_session_continuable = false;
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "clean session must not reject a text delta"
         );
@@ -7803,7 +9763,7 @@ mod tests {
         inner.cached_audio_key = None;
         inner.media_session_continuable = false;
         let image_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("text delta after non-continuable image turn must reject");
         assert!(
             image_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7820,7 +9780,7 @@ mod tests {
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = false;
         let audio_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("text delta after non-continuable audio turn must reject");
         assert!(
             audio_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7839,7 +9799,7 @@ mod tests {
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = true;
         let audio_not_live_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("continuable audio session with no live request must REJECT");
         assert!(
             audio_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7857,7 +9817,7 @@ mod tests {
         inner.cached_audio_key = None;
         inner.media_session_continuable = true;
         let image_not_live_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("continuable image session with no live request must REJECT");
         assert!(
             image_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -7875,7 +9835,7 @@ mod tests {
     /// must clear `cached_audio_key`, exactly as the flat `save_cache_state`
     /// does on a fresh turn. Without that clear, a text-only paged start over a
     /// reused model whose prior turn was audio would leave `cached_audio_key`
-    /// stale, and the next text delta's `text_delta_image_guard` would wrongly
+    /// stale, and the next text delta's `text_delta_media_guard` would wrongly
     /// force an "audio state" restart on the text-only session. This pins the
     /// fix: pre-fix the post-save key would stay `Some` and the guard would
     /// return the audio-state restart string, failing both asserts below.
@@ -7920,10 +9880,186 @@ mod tests {
         // session. Pre-fix this would be `Some("…holds audio state")`.
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "after a text-only paged save the guard must not force an audio restart"
         );
+    }
+
+    /// A warm text save over a pure-image session extends the same live
+    /// media-derived KV. It must preserve the raw image identity and ordered
+    /// placeholder sidecar so later text blocks keep the same image-aware block
+    /// keys. Audio and mixed turns are deliberately cold/non-continuable and do
+    /// not enter this path. The no-adapter guard also proves the preserved image
+    /// context retains the existing restart wording across repeated saves.
+    #[test]
+    fn test_media_context_survives_repeated_warm_text_saves() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let image_key = 11;
+        let image_positions = vec![(1, image_key)];
+        inner.publish_media_session_context(Some(image_key), None);
+        inner.cached_paged_image_token_positions = image_positions.clone();
+        inner.media_session_continuable = true;
+        assert_eq!(inner.session_media(), MediaCapabilities::IMAGES);
+
+        for turn in 0..2u32 {
+            // Mirrors `run_paged_turn` handing the planner's prior context
+            // to `save_paged_history` for a successful warm text delta.
+            inner.paged_text_turn_context = inner.session_media();
+            inner
+                .save_paged_history(&[10, 11, turn], &[20, 21], false, true)
+                .expect("warm text paged save must succeed");
+
+            assert_eq!(inner.cached_image_key, Some(image_key));
+            assert!(inner.cached_audio_key.is_none());
+            assert_eq!(
+                inner.cached_paged_image_token_positions, image_positions,
+                "turn {turn} must preserve exact image cache lineage"
+            );
+            assert_eq!(
+                inner.session_media(),
+                MediaCapabilities::IMAGES,
+                "turn {turn} must preserve the image-derived context"
+            );
+            assert!(inner.media_session_continuable);
+
+            // This fixture has no adapter, so the guard must reject. Its
+            // unchanged error format should still name the image context.
+            let reject = inner
+                .text_delta_media_guard("chat_session_continue")
+                .expect("not-live image context must request a restart");
+            assert!(reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX));
+            assert!(reject.contains("image state"), "got: {reject}");
+        }
+    }
+
+    /// A failed paged media prepare must fail CLOSED. The vision core disarms
+    /// `media_session_continuable` before the fallible adapter prepare, and all
+    /// subsequent prepare failures call `invalidate_gemma4_hybrid_session`,
+    /// which releases the request and clears both global and sliding reuse
+    /// state. No media-derived history may survive as a token-only prefix hit.
+    ///
+    /// The state is built with the real transition functions
+    /// (`publish_media_session_context` → warm `save_paged_history` → marker
+    /// disarm → `invalidate_gemma4_hybrid_session`); driving the complete
+    /// multimodal core to the failing prepare needs a real tokenizer file,
+    /// which unit tests do not have.
+    #[test]
+    fn test_failed_media_prepare_fails_closed_after_warm_continuation() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        // Live caches so the prefix check below can only miss via the media
+        // gate (not via `caches.is_none()`).
+        inner
+            .init_caches_sync()
+            .expect("init_caches_sync must succeed");
+
+        // Warm-continued pure-image session: finalize published exact image
+        // identity + context and armed the marker; the warm text save preserves
+        // that image lineage for later image-aware block registration.
+        inner.publish_media_session_context(Some(11), None);
+        inner.cached_paged_image_token_positions = vec![(1, 11)];
+        inner.media_session_continuable = true;
+        inner.paged_text_turn_context = inner.session_media();
+        inner
+            .save_paged_history(&[100, 101, 102], &[103, 104], false, true)
+            .expect("warm text paged save must succeed");
+        // Mirrors `run_paged_turn` resetting the turn-scoped snapshot.
+        inner.paged_text_turn_context = MediaCapabilities::NONE;
+        assert_eq!(inner.cached_image_key, Some(11));
+        assert!(inner.cached_audio_key.is_none());
+        assert_eq!(inner.cached_paged_image_token_positions, vec![(1, 11)]);
+        assert_eq!(inner.session_media(), MediaCapabilities::IMAGES);
+
+        // `keep_all = false` dropped the trailing stop token 104.
+        assert_eq!(inner.cached_token_history, vec![100, 101, 102, 103]);
+        let delta_tokens: Vec<u32> = vec![100, 101, 102, 103, 200];
+
+        // While the continuation is armed the media gate does not force a
+        // prefix miss (warm reuse stays possible).
+        assert_eq!(
+            inner.verify_cache_prefix(&delta_tokens, true),
+            inner.cached_token_history.len(),
+            "an armed continuation must not be forced to miss"
+        );
+
+        // The next media turn's failure path: the vision core disarms the
+        // marker, then its prepare helper invalidates the complete hybrid
+        // session before returning the error.
+        inner.media_session_continuable = false;
+        inner.invalidate_gemma4_hybrid_session("unit-test media prepare failure");
+
+        assert!(inner.caches.is_none());
+        assert!(inner.cached_token_history.is_empty());
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_audio_key.is_none());
+        assert!(inner.cached_paged_image_token_positions.is_empty());
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert!(!inner.media_session_continuable);
+        assert_eq!(
+            inner.verify_cache_prefix(&delta_tokens, true),
+            0,
+            "invalidated media history must not seed a text-only prefix hit"
+        );
+        assert!(
+            inner
+                .text_delta_media_guard("chat_session_continue")
+                .is_none(),
+            "a fully invalidated session has no stale media state to guard"
+        );
+    }
+
+    #[test]
+    fn test_fresh_text_save_replaces_persistent_media_context() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        inner.publish_media_session_context(Some(11), Some(22));
+        inner.media_session_continuable = true;
+        // Fresh plans carry no prior context. A successful text save therefore
+        // replaces, rather than extends, the old media session.
+        inner.paged_text_turn_context = MediaCapabilities::NONE;
+        inner
+            .save_paged_history(&[1, 2, 3], &[4, 5], false, true)
+            .expect("fresh text paged save must succeed");
+
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert!(!inner.media_session_continuable);
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_audio_key.is_none());
     }
 
     /// Image/audio symmetry in `verify_cache_prefix`: a non-continuable session
@@ -8017,18 +10153,28 @@ mod tests {
             "marker must default to false on construction"
         );
 
-        // clear_reuse_state resets the marker.
+        // clear_reuse_state resets the marker and both persistent/transient
+        // media context sources.
+        inner.publish_media_session_context(Some(7), Some(8));
+        inner.paged_text_turn_context = MediaCapabilities::IMAGES_AND_AUDIO;
         inner.media_session_continuable = true;
         inner.clear_reuse_state();
         assert!(
             !inner.media_session_continuable,
             "clear_reuse_state must reset the continuable marker"
         );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert_eq!(
+            inner.paged_text_turn_context,
+            MediaCapabilities::NONE,
+            "clear_reuse_state must clear transient turn context"
+        );
 
         // reset_caches_sync (which calls clear_reuse_state) resets the marker
         // AND nulls caches → has_live_session() false → a delta cannot continue.
+        inner.publish_media_session_context(None, Some(9));
+        inner.paged_text_turn_context = MediaCapabilities::AUDIO;
         inner.media_session_continuable = true;
-        inner.cached_audio_key = Some(9);
         inner
             .reset_caches_sync()
             .expect("reset_caches_sync must succeed");
@@ -8040,70 +10186,26 @@ mod tests {
             inner.cached_audio_key.is_none(),
             "reset_caches_sync must clear the media key"
         );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
         // After reset, even toggling the marker can't allow a delta: the
         // session is dead (no live caches), and the reset already cleared it.
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "post-reset session holds no media key → guard returns None (no media to reject)"
         );
     }
 
-    /// Eligibility gate (`gemma4_media_continuable`): ANY image or audio turn is
-    /// eligible to warm-continue a text follow-up — audio, non-unified image, AND
-    /// the unified bidirectional-vision image. A text-only turn is never a media
-    /// turn. Faithfulness is enforced downstream by the `stored && live_for_continue`
-    /// gate in `finalize_vision_turn_media_state`, not here.
+    /// Only pure image turns currently publish image-aware per-block keys.
+    /// Audio and mixed-media turns stay cold until their non-token identity is
+    /// represented in the same cache chain.
     #[test]
     fn test_gemma4_media_continuable_gate() {
-        let mut inner = match super::Gemma4Inner::new(paged_tiny_config(Some(false))) {
-            Ok(i) => i,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!("skipping (no Metal device): {msg}");
-                    return;
-                }
-                panic!("unexpected Gemma4Inner::new failure: {msg}");
-            }
-        };
-
-        let image_id = inner.config.image_token_id.unwrap_or(258880) as u32;
-        let audio_id = inner.config.audio_token_id.unwrap_or(258881) as u32;
-        let text_tokens: Vec<u32> = vec![10, 11, 12, 13];
-        let image_tokens: Vec<u32> = vec![10, image_id, image_id, 13];
-        let audio_tokens: Vec<u32> = vec![10, audio_id, audio_id, 13];
-
-        // Text-only: never eligible as a media turn.
-        assert!(!inner.gemma4_media_continuable(&text_tokens));
-
-        // Audio is eligible regardless of is_unified / bidirectional config.
-        inner.config.is_unified = false;
-        inner.config.use_bidirectional_attention = None;
-        assert!(inner.gemma4_media_continuable(&audio_tokens));
-        inner.config.is_unified = true;
-        inner.config.use_bidirectional_attention = Some("vision".to_string());
-        assert!(
-            inner.gemma4_media_continuable(&audio_tokens),
-            "audio is eligible even on a unified ckpt"
-        );
-
-        // Non-unified image: eligible.
-        inner.config.is_unified = false;
-        inner.config.use_bidirectional_attention = None;
-        assert!(inner.gemma4_media_continuable(&image_tokens));
-
-        // Unified bidirectional-vision image: now ALSO eligible. The warm text
-        // delta routes through the causal text path (no overlay), so it is
-        // faithful; the finalize stored/live gate decides whether the checkpoint
-        // can actually keep KV live (12B non-shared → warm; e2b KV-shared → cold).
-        inner.config.is_unified = true;
-        inner.config.use_bidirectional_attention = Some("vision".to_string());
-        assert!(
-            inner.gemma4_media_continuable(&image_tokens),
-            "unified bidirectional-vision image is eligible; faithfulness gated downstream"
-        );
+        assert!(!gemma4_media_continuable(false, false));
+        assert!(gemma4_media_continuable(true, false));
+        assert!(!gemma4_media_continuable(false, true));
+        assert!(!gemma4_media_continuable(true, true));
     }
 
     /// All-global config: every layer must route through `GlobalPaged`
@@ -8345,6 +10447,7 @@ mod tests {
             prefix_len: prompt.len() as u32,
             block_size,
             final_block_hash: prompt_hash,
+            protected_image_prompt_boundary: false,
             tokens: prompt.clone(),
             snapshots: vec![None; inner.config.num_hidden_layers as usize],
         });
@@ -8362,6 +10465,7 @@ mod tests {
                     prefix_len: tokens.len() as u32,
                     block_size,
                     final_block_hash: i as u64 + 1,
+                    protected_image_prompt_boundary: false,
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
@@ -8410,6 +10514,7 @@ mod tests {
                 prefix_len: target_tokens.len() as u32,
                 block_size,
                 final_block_hash: target_hash,
+                protected_image_prompt_boundary: false,
                 tokens: target_tokens.clone(),
                 snapshots: vec![None; inner.config.num_hidden_layers as usize],
             });
@@ -8433,6 +10538,7 @@ mod tests {
                     prefix_len: tokens.len() as u32,
                     block_size,
                     final_block_hash: hash,
+                    protected_image_prompt_boundary: false,
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
@@ -8500,6 +10606,7 @@ mod tests {
                 prefix_len: target_tokens.len() as u32,
                 block_size,
                 final_block_hash: target_hash,
+                protected_image_prompt_boundary: false,
                 tokens: target_tokens.clone(),
                 snapshots: vec![None; inner.config.num_hidden_layers as usize],
             });
@@ -8524,6 +10631,7 @@ mod tests {
                     prefix_len: tokens.len() as u32,
                     block_size,
                     final_block_hash: hash,
+                    protected_image_prompt_boundary: false,
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
@@ -8586,6 +10694,7 @@ mod tests {
                 prefix_len: target_tokens.len() as u32,
                 block_size,
                 final_block_hash: target_hash,
+                protected_image_prompt_boundary: false,
                 tokens: target_tokens.clone(),
                 snapshots: vec![None; inner.config.num_hidden_layers as usize],
             });
@@ -8610,6 +10719,7 @@ mod tests {
                     prefix_len: tokens.len() as u32,
                     block_size,
                     final_block_hash: hash,
+                    protected_image_prompt_boundary: false,
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
@@ -8678,6 +10788,7 @@ mod tests {
                 prefix_len: checkpoint_len,
                 block_size,
                 final_block_hash: checkpoint_hash,
+                protected_image_prompt_boundary: false,
                 tokens: tokens[..checkpoint_len as usize].to_vec(),
                 snapshots: vec![None; inner.config.num_hidden_layers as usize],
             });
@@ -8718,6 +10829,7 @@ mod tests {
                 prefix_len: checkpoint_len,
                 block_size,
                 final_block_hash: checkpoint_hash,
+                protected_image_prompt_boundary: false,
                 tokens: tokens[..checkpoint_len as usize].to_vec(),
                 snapshots: vec![None; inner.config.num_hidden_layers as usize],
             });
@@ -8771,6 +10883,7 @@ mod tests {
                 prefix_len: target_len,
                 block_size,
                 final_block_hash: target_hash,
+                protected_image_prompt_boundary: false,
                 tokens: target_tokens.clone(),
                 snapshots: vec![None; inner.config.num_hidden_layers as usize],
             });
@@ -8796,6 +10909,7 @@ mod tests {
                     prefix_len,
                     block_size,
                     final_block_hash: hash,
+                    protected_image_prompt_boundary: false,
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
@@ -8882,6 +10996,158 @@ mod tests {
             }
             ref other => panic!("layer 7: expected SharedOnGlobal, got {other:?}"),
         }
+    }
+
+    /// Element-wise comparison for `Gemma4LayerKind`, which intentionally
+    /// does not derive `PartialEq` (mirrors `Lfm2LayerKind`, which doesn't
+    /// either — this codebase's existing tests compare these routing enums
+    /// via `matches!`/`match`, not `assert_eq!`).
+    fn layer_kind_matches(a: &super::Gemma4LayerKind, b: &super::Gemma4LayerKind) -> bool {
+        use super::Gemma4LayerKind::*;
+        match (a, b) {
+            (Sliding, Sliding) => true,
+            (GlobalPaged { paged_idx: x }, GlobalPaged { paged_idx: y }) => x == y,
+            (
+                SharedOnGlobal {
+                    anchor_paged_idx: x,
+                },
+                SharedOnGlobal {
+                    anchor_paged_idx: y,
+                },
+            ) => x == y,
+            (
+                SharedOnSliding {
+                    anchor_layer_idx: x,
+                },
+                SharedOnSliding {
+                    anchor_layer_idx: y,
+                },
+            ) => x == y,
+            _ => false,
+        }
+    }
+
+    /// `Gemma4Inner::new` must cache `layer_kinds` once instead of
+    /// re-deriving it (BTreeMap/BTreeSet grouping + a sort, see
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every paged
+    /// prefill-chunk / decode-step call. The cached field must always equal
+    /// a fresh from-scratch computation over the same config — covers
+    /// all-global, hybrid sliding+global, and KV-shared layouts (mirrors
+    /// the three `test_compute_layer_kinds_*` cases above).
+    #[test]
+    fn test_gemma4_inner_caches_layer_kinds_matching_fresh_compute() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+
+        let all_global = super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec!["full_attention".to_string(); 4],
+            ..paged_tiny_config(Some(true))
+        };
+
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let hybrid = super::Gemma4Config {
+            num_hidden_layers: 10,
+            layer_types: (0..10).map(|i| cycle[i % 5].clone()).collect(),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let shared_layer_types: Vec<String> = (0..8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        let kv_shared = super::Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types: shared_layer_types,
+            num_kv_shared_layers: Some(4),
+            ..paged_tiny_config(Some(true))
+        };
+
+        for cfg in [all_global, hybrid, kv_shared] {
+            let expected = super::compute_layer_kinds_from_kv_cache_specs(&cfg)
+                .expect("fresh layer-kind computation must succeed for a valid paged config");
+            let inner = match super::Gemma4Inner::new(cfg) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("No Metal device found") {
+                        eprintln!("skipping (no Metal device): {msg}");
+                        return;
+                    }
+                    panic!("unexpected Gemma4Inner::new failure: {msg}");
+                }
+            };
+            assert!(
+                inner.paged_adapter.is_some(),
+                "test configs force use_block_paged_cache=true"
+            );
+            assert_eq!(
+                inner.layer_kinds.len(),
+                expected.len(),
+                "cached layer_kinds length must match a fresh compute"
+            );
+            for (i, (got, want)) in inner.layer_kinds.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    layer_kind_matches(got, want),
+                    "layer {i}: cached layer_kinds diverged from fresh compute: \
+                     got {got:?}, want {want:?}"
+                );
+            }
+        }
+    }
+
+    /// Manual timing probe (not a correctness gate — `#[ignore]`d so it
+    /// never runs in CI). Measures the per-call cost this task eliminates:
+    /// re-deriving the routing table from scratch (BTreeMap/BTreeSet + sort)
+    /// vs. the cached `Vec::clone`. Pure CPU, no GPU/model weights, immune
+    /// to thermal throttling. Run with:
+    /// `cargo test -p mlx-core --release --lib -- --ignored --nocapture \
+    ///  bench_layer_kinds_manual`
+    #[test]
+    #[ignore]
+    fn bench_layer_kinds_manual() {
+        // Scaled to ~48 layers with a realistic 5:1 sliding:global cycle
+        // and KV-sharing, so the BTreeMap/BTreeSet grouping + sort has a
+        // realistic amount of work to do.
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 48,
+            layer_types: (0..48).map(|i| cycle[i % 5].clone()).collect(),
+            num_kv_shared_layers: Some(8),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let n: u32 = 200_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                super::compute_layer_kinds_from_kv_cache_specs(std::hint::black_box(&cfg)).unwrap(),
+            );
+        }
+        eprintln!("recompute: {:?}/call", start.elapsed() / n);
+
+        let cached = super::compute_layer_kinds_from_kv_cache_specs(&cfg).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(std::hint::black_box(&cached).clone());
+        }
+        eprintln!("cached clone: {:?}/call", start.elapsed() / n);
     }
 
     #[test]
@@ -9215,5 +11481,645 @@ mod tool_delta_marker_tests {
             occurrences, 1,
             "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
         );
+    }
+}
+
+#[cfg(test)]
+mod dspark_tap_tests {
+    //! Tap purity: threading a `DsparkTap` through the Gemma4 forward
+    //! paths must leave the compute graph byte-identical to a tap-less
+    //! run, while capturing the residual-stream hiddens of the tapped
+    //! layers. Runs a tiny random-weight Gemma4 (4 layers, hybrid
+    //! sliding/global types, one KV-shared layer) through the REAL
+    //! `forward_body` / `forward_inner` / `dspark_verify_forward` paths.
+
+    use super::*;
+    use crate::models::gemma4::dspark::DsparkTap;
+
+    fn tiny_config() -> Gemma4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+        }))
+        .expect("tiny Gemma4 config must deserialize")
+    }
+
+    pub(super) fn tiny_model(
+        config: &Gemma4Config,
+    ) -> (Embedding, Vec<Gemma4DecoderLayer>, RMSNorm) {
+        let embedding =
+            Embedding::new(config.vocab_size as u32, config.hidden_size as u32).unwrap();
+        let layers: Vec<Gemma4DecoderLayer> = (0..config.num_hidden_layers as usize)
+            .map(|i| Gemma4DecoderLayer::new(config, i).unwrap())
+            .collect();
+        let final_norm =
+            RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps)).unwrap();
+        (embedding, layers, final_norm)
+    }
+
+    pub(super) fn assert_bitwise_eq(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        assert_eq!(
+            a.shape().unwrap().to_vec(),
+            b.shape().unwrap().to_vec(),
+            "{ctx}: shape"
+        );
+        let a_bits: Vec<u32> = a
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let b_bits: Vec<u32> = b
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(a_bits, b_bits, "{ctx}: bits");
+    }
+
+    #[test]
+    fn dspark_tap_purity_and_verify_forward() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+
+        // 6-token prefill then a 3-token verify block: the block runs
+        // T>1 at offset 6, which also crosses the sliding window (6+3 > 8)
+        // so the windowed-mask path is exercised.
+        let prefill_ids = MxArray::from_int32(&[3, 9, 17, 25, 33, 41], &[1, 6]).unwrap();
+        let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
+
+        // Pass A: no tap.
+        let mut caches_a = init_caches_for_config(&config);
+        let hidden_a = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        let logits_a = forward_inner(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+
+        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1),
+        // with the real snapshot → verify → commit flow around the verify.
+        let layer_ids = [0usize, 2, 3];
+        let shared_slots = dspark_shared_slot_mask(&config);
+        assert_eq!(
+            shared_slots,
+            vec![false, false, false, true],
+            "config-derived shared-slot mask"
+        );
+        let mut caches_b = init_caches_for_config(&config);
+        let mut prefill_tap = DsparkTap::new(&layer_ids);
+        let hidden_b = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            None,
+            None,
+            &config,
+            Some(&mut prefill_tap),
+        )
+        .unwrap();
+        let rollback = super::super::layer_cache::snapshot_before_verify(
+            &caches_b,
+            block_ids.shape_at(1).unwrap() as usize,
+            &shared_slots,
+        )
+        .unwrap();
+        let mut verify_tap = DsparkTap::new(&layer_ids);
+        let logits_b = dspark_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            &mut verify_tap,
+        )
+        .unwrap();
+
+        // Tap must not perturb the compute graph.
+        assert_bitwise_eq(&hidden_a, &hidden_b, "prefill hidden");
+        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
+        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 64]);
+
+        // One [B, T, hidden] capture per tapped layer, per forward call.
+        assert_eq!(prefill_tap.captured.len(), layer_ids.len());
+        for arr in &prefill_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 6, 32]);
+        }
+        assert_eq!(verify_tap.captured.len(), layer_ids.len());
+        for arr in &verify_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 3, 32]);
+        }
+
+        // Different layers must yield different hiddens (real per-layer
+        // captures, not one array pushed repeatedly).
+        let first = verify_tap.captured[0].to_float32().unwrap().to_vec();
+        let second = verify_tap.captured[1].to_float32().unwrap().to_vec();
+        assert_ne!(first, second, "captures must differ across layers");
+
+        // Caches advance by T on both passes; the KV-shared layer's own
+        // vec entry is never written (it reads its anchor's cache).
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
+            assert_eq!(caches_a[idx].get_offset(), 9, "cache {idx} tapless offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched"
+        );
+
+        // Partial-keep commit on the real model: active caches land at
+        // prefill + keep, the shared slot stays untouched.
+        super::super::layer_cache::commit_after_verify(&mut caches_b, &rollback, 1).unwrap();
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched after commit"
+        );
+    }
+
+    #[test]
+    fn dspark_tap_rejects_unsorted_or_out_of_range_layer_ids() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let ids = MxArray::from_int32(&[3, 9], &[1, 2]).unwrap();
+
+        for bad in [vec![2usize, 0], vec![1, 1], vec![7]] {
+            let mut caches = init_caches_for_config(&config);
+            let mut tap = DsparkTap::new(&bad);
+            let result = forward_body(
+                Some(&ids),
+                None,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                None,
+                None,
+                &config,
+                Some(&mut tap),
+            );
+            assert!(result.is_err(), "layer_ids {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dspark_verify_forward_rejects_bad_block_shape() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let layer_ids = [0usize];
+
+        // Batch > 1 is rejected.
+        let batch2 = MxArray::from_int32(&[1, 2], &[2, 1]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &batch2,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
+        );
+
+        // 1-D input is rejected.
+        let flat = MxArray::from_int32(&[1, 2], &[2]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &flat,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod assistant_seam_tests {
+    //! Target-side seams for the assistant draft model: the K/V source
+    //! mapping (which target caches the draft reads), the extracted
+    //! `lm_head_logits` tail, and `assistant_verify_forward` (verify logits
+    //! plus the post-final-norm hidden the draft chains from). Runs a tiny
+    //! random-weight Gemma4 (4 hybrid layers, one KV-shared) through the
+    //! REAL forward paths.
+
+    use super::dspark_tap_tests::{assert_bitwise_eq, tiny_model};
+    use super::*;
+    use crate::models::gemma4::dspark::DsparkTap;
+
+    /// Tiny flat-path Gemma4 config (mirrors the DSpark decode tests):
+    /// 4 hybrid layers, one KV-shared.
+    fn tiny_target_config() -> Gemma4Config {
+        serde_json::from_value(tiny_target_config_value())
+            .expect("tiny Gemma4 config must deserialize")
+    }
+
+    fn tiny_target_config_value() -> serde_json::Value {
+        serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+            "use_block_paged_cache": false,
+            "eos_token_ids": []
+        })
+    }
+
+    /// [`tiny_target_config`] with overridden layer types and KV sharing
+    /// (the two inputs `assistant_kv_source_indices` reads).
+    fn hybrid_config(layer_types: &[&str], num_kv_shared_layers: Option<i32>) -> Gemma4Config {
+        let mut v = tiny_target_config_value();
+        v["layer_types"] = serde_json::json!(layer_types);
+        v["num_hidden_layers"] = serde_json::json!(layer_types.len());
+        match num_kv_shared_layers {
+            Some(n) => v["num_kv_shared_layers"] = serde_json::json!(n),
+            None => {
+                v.as_object_mut()
+                    .expect("tiny config value is an object")
+                    .remove("num_kv_shared_layers");
+            }
+        }
+        serde_json::from_value(v).expect("tiny Gemma4 config must deserialize")
+    }
+
+    // ── K/V source mapping ─────────────────────────────────────────────
+
+    /// With one KV-shared layer the non-shared prefix is [s, f, s]: the
+    /// draft reads the last sliding layer (2) and the last full layer (1)
+    /// — exactly the anchors `should_store_shared_kv` marks.
+    #[test]
+    fn kv_source_indices_pick_last_non_shared_layer_of_each_type() {
+        let config = hybrid_config(
+            &[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            Some(1),
+        );
+        let sources = assistant_kv_source_indices(&config).expect("mapping must resolve");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 2,
+                full: 1
+            }
+        );
+    }
+
+    /// Without KV sharing the boundary is num_hidden_layers, so the mapping
+    /// is simply the last layer of each type.
+    #[test]
+    fn kv_source_indices_without_sharing_pick_last_layer_of_each_type() {
+        let config = hybrid_config(
+            &[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            None,
+        );
+        let sources = assistant_kv_source_indices(&config).expect("mapping must resolve");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 2,
+                full: 3
+            }
+        );
+    }
+
+    /// A non-shared prefix lacking either attention type is a hard error —
+    /// the draft needs one K/V source per type.
+    #[test]
+    fn kv_source_indices_error_when_type_missing_below_boundary() {
+        // Prefix [sliding, sliding] has no full_attention layer.
+        let config = hybrid_config(
+            &[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "full_attention",
+            ],
+            Some(2),
+        );
+        let err = assistant_kv_source_indices(&config).expect_err("missing full layer must error");
+        assert!(err.reason.contains("full_attention"), "got: {}", err.reason);
+
+        // Prefix [full, full] has no sliding_attention layer.
+        let config = hybrid_config(
+            &[
+                "full_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
+            Some(2),
+        );
+        let err =
+            assistant_kv_source_indices(&config).expect_err("missing sliding layer must error");
+        assert!(
+            err.reason.contains("sliding_attention"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    /// A truncated `layer_types` vec leaves trailing layers without an
+    /// entry. Such layers match neither attention type: the mapping resolves
+    /// only exact `layer_types` entries (like `should_store_shared_kv`) and
+    /// errors when a type has no exact entry below the boundary, instead of
+    /// treating the missing entries as full attention.
+    #[test]
+    fn kv_source_indices_ignore_layers_with_missing_layer_types_entry() {
+        // 4 layers, `layer_types` truncated to 2 entries, no KV sharing.
+        let truncated = |layer_types: &[&str]| -> Gemma4Config {
+            let mut v = tiny_target_config_value();
+            v["layer_types"] = serde_json::json!(layer_types);
+            v.as_object_mut()
+                .expect("tiny config value is an object")
+                .remove("num_kv_shared_layers");
+            serde_json::from_value(v).expect("tiny Gemma4 config must deserialize")
+        };
+
+        // Both types have exact entries: layers 2/3 (no entry) must not be
+        // selected even though the full-attention fallback would claim them.
+        let sources =
+            assistant_kv_source_indices(&truncated(&["sliding_attention", "full_attention"]))
+                .expect("mapping must resolve from the exact entries");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 0,
+                full: 1
+            }
+        );
+
+        // No exact full_attention entry anywhere: hard error, not index 3.
+        let err =
+            assistant_kv_source_indices(&truncated(&["sliding_attention", "sliding_attention"]))
+                .expect_err("missing full_attention entry must error");
+        assert!(err.reason.contains("full_attention"), "got: {}", err.reason);
+    }
+
+    // ── lm_head tail extraction ────────────────────────────────────────
+
+    /// `forward_body` + `lm_head_logits` composed by hand must reproduce
+    /// `forward_inner` bitwise, with and without logit softcapping.
+    #[test]
+    fn lm_head_logits_matches_forward_inner() {
+        let mut capped = tiny_target_config_value();
+        capped["final_logit_softcapping"] = serde_json::json!(30.0);
+        let configs: [Gemma4Config; 2] = [
+            tiny_target_config(),
+            serde_json::from_value(capped).expect("tiny Gemma4 config must deserialize"),
+        ];
+        for config in &configs {
+            let (embedding, layers, final_norm) = tiny_model(config);
+            let ids = MxArray::from_int32(&[3, 9, 1, 5], &[1, 4]).unwrap();
+
+            let mut caches_a = init_caches_for_config(config);
+            let logits_a = forward_inner(
+                &ids,
+                &embedding,
+                &layers,
+                &mut caches_a,
+                &final_norm,
+                &None,
+                None,
+                None,
+                config,
+                None,
+            )
+            .unwrap();
+
+            let mut caches_b = init_caches_for_config(config);
+            let hidden = forward_body(
+                Some(&ids),
+                None,
+                &embedding,
+                &layers,
+                &mut caches_b,
+                &final_norm,
+                None,
+                None,
+                config,
+                None,
+            )
+            .unwrap();
+            let logits_b = lm_head_logits(&hidden, &embedding, &None, None, config).unwrap();
+
+            let ctx = format!(
+                "lm_head tail (softcap {:?})",
+                config.final_logit_softcapping
+            );
+            assert_bitwise_eq(&logits_a, &logits_b, &ctx);
+        }
+    }
+
+    // ── assistant verify forward ───────────────────────────────────────
+
+    /// Same forward as `dspark_verify_forward` (bitwise-equal logits against
+    /// an empty-tap run on equivalent fresh caches), plus the post-final-norm
+    /// hidden as the second tuple element; caches advance by T and bad block
+    /// shapes are rejected.
+    #[test]
+    fn assistant_verify_forward_returns_hidden_and_logits() {
+        let config = tiny_target_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+
+        // 6-token prefill then a 3-token verify block: the block runs T>1
+        // at offset 6 and crosses the sliding window (6+3 > 8).
+        let prefill_ids = MxArray::from_int32(&[3, 9, 1, 5, 2, 8], &[1, 6]).unwrap();
+        let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
+        let prefill = |caches: &mut [Gemma4LayerCache]| {
+            forward_body(
+                Some(&prefill_ids),
+                None,
+                &embedding,
+                &layers,
+                caches,
+                &final_norm,
+                None,
+                None,
+                &config,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Reference: dspark_verify_forward with an EMPTY tap.
+        let mut caches_a = init_caches_for_config(&config);
+        prefill(&mut caches_a);
+        let mut tap = DsparkTap::new(&[]);
+        let logits_a = dspark_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            &mut tap,
+        )
+        .unwrap();
+        assert!(tap.captured.is_empty(), "empty tap must capture nothing");
+
+        // Assistant seam on equivalent fresh caches.
+        let mut caches_b = init_caches_for_config(&config);
+        prefill(&mut caches_b);
+        let (logits_b, hidden) = assistant_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 16]);
+        assert_eq!(hidden.shape().unwrap().to_vec(), vec![1, 3, 8]);
+        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
+
+        // The hidden is the post-final-norm state of the same block forward.
+        let mut caches_c = init_caches_for_config(&config);
+        prefill(&mut caches_c);
+        let hidden_ref = forward_body(
+            Some(&block_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_c,
+            &final_norm,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_bitwise_eq(&hidden_ref, &hidden, "post-final-norm hidden");
+
+        // Caches advance by T; the KV-shared layer's own vec entry is never
+        // written (it reads its anchor's cache).
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched"
+        );
+
+        // Bad block shapes are rejected: batch > 1 and 1-D input.
+        for bad in [
+            MxArray::from_int32(&[1, 2], &[2, 1]).unwrap(),
+            MxArray::from_int32(&[1, 2], &[2]).unwrap(),
+        ] {
+            let mut caches = init_caches_for_config(&config);
+            assert!(
+                assistant_verify_forward(
+                    &bad,
+                    &embedding,
+                    &layers,
+                    &mut caches,
+                    &final_norm,
+                    &None,
+                    None,
+                    None,
+                    &config,
+                )
+                .is_err(),
+                "block shape {:?} must be rejected",
+                bad.shape().unwrap().as_ref()
+            );
+        }
     }
 }

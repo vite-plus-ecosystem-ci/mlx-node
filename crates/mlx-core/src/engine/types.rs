@@ -17,6 +17,18 @@ use crate::tools::ToolCallResult;
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct ChatConfig {
+    /// Internal logical cache owner. The agent provider forwards Pi's stable
+    /// session id so model-global GDN sidecars can retain parent and child
+    /// branches independently. This does not namespace the physical paged KV
+    /// cache; exact token/extra-key hashes remain shareable across owners.
+    #[napi(ts_type = "string | undefined")]
+    pub cache_owner_id: Option<String>,
+    /// Internal top-level owner for the bounded Qwen3.5 GDN sidecar store.
+    /// `cache_owner_id` may identify a child Pi session; this separately
+    /// identifies the current interactive root so /new and /resume can rotate
+    /// the protected branch without changing PagedAttention cache identity.
+    #[napi(ts_type = "string | undefined")]
+    pub cache_root_owner_id: Option<String>,
     #[napi(ts_type = "number | undefined")]
     pub max_new_tokens: Option<i32>,
     #[napi(ts_type = "number | undefined")]
@@ -86,17 +98,36 @@ pub struct ChatConfig {
     #[napi(ts_type = "boolean | undefined")]
     pub reuse_cache: Option<bool>,
     /// MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-    /// loop on the dense compiled path. Requires the model checkpoint to carry
-    /// an MTP head (otherwise silently ignored). Default: `false`.
+    /// loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
+    /// checkpoint to carry an MTP head (otherwise silently ignored). Default:
+    /// `false`.
     #[napi(ts_type = "boolean | undefined")]
     pub enable_mtp: Option<bool>,
-    /// MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
-    /// by the verify FFI contract. Default: 1.
+    /// MTP: number of draft tokens per speculative cycle.
     ///
+    /// On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the verify
+    /// FFI contract, and when unset native code currently pins depth 1.
     /// When `mtpAdaptiveDepth` is `true`, this value is used as the
     /// throughput-policy seed and the expected-value policy's max depth.
     /// Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
     /// enable it.
+    ///
+    /// Gemma4 external drafts (`draftModelPath`) resolve the field per draft
+    /// variant instead (`gemma4/model.rs` `resolve_params`, always from the
+    /// RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
+    /// contract that does not apply to external drafts):
+    /// - DSpark: with both knobs unset, full draft blocks (the checkpoint's
+    ///   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
+    ///   short target-AR/DSpark break-even calibration. A short generation
+    ///   budget that cannot finish calibration retains the fixed-block
+    ///   schedule. An explicit
+    ///   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
+    ///   opts the guard back in; explicit `false` disables it.
+    /// - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
+    ///   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
+    ///   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+    ///
+    /// `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
     #[napi(ts_type = "number | undefined")]
     pub mtp_depth: Option<i32>,
     /// MTP: when true, the decode loop runs the adaptive
@@ -108,7 +139,9 @@ pub struct ChatConfig {
     /// `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
     /// When false, the loop pins `mtpDepth` for every cycle.
     ///
-    /// Default: false. An explicit value always wins over the default.
+    /// Default: false, except Gemma4 DSpark enables its measured break-even
+    /// guard when both this field and `mtpDepth` are unset. An explicit value
+    /// always wins over the family default.
     #[napi(ts_type = "boolean | undefined")]
     pub mtp_adaptive_depth: Option<bool>,
 }

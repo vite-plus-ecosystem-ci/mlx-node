@@ -60,6 +60,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, PerformanceMetrics } from '@mlx-node/core';
+import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -301,6 +302,10 @@ async function handleStreamingNative(
   serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
+  // `runSessionStreaming` completed the exact token/capacity preflight before
+  // handing us this iterator. Commit SSE immediately instead of entering the
+  // generator here: its first `next()` also starts image processing/prefill and
+  // may not resolve until the first generated token.
   beginSSE(res);
   // Commit SSE wire format now so any throw before the terminal event routes
   // to the streaming error epilogue instead of corrupting the JSON path.
@@ -951,6 +956,10 @@ async function runSessionStreaming(
   signal: AbortSignal | undefined,
   resetNativeCache: boolean,
 ): Promise<MessagesStreamingOutcome> {
+  // Validate the exact canonical history before resetting either JS or native
+  // state. This preserves a clean HTTP 400 path for context overflow while
+  // keeping SSE header latency independent from image processing/prefill.
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   // Same dual-branch reset as `runSessionNonStreaming`: native-reset
   // requests wipe both JS and native state to block the cross-request
   // cache-affinity leak described at length in `responses.ts`; native-
@@ -966,7 +975,7 @@ async function runSessionStreaming(
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
-    stream: session.startFromHistoryStream(config, signal),
+    stream: session.startFromHistoryStream(constrainedConfig, signal),
     wasCommitted: () => session.turns > initialTurns,
   };
 }
@@ -1536,7 +1545,11 @@ export async function handleCreateMessage(
             sessionReg.drop(MESSAGES_WARM_SLOT_ID);
             const message = err instanceof Error ? err.message : 'Unknown error during inference';
             if (visibility.responseMode === null) {
-              sendAnthropicInternalError(res, message);
+              if (isContextCapacityError(err)) {
+                sendAnthropicBadRequest(res, message);
+              } else {
+                sendAnthropicInternalError(res, message);
+              }
             } else if (visibility.responseMode === 'json') {
               // Already committed to JSON — destroy the socket rather than corrupt the body.
               try {

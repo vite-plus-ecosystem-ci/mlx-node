@@ -416,6 +416,10 @@ mod mock_backend_tests {
         build_chatml_continue_delta_text, build_chatml_tool_delta_text, extract_chat_params,
         resolve_enable_thinking,
     };
+    use crate::engine::plan::{
+        ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+        SpeculativePlan,
+    };
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::stream::Stream;
     use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -591,10 +595,20 @@ mod mock_backend_tests {
         /// Return `None` from `wired_limit_bytes` (qwen3's
         /// no-WiredLimitContext policy).
         wired_none_knob: bool,
-        /// Report a paged adapter and answer the `paged_turn` probe with
+        /// Declare paged attention and answer the paged executor with
         /// `TurnOutput::Complete` — the streaming-contract violation the
         /// session core must reject loudly.
         paged_complete_knob: bool,
+        /// Admit images only for validation by the family's multimodal
+        /// handler. This intentionally does not claim a vision encoder is
+        /// available.
+        backend_validated_images_knob: bool,
+        multimodal_calls: usize,
+        /// Declare a flat speculative executor whose proposer supports only
+        /// text input over a text-only live context.
+        speculative_complete_knob: bool,
+        /// Exact media represented by the mock's live session state.
+        session_media_knob: MediaCapabilities,
         /// `render_prompt` invocation counter (interior mutability — the
         /// hook takes `&self`). The pre-render image guard must reject
         /// text-only image turns with this still 0.
@@ -628,6 +642,10 @@ mod mock_backend_tests {
                 gen_defaults_knob: None,
                 wired_none_knob: false,
                 paged_complete_knob: false,
+                backend_validated_images_knob: false,
+                multimodal_calls: 0,
+                speculative_complete_knob: false,
+                session_media_knob: MediaCapabilities::NONE,
                 render_prompt_calls: AtomicUsize::new(0),
             }
         }
@@ -666,6 +684,12 @@ mod mock_backend_tests {
             // invocation counter the pre-render image-guard tests assert
             // on.
             self.render_prompt_calls.fetch_add(1, Ordering::Relaxed);
+            if self.backend_validated_images_knob {
+                // Keep this integration probe independent of the inline
+                // tokenizer's template handling for structured image
+                // content: admission must reach the family handler.
+                return Ok(vec![TOK_HELLO]);
+            }
             tok.apply_chat_template_sync(
                 messages,
                 Some(true),
@@ -747,31 +771,77 @@ mod mock_backend_tests {
             }
         }
 
-        fn has_paged_adapter(&self) -> bool {
-            self.paged_complete_knob
+        fn execution_plan(&self) -> ExecutionPlan {
+            ExecutionPlan {
+                media: if self.backend_validated_images_knob {
+                    MediaPlan {
+                        available: MediaCapabilities::NONE,
+                        backend_validated: MediaCapabilities::IMAGES,
+                    }
+                } else if self.speculative_complete_knob {
+                    // The target itself can hold image context; the mock
+                    // proposer below intentionally cannot.
+                    MediaPlan {
+                        available: MediaCapabilities::IMAGES,
+                        backend_validated: MediaCapabilities::NONE,
+                    }
+                } else {
+                    MediaPlan::NONE
+                },
+                paged_attention: self.paged_complete_knob.then_some(PagedAttentionPlan {
+                    supports_delta: true,
+                }),
+                speculative: self.speculative_complete_knob.then_some(SpeculativePlan {
+                    kind: SpeculativeKind::NativeMtp,
+                    supported_input_media: MediaCapabilities::NONE,
+                    supported_context_media: MediaCapabilities::NONE,
+                    supports_paged_attention: false,
+                }),
+            }
         }
 
-        fn paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-            if self.paged_complete_knob {
-                // Deliberate streaming-contract violation under
-                // streaming: a probe that completes a sink-bearing turn
-                // must return Streamed, never Complete. On the sync path
-                // this is the correct shape.
-                Some(Ok(TurnOutput::Complete(Box::new(ChatResult {
-                    text: "PAGED_COMPLETE".to_string(),
-                    tool_calls: Vec::new(),
-                    thinking: None,
-                    num_tokens: 1,
-                    prompt_tokens: 1,
-                    reasoning_tokens: 0,
-                    finish_reason: "stop".to_string(),
-                    raw_text: "PAGED_COMPLETE".to_string(),
-                    cached_tokens: 0,
-                    performance: None,
-                }))))
-            } else {
-                None
-            }
+        fn session_media(&self) -> MediaCapabilities {
+            self.session_media_knob
+        }
+
+        fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+            // Deliberate streaming-contract violation under streaming: an
+            // executor that completes a sink-bearing turn must return
+            // Streamed, never Complete. On the sync path this is correct.
+            Ok(TurnOutput::Complete(Box::new(ChatResult {
+                text: "PAGED_COMPLETE".to_string(),
+                tool_calls: Vec::new(),
+                thinking: None,
+                num_tokens: 1,
+                prompt_tokens: 1,
+                reasoning_tokens: 0,
+                finish_reason: "stop".to_string(),
+                raw_text: "PAGED_COMPLETE".to_string(),
+                cached_tokens: 0,
+                performance: None,
+            })))
+        }
+
+        fn run_multimodal_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+            self.multimodal_calls += 1;
+            Err(Error::from_reason(
+                "mock vision encoder is not loaded for this checkpoint",
+            ))
+        }
+
+        fn run_speculative_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+            Ok(TurnOutput::Complete(Box::new(ChatResult {
+                text: "SPECULATIVE_COMPLETE".to_string(),
+                tool_calls: Vec::new(),
+                thinking: None,
+                num_tokens: 1,
+                prompt_tokens: 1,
+                reasoning_tokens: 0,
+                finish_reason: "stop".to_string(),
+                raw_text: "SPECULATIVE_COMPLETE".to_string(),
+                cached_tokens: 0,
+                performance: None,
+            })))
         }
 
         fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
@@ -885,6 +955,8 @@ mod mock_backend_tests {
 
     fn greedy_config() -> ChatConfig {
         ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             ..Default::default()
         }
@@ -898,6 +970,7 @@ mod mock_backend_tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }]
@@ -1081,6 +1154,8 @@ mod mock_backend_tests {
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_owner_id: None,
+                cache_root_owner_id: None,
                 temperature: Some(0.0),
                 max_new_tokens: Some(3),
                 ..Default::default()
@@ -1171,6 +1246,8 @@ mod mock_backend_tests {
             ChatCmd::StreamSessionStart {
                 messages: user_messages("hello"),
                 config: ChatConfig {
+                    cache_owner_id: None,
+                    cache_root_owner_id: None,
                     temperature: Some(0.0),
                     include_reasoning: Some(false),
                     ..Default::default()
@@ -1251,6 +1328,8 @@ mod mock_backend_tests {
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_owner_id: None,
+                cache_root_owner_id: None,
                 reuse_cache: Some(false),
                 ..Default::default()
             },
@@ -1500,6 +1579,8 @@ mod mock_backend_tests {
 
         // Explicit request value wins over the model default.
         let explicit = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             top_p: Some(0.5),
             ..Default::default()
@@ -1545,6 +1626,8 @@ mod mock_backend_tests {
         };
 
         let mut cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.9), // explicit → must survive
             top_p: Some(0.8),       // explicit, default is None → must survive
             ..Default::default()
@@ -1592,6 +1675,8 @@ mod mock_backend_tests {
 
         // (b) do_sample:false + explicit request temperature → request wins.
         let mut cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.8),
             ..Default::default()
         };
@@ -1756,7 +1841,7 @@ mod mock_backend_tests {
 
     // ---- streaming-contract regressions ----
 
-    /// A whole-turn probe returning `TurnOutput::Complete` on a
+    /// A whole-turn executor returning `TurnOutput::Complete` on a
     /// STREAMING turn must NOT silently
     /// close the stream (no chunks, no done-chunk, no error — JS
     /// consumers hang). The session core rejects the contract violation
@@ -1799,7 +1884,7 @@ mod mock_backend_tests {
             "got: {}",
             err.reason
         );
-        // The probe short-circuited the turn before the generic flow:
+        // The executor short-circuited the turn before the generic flow:
         // no prefill, no decode, no session state persisted.
         assert!(backend.prefill_calls.is_empty());
         assert!(backend.save_calls.is_empty());
@@ -1867,6 +1952,114 @@ mod mock_backend_tests {
         .unwrap_or_else(|e| panic!("text-only start failed: {}", e.reason));
         assert_eq!(r.finish_reason, "stop");
         assert_eq!(backend.render_prompt_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// Media admitted only through `backend_validated` must cross the
+    /// pre-render boundary and reach the family's multimodal handler, while
+    /// still preserving the truth that no encoder is available. This keeps a
+    /// checkpoint-specific validation error instead of replacing it with the
+    /// engine's generic text-only rejection.
+    #[test]
+    fn backend_validated_image_reaches_family_handler() {
+        let mut backend = MockBackend::new(vec![]);
+        backend.backend_validated_images_knob = true;
+
+        let mut messages = user_messages("hello");
+        messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
+
+        let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages,
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("family handler must validate backend-admitted image input");
+        assert_eq!(
+            err.reason,
+            "mock vision encoder is not loaded for this checkpoint",
+        );
+        assert_eq!(backend.render_prompt_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.multimodal_calls, 1);
+        assert!(backend.prefill_calls.is_empty());
+        assert!(backend.save_calls.is_empty());
+    }
+
+    #[test]
+    fn fresh_turn_ignores_stale_session_media_when_planning_speculation() {
+        let mut backend = MockBackend::new(vec![]);
+        backend.speculative_complete_knob = true;
+        // Simulate stale state from a prior session. A fresh request fully
+        // defines its own context and must resolve context_media = NONE.
+        backend.session_media_knob = MediaCapabilities::IMAGES;
+        let mut config = greedy_config();
+        config.enable_mtp = Some(true);
+
+        let result = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config,
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("fresh speculative turn failed: {}", e.reason));
+        assert_eq!(result.text, "SPECULATIVE_COMPLETE");
+        assert!(backend.prefill_calls.is_empty());
+    }
+
+    #[test]
+    fn delta_turn_uses_live_session_media_when_planning_speculation() {
+        let mut backend = MockBackend::new(vec![
+            vec![TOK_HELLO, TOK_IM_END],
+            vec![TOK_WORLD, TOK_IM_END],
+        ]);
+        run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("session setup failed: {}", e.reason));
+
+        // Target supports an image-bearing prefix, but the declared
+        // proposer supports context_media = NONE. The delta carries no new
+        // images; it must still fall back to exact AR because the live
+        // context is multimodal.
+        backend.speculative_complete_knob = true;
+        backend.session_media_knob = MediaCapabilities::IMAGES;
+        let mut config = greedy_config();
+        config.enable_mtp = Some(true);
+        let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            user_message: "world".to_string(),
+            images: None,
+            audio: None,
+            config,
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("media-context delta failed: {}", e.reason));
+
+        assert_ne!(result.text, "SPECULATIVE_COMPLETE");
+        assert_eq!(backend.prefill_calls.len(), 2, "delta must use exact AR");
+    }
+
+    #[test]
+    fn default_delta_guard_checks_live_media_per_kind() {
+        let mut backend = MockBackend::new(vec![]);
+        // This mock target advertises images (through the speculative knob),
+        // but not audio.
+        backend.speculative_complete_knob = true;
+        backend.session_media_knob = MediaCapabilities::IMAGES;
+        assert!(
+            backend
+                .text_delta_media_guard("chat_tokens_delta_sync")
+                .is_none(),
+            "an image-capable target may continue its image context",
+        );
+
+        backend.session_media_knob = MediaCapabilities::AUDIO;
+        assert_eq!(
+            backend.text_delta_media_guard("chat_tokens_delta_sync"),
+            Some(
+                "chat_tokens_delta_sync is text-only; session currently holds audio state"
+                    .to_string(),
+            ),
+            "image support must not silently admit an audio-derived context",
+        );
     }
 
     /// (stream) Same rejection on the streaming twin: exactly one typed

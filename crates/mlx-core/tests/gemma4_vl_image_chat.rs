@@ -34,6 +34,8 @@ use napi::bindgen_prelude::Uint8Array;
 
 fn cfg(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -68,6 +70,7 @@ fn user_msg(content: &str, image: Option<&[u8]>) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: image.map(|b| vec![Uint8Array::new(b.to_vec())]),
         audio: None,
     }
@@ -151,7 +154,7 @@ async fn gemma4_vl_image_chat_t0_capture() {
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
 
-    let model = Gemma4Model::load(model_path.clone())
+    let model = Gemma4Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Gemma-4-VL model");
 

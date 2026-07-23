@@ -33,6 +33,7 @@
 //!   For the **no-cache** case (cached_prefix_len = 0), pass 1 is
 //!   skipped entirely and the result is exact.
 
+use std::ops::Range;
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -42,11 +43,12 @@ use crate::engine::vision::VisionMerge;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::nn::{Embedding, Linear, RMSNorm};
+use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
+use super::quantized_linear::LinearProj;
 
 fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
@@ -74,26 +76,23 @@ pub(crate) fn paged_rope_offset(physical_position: u32, cached_rope_deltas: i32)
 ///
 /// `cached_rope_deltas` is shared model state: an image prefill bakes in a
 /// compressed-position delta (negative) that only aligns with the image's
-/// physically-resident K/V. The delta is meaningful for exactly ONE outcome of
-/// the paged turn planner — `continued_live_prefix`, where the live image
-/// sequence is being extended and its K/V is re-attended. Every other outcome
-/// must drop it:
+/// physically-resident K/V. The delta is meaningful only when the caller has
+/// validated that the selected live or pooled prefix retains that exact image
+/// lineage. Every unrelated outcome must drop it:
 /// * a cold/fresh turn carries no cross-turn delta;
-/// * a NON-live prefix-cache hit (`cached_prefix_len > 0` but
-///   `continued_live_prefix == false`) can only restore pure-text prefix blocks
-///   — image requests prefill with `skip_lookup` and never publish a hashable
-///   text stream that collides with their expanded-placeholder blocks — so the
-///   suffix must rotate at the raw physical slot (delta 0), not at the stale
-///   negative delta a prior image turn left on the shared model.
+/// * a NON-live pure-text prefix-cache hit has no image M-RoPE lineage, so the
+///   suffix must rotate at the raw physical slot (delta 0). Image-aware callers
+///   that restore an image-keyed prefix pass `true` after validating the saved
+///   image identity and retain the matching delta.
 ///
 /// Keying the reset on `cached_prefix_len == 0` is therefore too weak: it leaks
 /// a stale image delta into unrelated text requests that merely share a cached
 /// text prefix.
 pub(crate) fn rope_delta_for_paged_turn(
     cached_rope_deltas: Option<i32>,
-    continued_live_prefix: bool,
+    preserve_image_lineage: bool,
 ) -> Option<i32> {
-    if continued_live_prefix {
+    if preserve_image_lineage {
         cached_rope_deltas
     } else {
         None
@@ -106,6 +105,93 @@ fn trace_memory_mib() -> (f64, f64, f64) {
         bytes_to_mib(crate::array::get_cache_memory()),
         bytes_to_mib(crate::array::get_peak_memory()),
     )
+}
+
+/// Materialized GDN sidecar state for a block-aligned token prefix.
+///
+/// Full-attention K/V is owned by the paged adapter, so this snapshot keeps
+/// only the linear-attention layers' conv/recurrent arrays. Full-attention
+/// entries are empty placeholders that preserve layer indexing.
+pub(crate) struct MaterializedGdnPrefixCheckpoint {
+    pub(crate) prefix_len: u32,
+    pub(crate) caches: Vec<Qwen3_5LayerCache>,
+}
+
+pub(crate) fn materialize_linear_layer_caches(caches: &[Qwen3_5LayerCache]) -> Result<()> {
+    let mut arrays = Vec::new();
+    for cache in caches {
+        if matches!(cache, Qwen3_5LayerCache::Linear(_)) {
+            cache.collect_arrays(&mut arrays);
+        }
+    }
+    if !arrays.is_empty() {
+        MxArray::eval_arrays(&arrays)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn snapshot_materialized_linear_layer_caches(
+    caches: &[Qwen3_5LayerCache],
+) -> Option<Vec<Qwen3_5LayerCache>> {
+    let mut snapshot = Vec::with_capacity(caches.len());
+    for cache in caches {
+        match cache {
+            Qwen3_5LayerCache::Linear(arrays) => {
+                if arrays.get(0).is_none() || arrays.get(1).is_none() {
+                    return None;
+                }
+                snapshot.push(Qwen3_5LayerCache::Linear(arrays.clone()));
+            }
+            Qwen3_5LayerCache::FullAttention(_) => {
+                snapshot.push(Qwen3_5LayerCache::new_full_attention());
+            }
+        }
+    }
+    Some(snapshot)
+}
+
+/// Return the largest complete paged-block boundary strictly before the end of
+/// the prompt.
+///
+/// Production prefix lookup is capped at `prompt.len() - 1` so at least one
+/// suffix token remains for prefill. Mirroring that cap here keeps the GDN
+/// sidecar on a boundary the next turn can actually restore. This differs from
+/// the final complete block only when the prompt itself is block-aligned; in
+/// that case it deliberately backs off one block instead of publishing an
+/// unreachable checkpoint.
+pub(crate) fn gdn_checkpoint_target(
+    full_tokens_len: usize,
+    cached_prefix_len: u32,
+    block_size: u32,
+) -> Option<u32> {
+    if block_size == 0 {
+        return None;
+    }
+    let full_tokens_len = u32::try_from(full_tokens_len).ok()?;
+    let max_cache_hit_tokens = full_tokens_len.checked_sub(1)?;
+    let target = max_cache_hit_tokens / block_size * block_size;
+    (target > cached_prefix_len).then_some(target)
+}
+
+pub(crate) fn paged_prefill_ranges(
+    suffix_len: usize,
+    chunk_size: usize,
+    checkpoint_suffix_offset: Option<usize>,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < suffix_len {
+        let mut end = start.saturating_add(chunk_size).min(suffix_len);
+        if let Some(checkpoint) = checkpoint_suffix_offset
+            && checkpoint > start
+            && checkpoint < end
+        {
+            end = checkpoint;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
 }
 
 /// Forward the cached-prefix tokens through GDN layers ONLY. Used as
@@ -128,7 +214,20 @@ pub(crate) fn run_gdn_only_prefill(
         return Ok(());
     }
     let input_ids = MxArray::from_uint32(prefix_tokens, &[1, prefix_tokens.len() as i64])?;
-    let mut hidden_states = embed.forward(&input_ids)?;
+    let hidden_states = embed.forward(&input_ids)?;
+    run_gdn_only_prefill_embeddings(&hidden_states, layers, caches)
+}
+
+/// Forward an already-embedded prefix through GDN layers only.
+pub(crate) fn run_gdn_only_prefill_embeddings(
+    prefix_inputs_embeds: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+) -> Result<()> {
+    if prefix_inputs_embeds.shape_at(1)? == 0 {
+        return Ok(());
+    }
+    let mut hidden_states = prefix_inputs_embeds.clone();
 
     let num_layers = layers.len();
     #[allow(clippy::needless_range_loop)]
@@ -148,6 +247,30 @@ pub(crate) fn run_gdn_only_prefill(
     Ok(())
 }
 
+/// Replay a GDN prefix in bounded chunks and materialize recurrent state after
+/// each chunk. This is the correctness fallback for a sidecar-checkpoint miss.
+/// It remains O(prefix), but it cannot hide an arbitrarily large lazy graph in
+/// the first suffix chunk or exhaust the MLX graph allocator.
+pub(crate) fn run_gdn_only_prefill_materialized(
+    prefix_tokens: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+) -> Result<()> {
+    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
+    let chunk_size = if configured_chunk_size > 0 {
+        configured_chunk_size as usize
+    } else {
+        2048
+    };
+    for chunk in prefix_tokens.chunks(chunk_size) {
+        run_gdn_only_prefill(chunk, embed, layers, caches)?;
+        materialize_linear_layer_caches(caches)?;
+        crate::array::synchronize_and_clear_cache();
+    }
+    Ok(())
+}
+
 /// Run a paged prefill over the suffix tokens. Returns the last
 /// position's logits squeezed to `[vocab]`.
 ///
@@ -157,7 +280,7 @@ pub(crate) fn run_gdn_only_prefill(
 /// the suffix `&tokens[cached_prefix_len..]` is what gets recorded
 /// into the paged adapter and fed through the full forward pass.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_paged_prefill_chunk(
+pub(crate) fn run_paged_prefill_chunk_with_checkpoint(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
@@ -166,12 +289,12 @@ pub(crate) fn run_paged_prefill_chunk(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
-) -> Result<MxArray> {
+) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
     run_paged_prefill_chunk_with_size(
         full_tokens,
@@ -208,20 +331,24 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
-) -> Result<MxArray> {
+) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_prefill_chunk called with empty suffix",
         ));
     }
 
-    if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
+    // Preserve the public `0 = legacy single-shot` contract. Capturing a
+    // sidecar at the stable reusable-block boundary may require splitting
+    // before the final chunk, so it is intentionally available only when
+    // chunking is enabled.
+    if chunk_size <= 0 {
         return run_paged_prefill_single_shot(
             full_tokens,
             suffix_tokens,
@@ -236,16 +363,53 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
-        );
+        )
+        .map(|logits| (logits, None));
+    }
+
+    let checkpoint_target = gdn_checkpoint_target(
+        full_tokens.len(),
+        cached_prefix_len,
+        paged_adapter.block_size(),
+    );
+
+    if checkpoint_target.is_none() && suffix_tokens.len() <= chunk_size as usize {
+        return run_paged_prefill_single_shot(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            gdn_prefix_already_primed,
+            embed,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight,
+            layer_kinds,
+            paged_adapter,
+            cached_rope_deltas,
+        )
+        .map(|logits| (logits, None));
     }
 
     let trace_enabled = inference_trace_enabled();
+    let inference_info_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let chunk_size_usize = chunk_size as usize;
+    let checkpoint_suffix_offset = checkpoint_target
+        .and_then(|target| target.checked_sub(cached_prefix_len))
+        .map(|offset| offset as usize);
+    let chunk_ranges = paged_prefill_ranges(
+        suffix_tokens.len(),
+        chunk_size_usize,
+        checkpoint_suffix_offset,
+    );
 
     // Pass 1: GDN-only prefill over the cached prefix. This runs once before
     // suffix chunking; GDN recurrent state then advances in-place across chunks.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_trace_start = trace_enabled.then(Instant::now);
+        let gdn_info_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
         if let Some(start) = gdn_trace_start {
@@ -260,15 +424,32 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 peak_mib
             ));
         }
+        if let Some(start) = gdn_info_start {
+            let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "paged_prefill_gdn_prefix_graph_built",
+                prefix_tokens = cached_prefix_len,
+                graph_build_ms = elapsed_ms(start),
+                materialized = false,
+                active_mib,
+                cache_mib,
+                peak_mib,
+                "paged prefill GDN prefix graph built"
+            );
+        }
     }
 
-    let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
+    let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
+    let mut checkpoint = None;
     let mut chunk_start_position = cached_prefix_len;
 
-    for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+    for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
+        let chunk_info_start = inference_info_enabled.then(Instant::now);
 
         paged_adapter
             .record_tokens(chunk)
@@ -287,13 +468,26 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             cached_rope_deltas,
         )?;
 
+        let context_after = chunk_start_position + chunk.len() as u32;
+        let capture_checkpoint = checkpoint_target == Some(context_after);
+
         if is_last_chunk {
             last_logits = Some(project_last_token_logits(
                 &hidden_states,
                 final_norm,
                 lm_head,
+                embed,
                 embedding_weight,
             )?);
+            if capture_checkpoint {
+                materialize_linear_layer_caches(caches)?;
+                checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
+                    MaterializedGdnPrefixCheckpoint {
+                        prefix_len: context_after,
+                        caches,
+                    }
+                });
+            }
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
                 let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
@@ -312,8 +506,36 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                     peak_mib
                 ));
             }
+            if let Some(start) = chunk_info_start {
+                let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "paged_prefill_chunk_done",
+                    chunk_index = chunk_idx + 1,
+                    total_chunks,
+                    chunk_tokens = chunk.len(),
+                    context_before = chunk_start_position,
+                    context_after = chunk_start_position + chunk.len() as u32,
+                    materialized = false,
+                    gdn_checkpoint_materialized = capture_checkpoint,
+                    graph_build_ms = elapsed_ms(start),
+                    active_mib,
+                    cache_mib,
+                    peak_mib,
+                    "final paged prefill chunk graph built"
+                );
+            }
         } else {
             hidden_states.eval();
+            if capture_checkpoint {
+                materialize_linear_layer_caches(caches)?;
+                checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
+                    MaterializedGdnPrefixCheckpoint {
+                        prefix_len: context_after,
+                        caches,
+                    }
+                });
+            }
             crate::array::synchronize_and_clear_cache();
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
@@ -339,16 +561,42 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                     peak_mib
                 ));
             }
+            if let Some(start) = chunk_info_start {
+                let chunk_elapsed_ms = elapsed_ms(start);
+                let chunk_tok_s = if chunk_elapsed_ms > 0.0 {
+                    chunk.len() as f64 / (chunk_elapsed_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "paged_prefill_chunk_done",
+                    chunk_index = chunk_idx + 1,
+                    total_chunks,
+                    chunk_tokens = chunk.len(),
+                    context_before = chunk_start_position,
+                    context_after = chunk_start_position + chunk.len() as u32,
+                    materialized = true,
+                    elapsed_ms = chunk_elapsed_ms,
+                    tok_s = chunk_tok_s,
+                    active_mib,
+                    cache_mib,
+                    peak_mib,
+                    "paged prefill chunk completed"
+                );
+            }
         }
 
         chunk_start_position += chunk.len() as u32;
     }
 
-    last_logits.ok_or_else(|| {
+    let logits = last_logits.ok_or_else(|| {
         Error::from_reason(
             "chunked prefill produced no last chunk (unreachable for non-empty suffix)",
         )
-    })
+    })?;
+    Ok((logits, checkpoint))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -361,19 +609,37 @@ fn run_paged_prefill_single_shot(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
 ) -> Result<MxArray> {
+    let inference_info_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+    let single_shot_start = inference_info_enabled.then(Instant::now);
     paged_adapter
         .record_tokens(suffix_tokens)
         .map_err(Error::from_reason)?;
 
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
+        let gdn_info_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        if let Some(start) = gdn_info_start {
+            let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "paged_prefill_gdn_prefix_graph_built",
+                prefix_tokens = cached_prefix_len,
+                graph_build_ms = elapsed_ms(start),
+                materialized = false,
+                active_mib,
+                cache_mib,
+                peak_mib,
+                "single-shot paged prefill GDN prefix graph built"
+            );
+        }
     }
 
     let hidden_states = run_paged_prefill_one_chunk(
@@ -389,10 +655,27 @@ fn run_paged_prefill_single_shot(
         cached_rope_deltas,
     )?;
 
-    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+    let logits =
+        project_last_token_logits(&hidden_states, final_norm, lm_head, embed, embedding_weight)?;
+    if let Some(start) = single_shot_start {
+        let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "paged_prefill_single_shot_graph_built",
+            suffix_tokens = suffix_tokens.len(),
+            cached_prefix_tokens = cached_prefix_len,
+            graph_build_ms = elapsed_ms(start),
+            materialized = false,
+            active_mib,
+            cache_mib,
+            peak_mib,
+            "single-shot paged prefill graph built"
+        );
+    }
+    Ok(logits)
 }
 
-/// Single-turn image-bearing paged prefill.
+/// Image-bearing paged prefill with optional cached-prefix reuse.
 ///
 /// Feeds the vision encoder's image-merged token embeddings
 /// (`merge.inputs_embeds`) through the paged adapter and applies 3-row M-RoPE
@@ -403,50 +686,152 @@ fn run_paged_prefill_single_shot(
 /// embedding row). They drive `record_tokens` / the physical slot cursor only;
 /// the forward itself consumes the merged embeddings, not re-embedded ids.
 ///
-/// SINGLE-TURN ONLY: runs on a fresh prefill (`cached_prefix_len == 0`); there
-/// is no GDN prefix replay and no cache-hit read-back. The forward is run in
-/// one shot over the whole sequence so the GDN recurrent-state accumulation
-/// and M-RoPE positions match the flat VLM prefill exactly.
+/// Only `expanded_tokens[cached_prefix_len..]` are recorded and forwarded. The
+/// corresponding slices of `merge.inputs_embeds` and `merge.position_ids` are
+/// forwarded at their absolute physical positions, so full-attention layers
+/// read the cached image-aware K/V prefix and rotate the suffix with the same
+/// M-RoPE coordinates as a cold prefill.
+///
+/// A non-zero cached prefix is accepted only with its matching materialized
+/// GDN sidecar. The caller must downgrade a K/V-only candidate to a cold
+/// position-zero prefill; replaying only the recurrent layers would omit the
+/// intervening attention/MLP residual stream and create a state that never
+/// existed in the original image prefill.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_vlm_prefill(
     expanded_tokens: &[u32],
     merge: &VisionMerge,
+    cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
-) -> Result<MxArray> {
+) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_vlm_prefill called with empty prompt",
         ));
     }
+    let prompt_len = expanded_tokens.len();
+    let prompt_len_u32 = u32::try_from(prompt_len)
+        .map_err(|_| Error::from_reason("VLM prompt length exceeds u32"))?;
+    let cached_prefix_len_us = usize::try_from(cached_prefix_len)
+        .map_err(|_| Error::from_reason("VLM cached prefix length does not fit usize"))?;
+    if cached_prefix_len >= prompt_len_u32 {
+        return Err(Error::from_reason(format!(
+            "run_paged_vlm_prefill requires a non-empty suffix: cached_prefix_len={} prompt_len={}",
+            cached_prefix_len, prompt_len
+        )));
+    }
+    let embed_len = merge.inputs_embeds.shape_at(1)?;
+    let position_len = merge.position_ids.shape_at(2)?;
+    if embed_len != prompt_len as i64 || position_len != prompt_len as i64 {
+        return Err(Error::from_reason(format!(
+            "run_paged_vlm_prefill merge length mismatch: tokens={} inputs_embeds={} position_ids={}",
+            prompt_len, embed_len, position_len
+        )));
+    }
+    let adapter_prefix_len = paged_adapter.current_token_count();
+    if adapter_prefix_len != cached_prefix_len {
+        return Err(Error::from_reason(format!(
+            "run_paged_vlm_prefill adapter prefix mismatch: adapter={} requested={}",
+            adapter_prefix_len, cached_prefix_len
+        )));
+    }
 
-    paged_adapter
-        .record_tokens(expanded_tokens)
-        .map_err(Error::from_reason)?;
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
+        return Err(Error::from_reason(
+            "run_paged_vlm_prefill received a K/V prefix without an exact GDN sidecar; caller must restart cold",
+        ));
+    }
 
-    let hidden_states = run_paged_prefill_one_chunk(
-        expanded_tokens,
-        /* chunk_first_position */ 0,
-        embed,
-        layers,
-        caches,
-        layer_kinds,
-        paged_adapter,
-        Some(&merge.inputs_embeds),
-        Some(&merge.position_ids),
-        // Image prefill drives full-attention layers through the 3-row M-RoPE
-        // arm (`position_ids` is `Some`), so the scalar offset is unused here.
-        /* cached_rope_deltas */
-        0,
-    )?;
+    let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
+    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
+    let chunk_size = if configured_chunk_size > 0 {
+        configured_chunk_size as usize
+    } else {
+        suffix_tokens.len()
+    };
+    // Image-aware KV reuse also needs an exact recurrent sidecar. Even when
+    // generic text prefill chunking is disabled, split once at the reusable
+    // block boundary so a later non-live image-prefix hit remains exact.
+    let checkpoint_target =
+        gdn_checkpoint_target(prompt_len, cached_prefix_len, paged_adapter.block_size());
+    let checkpoint_suffix_offset = checkpoint_target
+        .and_then(|target| target.checked_sub(cached_prefix_len))
+        .map(|offset| offset as usize);
+    let chunk_ranges =
+        paged_prefill_ranges(suffix_tokens.len(), chunk_size, checkpoint_suffix_offset);
+    let total_chunks = chunk_ranges.len();
+    let mut last_logits = None;
+    let mut checkpoint = None;
 
-    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+    for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        let absolute_start = cached_prefix_len_us + range.start;
+        let absolute_end = cached_prefix_len_us + range.end;
+        let chunk_tokens = &expanded_tokens[absolute_start..absolute_end];
+        let chunk_embeds =
+            merge
+                .inputs_embeds
+                .slice_axis(1, absolute_start as i64, absolute_end as i64)?;
+        let chunk_positions =
+            merge
+                .position_ids
+                .slice_axis(2, absolute_start as i64, absolute_end as i64)?;
+
+        paged_adapter
+            .record_tokens(chunk_tokens)
+            .map_err(Error::from_reason)?;
+        let hidden_states = run_paged_prefill_one_chunk(
+            chunk_tokens,
+            absolute_start as u32,
+            embed,
+            layers,
+            caches,
+            layer_kinds,
+            paged_adapter,
+            Some(&chunk_embeds),
+            Some(&chunk_positions),
+            // The explicit M-RoPE grid is authoritative for image prefill.
+            0,
+        )?;
+
+        let context_after = absolute_end as u32;
+        let capture_checkpoint = checkpoint_target == Some(context_after);
+        let is_last_chunk = chunk_idx + 1 == total_chunks;
+        if is_last_chunk {
+            last_logits = Some(project_last_token_logits(
+                &hidden_states,
+                final_norm,
+                lm_head,
+                embed,
+                embedding_weight,
+            )?);
+        } else {
+            hidden_states.eval();
+        }
+        if capture_checkpoint {
+            materialize_linear_layer_caches(caches)?;
+            checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
+                MaterializedGdnPrefixCheckpoint {
+                    prefix_len: context_after,
+                    caches,
+                }
+            });
+        }
+        if !is_last_chunk {
+            crate::array::synchronize_and_clear_cache();
+        }
+    }
+
+    let logits = last_logits
+        .ok_or_else(|| Error::from_reason("run_paged_vlm_prefill produced no final chunk"))?;
+    Ok((logits, checkpoint))
 }
 
 /// Paged prefill variant that ALSO returns the post-`final_norm` hidden
@@ -455,16 +840,17 @@ pub(crate) fn run_paged_vlm_prefill(
 ///
 /// Mirror of `chunked_prefill_with_hidden` (dense / flat path). The
 /// paged-MTP gate inside `paged_turn_sync_core_inner` consumes this so
-/// `prefill_mtp_commit` can seed `g_mtp_committed_len = N` before the
+/// `begin_mtp_decode`'s prompt-prefix seed can commit the full prompt
+/// (advancing the stepper's `committed_len` to N) before the
 /// first MTP cycle — without it the MTP draft attends over a
 /// prompt-less context and parity vs the AR run breaks.
 ///
 /// Caller MUST gate on `cached_prefix_len == 0` (the dense gate uses
 /// the same `want_prompt_hidden` predicate). On a cache-reuse turn the
 /// prefill only processes the suffix, so the captured hidden would not
-/// cover the full prompt and `prefill_mtp_commit` cannot use it.
+/// cover the full prompt and the prompt-prefix seed cannot use it.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_paged_prefill_chunk_with_hidden(
+pub(crate) fn run_paged_prefill_chunk_with_hidden_and_checkpoint(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
@@ -473,13 +859,13 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
-) -> Result<(MxArray, MxArray)> {
+) -> Result<(MxArray, MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
     run_paged_prefill_chunk_with_hidden_with_size(
         full_tokens,
@@ -510,21 +896,23 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
-) -> Result<(MxArray, MxArray)> {
+) -> Result<(MxArray, MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_prefill_chunk_with_hidden called with empty suffix",
         ));
     }
 
-    if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
+    // Preserve the public `0 = legacy single-shot` contract. See the
+    // non-hidden worker above for why sidecar capture requires chunking.
+    if chunk_size <= 0 {
         return run_paged_prefill_single_shot_with_hidden(
             full_tokens,
             suffix_tokens,
@@ -540,18 +928,72 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             paged_adapter,
             keep_last_hidden,
             cached_rope_deltas,
-        );
+        )
+        .map(|(logits, hidden)| (logits, hidden, None));
     }
 
+    let checkpoint_target = gdn_checkpoint_target(
+        full_tokens.len(),
+        cached_prefix_len,
+        paged_adapter.block_size(),
+    );
+
+    if checkpoint_target.is_none() && suffix_tokens.len() <= chunk_size as usize {
+        return run_paged_prefill_single_shot_with_hidden(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            gdn_prefix_already_primed,
+            embed,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight,
+            layer_kinds,
+            paged_adapter,
+            keep_last_hidden,
+            cached_rope_deltas,
+        )
+        .map(|(logits, hidden)| (logits, hidden, None));
+    }
+
+    let inference_info_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+    let prefill_trace_start = inference_info_enabled.then(Instant::now);
     let chunk_size_usize = chunk_size as usize;
+    let checkpoint_suffix_offset = checkpoint_target
+        .and_then(|target| target.checked_sub(cached_prefix_len))
+        .map(|offset| offset as usize);
+    let chunk_ranges = paged_prefill_ranges(
+        suffix_tokens.len(),
+        chunk_size_usize,
+        checkpoint_suffix_offset,
+    );
 
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
+        let gdn_trace_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        if let Some(start) = gdn_trace_start {
+            let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "paged_mtp_gdn_prefix_graph_built",
+                prefix_tokens = cached_prefix_len,
+                graph_build_ms = elapsed_ms(start),
+                materialized = false,
+                active_mib,
+                cache_mib,
+                peak_mib,
+                "paged MTP GDN prefix graph built"
+            );
+        }
     }
 
-    let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
+    let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
+    let mut checkpoint = None;
     let mut hidden_chunks: Vec<MxArray> = Vec::with_capacity(total_chunks);
     let total_suffix_len = suffix_tokens.len();
     let keep_start = keep_last_hidden
@@ -560,7 +1002,9 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     let mut chunk_start_position = cached_prefix_len;
     let mut suffix_offset = 0usize;
 
-    for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+    for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        let chunk = &suffix_tokens[range];
+        let chunk_trace_start = inference_info_enabled.then(Instant::now);
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_start = suffix_offset;
         let chunk_end = chunk_start + chunk.len();
@@ -588,6 +1032,8 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
         } else {
             None
         };
+        let context_after = chunk_start_position + chunk.len() as u32;
+        let capture_checkpoint = checkpoint_target == Some(context_after);
 
         if is_last_chunk {
             // Reuse the already-normed last chunk to project last-token
@@ -600,6 +1046,8 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
             let logits = if let Some(head) = lm_head {
                 head.forward(&last_hidden)?
+            } else if embed.is_packed_quantized() {
+                embed.as_linear(&last_hidden)?
             } else {
                 let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                 last_hidden.matmul(&weight_t)?
@@ -626,8 +1074,49 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             kept_hidden.eval();
             hidden_chunks.push(kept_hidden);
         }
+        if capture_checkpoint {
+            materialize_linear_layer_caches(caches)?;
+            checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
+                MaterializedGdnPrefixCheckpoint {
+                    prefix_len: context_after,
+                    caches,
+                }
+            });
+        }
         if !is_last_chunk {
             crate::array::synchronize_and_clear_cache();
+        }
+        if let Some(start) = chunk_trace_start {
+            // This elapsed value includes the existing materialization point:
+            // kept hidden eval for retained MTP history, or the normal
+            // inter-chunk synchronize+clear. No synchronization is added for
+            // tracing, so the final chunk explicitly reports whether its
+            // retained hidden state supplied that barrier.
+            let elapsed = elapsed_ms(start);
+            let tok_s = if elapsed > 0.0 {
+                chunk.len() as f64 / (elapsed / 1000.0)
+            } else {
+                0.0
+            };
+            let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "paged_mtp_prefill_chunk_done",
+                chunk_index = chunk_idx + 1,
+                total_chunks,
+                chunk_tokens = chunk.len(),
+                context_before = chunk_start_position,
+                context_after = chunk_start_position + chunk.len() as u32,
+                retained_hidden = overlaps_kept_tail,
+                materialized = overlaps_kept_tail || !is_last_chunk || capture_checkpoint,
+                gdn_checkpoint_materialized = capture_checkpoint,
+                elapsed_ms = elapsed,
+                tok_s,
+                active_mib,
+                cache_mib,
+                peak_mib,
+                "paged MTP prefill chunk completed"
+            );
         }
         chunk_start_position += chunk.len() as u32;
         suffix_offset = chunk_end;
@@ -651,7 +1140,20 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
         acc
     };
 
-    Ok((last_logits, prompt_hidden))
+    if let Some(start) = prefill_trace_start {
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "paged_mtp_prefill_done",
+            suffix_tokens = suffix_tokens.len(),
+            cached_prefix_tokens = cached_prefix_len,
+            total_chunks,
+            kept_hidden_tokens = keep_last_hidden.unwrap_or(total_suffix_len).min(total_suffix_len),
+            elapsed_ms = elapsed_ms(start),
+            "paged MTP prefill completed"
+        );
+    }
+
+    Ok((last_logits, prompt_hidden, checkpoint))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -664,7 +1166,7 @@ fn run_paged_prefill_single_shot_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -697,6 +1199,7 @@ fn run_paged_prefill_single_shot_with_hidden(
         &hidden_states,
         final_norm,
         lm_head,
+        embed,
         embedding_weight,
         keep_last_hidden,
     )
@@ -743,6 +1246,15 @@ fn run_paged_prefill_one_chunk(
     // and image prefill uses the M-RoPE arm so this is ignored there.
     let rope_position_offset = paged_rope_offset(chunk_first_position, cached_rope_deltas);
 
+    // Shared per-forward-pass scratch slot for the M-RoPE cos/sin precompute
+    // (see `Qwen3_5Attention::forward_paged`'s `mrope_cache` doc comment).
+    // Every `FullAttentionPaged` layer in this loop shares one `position_ids`
+    // array, so the first such layer computes the selected cos/sin and every
+    // later one reuses it instead of recomputing the cos/sin table +
+    // `take_along_axis` gather. Stays `None` (untouched) on the text-only
+    // path where `position_ids` is `None`.
+    let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+
     for (layer_idx, ((layer, cache_slot), kind)) in layers
         .iter_mut()
         .zip(caches.iter_mut())
@@ -767,6 +1279,7 @@ fn run_paged_prefill_one_chunk(
             layer_positions,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut mrope_cache,
         )?;
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
     }
@@ -776,7 +1289,8 @@ fn run_paged_prefill_one_chunk(
 fn project_last_token_logits(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let seq_len = hidden_states.shape_at(1)?;
@@ -785,6 +1299,12 @@ fn project_last_token_logits(
     let h = final_norm.forward(&last_hidden)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        // Tied + packed-quantized embedding: route through the packed
+        // `quantized_matmul` instead of a dense `[vocab, hidden]` transpose
+        // + matmul (the `embedding_weight` fallback below reads a fully
+        // pre-dequantized/on-demand-dequantized dense copy).
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -797,13 +1317,14 @@ fn project_last_token_logits(
 /// head, returning `(last_token_logits[vocab], full_chunk_hidden[1, T, hidden])`.
 ///
 /// The paged prefill variant needs every chunk's post-`final_norm` hidden so
-/// the MTP committed-history prefill seed (`prefill_mtp_commit`) gets a
-/// contiguous `[1, prompt_len, hidden]` tensor — mirrors
-/// `chunked_prefill_with_hidden` on the dense path.
+/// the MTP committed-history prompt seed (`prompt_hidden`, consumed by
+/// `begin_mtp_decode`) gets a contiguous `[1, prompt_len, hidden]` tensor —
+/// mirrors `chunked_prefill_with_hidden` on the dense path.
 fn project_last_token_logits_with_full_hidden(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
     keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
@@ -813,6 +1334,8 @@ fn project_last_token_logits_with_full_hidden(
     let last_hidden = full_hidden.slice_axis(1, prompt_len - 1, prompt_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&last_hidden)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&last_hidden)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         last_hidden.matmul(&weight_t)?
@@ -827,9 +1350,10 @@ fn project_last_token_logits_with_full_hidden(
         full_hidden
     };
 
-    // The caller runs `synchronize_and_clear_cache()` before
-    // `prefill_mtp_commit`, which would otherwise free the lazy graph nodes
-    // backing the kept hidden. Materialise before return.
+    // The caller runs `synchronize_and_clear_cache()` after prefill, before
+    // `begin_mtp_decode` consumes the kept hidden as its prompt-prefix seed
+    // — that sweep would otherwise free the lazy graph nodes backing the
+    // kept hidden. Materialise before return.
     kept_hidden.eval();
     debug_assert_eq!(kept_hidden.shape_at(0)?, 1);
     debug_assert!(kept_hidden.shape_at(1)? >= 1);
@@ -848,7 +1372,7 @@ pub(crate) fn run_paged_decode_step(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -893,12 +1417,15 @@ pub(crate) fn run_paged_decode_step(
             /* position_ids */ None,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -912,9 +1439,9 @@ pub(crate) fn run_paged_decode_step(
 /// Routes full-attention layers through the paged adapter (writing one new K/V
 /// slot into the pool, attending over `read_kv_range(0, total_ctx)`) and GDN
 /// layers through the flat `Qwen3_5LayerCache::Linear` slots in `caches`, the
-/// same split `run_paged_decode_step` uses. The eager analogue of the compiled
-/// `forward_with_hidden` closure that calls `forward_dense_cpp_paged` +
-/// `export_last_hidden_paged`.
+/// same split `run_paged_decode_step` uses. The eager analogue of the deleted
+/// compiled `forward_with_hidden` closure that called `forward_dense_cpp_paged`
+/// + `export_last_hidden_paged`.
 ///
 /// Returns `(logits [1, 1, vocab], hidden [1, hidden])`. The hidden is squeezed
 /// on the time axis to match the eager-flat MTP `forward_with_hidden` contract
@@ -926,7 +1453,7 @@ pub(crate) fn run_paged_step_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
@@ -971,16 +1498,22 @@ pub(crate) fn run_paged_step_with_hidden(
             /* position_ids */ None,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 
     let h3 = final_norm.forward(&hidden_states)?;
-    let logits = match (lm_head, embedding_weight_t) {
-        (Some(head), _) => head.forward(&h3)?,
-        (None, Some(wt)) => h3.matmul(wt)?,
-        (None, None) => {
-            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-            h3.matmul(&wt)?
+    let logits = if let Some(head) = lm_head {
+        head.forward(&h3)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h3)?
+    } else {
+        match embedding_weight_t {
+            Some(wt) => h3.matmul(wt)?,
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h3.matmul(&wt)?
+            }
         }
     };
     let hidden = h3.squeeze(Some(&[1]))?;
@@ -992,7 +1525,7 @@ pub(crate) fn run_paged_step_with_hidden(
 /// at every verify position, recording the per-layer GDN tape for the rollback
 /// replay.
 ///
-/// The eager analogue of the compiled `forward_mtp_verify_paged` FFI. The
+/// The eager analogue of the deleted compiled `forward_mtp_verify_paged` FFI. The
 /// `verify_ids` (`[1, K+1]` int32) are recorded into the adapter in ONE
 /// `record_tokens` call (so the new K/V land at logical positions
 /// `[ctx, ctx+K]`), then run through every layer: full-attention via the paged
@@ -1011,7 +1544,7 @@ pub(crate) fn run_paged_verify_step(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
@@ -1080,17 +1613,92 @@ pub(crate) fn run_paged_verify_step(
     }
 
     let hiddens = final_norm.forward(&hidden_states)?;
-    let logits = match (lm_head, embedding_weight_t) {
-        (Some(head), _) => head.forward(&hiddens)?,
-        (None, Some(wt)) => hiddens.matmul(wt)?,
-        (None, None) => {
-            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-            hiddens.matmul(&wt)?
+    let logits = if let Some(head) = lm_head {
+        head.forward(&hiddens)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&hiddens)?
+    } else {
+        match embedding_weight_t {
+            Some(wt) => hiddens.matmul(wt)?,
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                hiddens.matmul(&wt)?
+            }
         }
     };
     Ok(super::mtp_decode::MtpVerifyOutput::logits_only(
         logits, hiddens,
     ))
+}
+
+#[cfg(test)]
+mod gdn_checkpoint_tests {
+    use super::{gdn_checkpoint_target, paged_prefill_ranges};
+
+    fn assert_contiguous_cover(ranges: &[std::ops::Range<usize>], suffix_len: usize) {
+        let mut cursor = 0;
+        for range in ranges {
+            assert_eq!(range.start, cursor, "range gap or overlap at {cursor}");
+            assert!(range.end > range.start, "ranges must be non-empty");
+            cursor = range.end;
+        }
+        assert_eq!(cursor, suffix_len);
+    }
+
+    #[test]
+    fn checkpoint_target_matches_largest_reusable_block_boundary() {
+        assert_eq!(gdn_checkpoint_target(37, 0, 16), Some(32));
+        assert_eq!(gdn_checkpoint_target(33, 0, 16), Some(32));
+        assert_eq!(gdn_checkpoint_target(32, 0, 16), Some(16));
+        assert_eq!(gdn_checkpoint_target(17, 0, 16), Some(16));
+        assert_eq!(gdn_checkpoint_target(37, 16, 16), Some(32));
+        assert_eq!(gdn_checkpoint_target(37, 32, 16), None);
+        assert_eq!(gdn_checkpoint_target(37, 33, 16), None);
+        assert_eq!(gdn_checkpoint_target(32, 16, 16), None);
+        assert_eq!(gdn_checkpoint_target(16, 16, 16), None);
+        assert_eq!(gdn_checkpoint_target(16, 0, 16), None);
+        assert_eq!(gdn_checkpoint_target(1, 0, 16), None);
+        assert_eq!(gdn_checkpoint_target(0, 0, 16), None);
+        assert_eq!(gdn_checkpoint_target(37, 0, 0), None);
+
+        // These block-aligned boundaries are the three costly rollback cases
+        // observed in the live agent trace.
+        assert_eq!(gdn_checkpoint_target(41_216, 0, 16), Some(41_200));
+        assert_eq!(gdn_checkpoint_target(45_360, 0, 16), Some(45_344));
+        assert_eq!(gdn_checkpoint_target(47_488, 0, 16), Some(47_472));
+    }
+
+    #[test]
+    fn prefill_ranges_split_at_checkpoint_inside_chunk() {
+        let non_aligned_target = gdn_checkpoint_target(37, 0, 16);
+        let ranges = paged_prefill_ranges(37, 2048, non_aligned_target.map(|v| v as usize));
+        assert_eq!(ranges, vec![0..32, 32..37]);
+        assert_contiguous_cover(&ranges, 37);
+
+        let aligned_target = gdn_checkpoint_target(32, 0, 16);
+        let ranges = paged_prefill_ranges(32, 2048, aligned_target.map(|v| v as usize));
+        assert_eq!(ranges, vec![0..16, 16..32]);
+        assert_contiguous_cover(&ranges, 32);
+
+        // Cached prefix 16, full prompt 37: checkpoint 32 is suffix offset 16.
+        let ranges = paged_prefill_ranges(21, 2048, Some(16));
+        assert_eq!(ranges, vec![0..16, 16..21]);
+        assert_contiguous_cover(&ranges, 21);
+    }
+
+    #[test]
+    fn prefill_ranges_keep_existing_chunk_boundary() {
+        let ranges = paged_prefill_ranges(2053, 2048, Some(2048));
+        assert_eq!(ranges, vec![0..2048, 2048..2053]);
+        assert_contiguous_cover(&ranges, 2053);
+    }
+
+    #[test]
+    fn prefill_ranges_cover_suffix_without_checkpoint() {
+        let ranges = paged_prefill_ranges(5000, 2048, None);
+        assert_eq!(ranges, vec![0..2048, 2048..4096, 4096..5000]);
+        assert_contiguous_cover(&ranges, 5000);
+    }
 }
 
 #[cfg(test)]

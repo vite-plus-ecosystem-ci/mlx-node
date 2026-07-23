@@ -214,3 +214,4 @@ __pycache__/
 /mlx-vlm
 *.metallib
 .vite-agent
+/Model-Optimizer

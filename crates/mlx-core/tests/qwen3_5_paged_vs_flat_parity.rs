@@ -3,16 +3,11 @@
 //!
 //! Mirrors `lfm2_paged_vs_flat_parity.rs`. Qwen3.5's hybrid layer mix
 //! (GDN linear-attention + full-attention) means only the
-//! full-attention layers route through the paged adapter. The compiled
-//! C++ forward is bypassed entirely on the paged path; this gate
-//! verifies that the pure-Rust paged forward is byte-equal to the
-//! pure-Rust flat forward (for greedy decoding) on real weights.
-//!
-//! ⚠️ The compiled C++ forward path is the production fast path on
-//! flat (≈6.4 tok/s on M3 Max). When the paged adapter is enabled the
-//! Rust fallback runs instead — so the parity comparison is between
-//! two Rust forward paths, NOT between Rust paged and compiled C++
-//! flat. This is the same trade-off LFM2 makes with the conv operator.
+//! full-attention layers route through the paged adapter. Both sides of
+//! the comparison are pure-Rust eager forwards (the compiled C++
+//! qwen3.5 forward no longer exists): this gate verifies that the paged
+//! forward is byte-equal to the flat forward (for greedy decoding) on
+//! real weights.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH` so a plain `cargo test --ignored`
 //! without the env var still passes (the early-return short-circuits
@@ -95,6 +90,8 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -129,6 +126,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }
@@ -178,22 +176,36 @@ async fn qwen3_5_paged_vs_flat_greedy_token_parity() {
         Err(e) => panic!("failed to clone model dir for paged path: {e}"),
     };
 
+    let prompts = parity_prompts();
     let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string())
         .await
         .expect("failed to load flat-path Qwen3.5 model");
-    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
-        .await
-        .expect("failed to load paged-path Qwen3.5 model");
-
-    let prompts = parity_prompts();
+    let mut flat_results = Vec::with_capacity(prompts.len());
     for (idx, prompt) in prompts.iter().enumerate() {
         let cfg_flat = parity_chat_config(32);
-        let cfg_paged = parity_chat_config(32);
-
         let r_flat = flat_model
             .chat_session_start(vec![user_message(prompt)], Some(cfg_flat))
             .await
             .unwrap_or_else(|e| panic!("flat chat_session_start failed (#{idx}): {e:?}"));
+        flat_results.push(r_flat);
+    }
+
+    // The adaptive paged-pool cap samples process-global MLX active memory.
+    // Keeping both 1.7 GiB oracle copies resident leaves no safely reserved KV
+    // headroom on the 7 GiB macOS CI runner. Join the flat worker so its state
+    // and weights are deterministically gone before sizing the paged pool; a
+    // plain `drop(flat_model)` is insufficient because normal NAPI teardown
+    // intentionally detaches the worker thread.
+    flat_model
+        .shutdown_for_test()
+        .expect("flat-path Qwen3.5 model thread panicked during teardown");
+    mlx_core::array::synchronize_and_clear_cache();
+
+    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
+        .await
+        .expect("failed to load paged-path Qwen3.5 model");
+    for (idx, (prompt, r_flat)) in prompts.iter().zip(flat_results.iter()).enumerate() {
+        let cfg_paged = parity_chat_config(32);
         let r_paged = paged_model
             .chat_session_start(vec![user_message(prompt)], Some(cfg_paged))
             .await

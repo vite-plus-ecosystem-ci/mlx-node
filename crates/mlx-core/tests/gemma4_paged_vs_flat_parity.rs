@@ -109,6 +109,8 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -143,6 +145,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }
@@ -198,10 +201,10 @@ async fn gemma4_paged_vs_flat_greedy_token_parity() {
         Err(e) => panic!("failed to clone model dir for paged path: {e}"),
     };
 
-    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy())
+    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy(), None)
         .await
         .expect("failed to load flat-path Gemma4 model");
-    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy())
+    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy(), None)
         .await
         .expect("failed to load paged-path Gemma4 model");
 
@@ -277,10 +280,10 @@ async fn gemma4_paged_vs_flat_prefix_reuse_parity() {
         Err(e) => panic!("failed to clone model dir for paged path: {e}"),
     };
 
-    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy())
+    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy(), None)
         .await
         .expect("failed to load flat-path Gemma4 model");
-    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy())
+    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy(), None)
         .await
         .expect("failed to load paged-path Gemma4 model");
 

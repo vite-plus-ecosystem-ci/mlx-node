@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -31,6 +32,19 @@
 namespace mlx::core::fast {
 
 namespace {
+
+// The runtime validators establish `value >= 0` and `divisor > 0` before
+// either caller reaches this helper. Widen before arithmetic so INT32_MAX is
+// a valid sequence length rather than overflowing in `value + divisor - 1`.
+constexpr int64_t ceil_div_nonnegative_i32(int32_t value, int32_t divisor) {
+  const int64_t wide_value = static_cast<int64_t>(value);
+  const int64_t wide_divisor = static_cast<int64_t>(divisor);
+  return wide_value / wide_divisor + (wide_value % wide_divisor != 0);
+}
+
+static_assert(
+    ceil_div_nonnegative_i32(std::numeric_limits<int32_t>::max(), 16) ==
+    134217728);
 
 // Derive `x_pack` (the inner-axis vLLM K-pool packing factor) from the
 // on-cache KV dtype. `x_pack` is `16 / sizeof(scalar)`:
@@ -955,12 +969,11 @@ void PagedAttention::eval_gpu(
             << "(including the compile-cached path).";
         throw std::invalid_argument(msg.str());
       }
-      // ceil(s / block_size_); s >= 0 so integer division is fine.
-      const int32_t num_used_blocks =
-          (s + block_size_ - 1) / block_size_;
+      const int64_t num_used_blocks =
+          ceil_div_nonnegative_i32(s, block_size_);
       const size_t row_offset =
           static_cast<size_t>(i) * static_cast<size_t>(max_blocks_per_seq);
-      for (int32_t j = 0; j < num_used_blocks; ++j) {
+      for (int64_t j = 0; j < num_used_blocks; ++j) {
         const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
         if (blk < 0 || blk >= num_blocks) {
           std::ostringstream msg;
@@ -1541,11 +1554,11 @@ void PagedAttentionVarlen::eval_gpu(
             << "]";
         throw std::invalid_argument(msg.str());
       }
-      const int32_t num_used_blocks =
-          (s + block_size_ - 1) / block_size_;
+      const int64_t num_used_blocks =
+          ceil_div_nonnegative_i32(s, block_size_);
       const size_t row_offset =
           static_cast<size_t>(i) * static_cast<size_t>(max_blocks_per_seq);
-      for (int32_t j = 0; j < num_used_blocks; ++j) {
+      for (int64_t j = 0; j < num_used_blocks; ++j) {
         const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
         if (blk < 0 || blk >= num_blocks) {
           std::ostringstream msg;
@@ -1576,6 +1589,16 @@ void PagedAttentionVarlen::eval_gpu(
       std::ostringstream msg;
       msg << "[runtime] PagedAttentionVarlen::eval_gpu: cu_seqlens_q not "
           << "monotone non-decreasing at index " << i;
+      throw std::invalid_argument(msg.str());
+    }
+    const int32_t query_span =
+        cu_seqlens_q_data[i + 1] - cu_seqlens_q_data[i];
+    if (query_span > seq_lens_data[i]) {
+      std::ostringstream msg;
+      msg << "[runtime] PagedAttentionVarlen::eval_gpu: query span for "
+          << "sequence " << i << " (" << query_span
+          << ") must not exceed seq_lens[" << i << "] ("
+          << seq_lens_data[i] << ")";
       throw std::invalid_argument(msg.str());
     }
   }
@@ -1808,6 +1831,96 @@ mlx_array* mlx_paged_attention_forward(
     return nullptr;
   } catch (...) {
     mlx_trace_native_error("paged_attention_forward", "unknown exception");
+    return nullptr;
+  }
+}
+
+/// Production FFI: emit a `PagedAttentionVarlen` MLX Custom primitive and
+/// return the resulting lazy on-device array. This is the ragged-Q sibling of
+/// `mlx_paged_attention_forward`: `block_table` / `seq_lens` describe one row
+/// per sequence while `cu_seqlens_q` maps the flat query rows back to those
+/// sequences.
+///
+/// Returns nullptr on bridge/factory validation errors. The returned array is
+/// still lazy, so GPU dispatch errors surface later when MLX evaluates the
+/// graph.
+mlx_array* mlx_paged_attention_varlen_forward(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* cu_seqlens_q_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw) {
+  if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
+      !seq_lens_ptr || !cu_seqlens_q_ptr || !k_scale_ptr || !v_scale_ptr) {
+    return nullptr;
+  }
+
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+
+    if (kv_dtype_raw > static_cast<uint8_t>(KvDtype::Fp8)) {
+      std::ostringstream msg;
+      msg << "invalid kv_dtype_raw " << static_cast<int>(kv_dtype_raw)
+          << "; expected 0 (Fp16), 1 (Bf16), or 2 (Fp8)";
+      throw std::invalid_argument(msg.str());
+    }
+
+    auto& q_raw             = *reinterpret_cast<array*>(q_ptr);
+    auto& k_pool            = *reinterpret_cast<array*>(k_pool_ptr);
+    auto& v_pool            = *reinterpret_cast<array*>(v_pool_ptr);
+    auto& block_table_raw   = *reinterpret_cast<array*>(block_table_ptr);
+    auto& seq_lens_raw      = *reinterpret_cast<array*>(seq_lens_ptr);
+    auto& cu_seqlens_q_raw  = *reinterpret_cast<array*>(cu_seqlens_q_ptr);
+    auto& k_scale           = *reinterpret_cast<array*>(k_scale_ptr);
+    auto& v_scale           = *reinterpret_cast<array*>(v_scale_ptr);
+
+    auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
+
+    // Match the single-row bridge: query activations may come from lazy
+    // reshape/slice/rope chains, so make only q contiguous here. The varlen
+    // primitive host-reads block_table, seq_lens, and cu_seqlens_q during GPU
+    // evaluation; preserving those adapter-owned arrays lets the factory reject
+    // non-row-contiguous or nonzero-offset metadata instead of hiding it behind
+    // lazy contiguous copies.
+    auto q = contiguous(q_raw);
+
+    auto out = paged_attention_varlen(
+        q,
+        k_pool,
+        v_pool,
+        block_table_raw,
+        seq_lens_raw,
+        cu_seqlens_q_raw,
+        k_scale,
+        v_scale,
+        scale,
+        softcap,
+        sliding_window,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        kv_dtype);
+
+    return reinterpret_cast<mlx_array*>(new array(std::move(out)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("paged_attention_varlen_forward", e.what());
+    return nullptr;
+  } catch (...) {
+    mlx_trace_native_error(
+        "paged_attention_varlen_forward", "unknown exception");
     return nullptr;
   }
 }
@@ -5326,7 +5439,7 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads() {
 
 /// Primitive directly constructed with `block_size_=0`. eval_gpu's
 /// validator must reject; otherwise the runtime bounds check would
-/// compute `(s + block_size_ - 1) / block_size_` and divide by zero.
+/// divide the sequence length by `block_size_` in host code.
 int mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() {
   try {
     using namespace mlx::core::fast;
@@ -5549,7 +5662,7 @@ int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
 
 /// Primitive directly constructed with `block_size_=0`. eval_gpu's
 /// validator must reject; otherwise the runtime bounds check would
-/// divide `(s + block_size_ - 1) / block_size_` by zero in host code,
+/// divide the sequence length by `block_size_` in host code,
 /// crashing the process before the `max_context_len <= 0` guard runs.
 int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
   try {
@@ -6171,6 +6284,130 @@ int mlx_paged_attention_varlen_factory_accepts_wellformed() {
   return 1;
 }
 
+/// The public varlen C ABI must fail closed on unknown KV dtype wire values
+/// instead of casting them into `KvDtype` and reaching the enum switch
+/// fallthroughs. The remaining inputs are structurally valid so a missing
+/// bridge check would return a non-null lazy output and fail this test.
+int mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() {
+  using namespace mlx::core;
+
+  array q(Shape{4, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{2, 4}, int32, nullptr, {});
+  array seq_lens(Shape{2}, int32, nullptr, {});
+  array cu_seqlens_q(Shape{3}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  auto* out = mlx_paged_attention_varlen_forward(
+      reinterpret_cast<mlx_array*>(&q),
+      reinterpret_cast<mlx_array*>(&k_pool),
+      reinterpret_cast<mlx_array*>(&v_pool),
+      reinterpret_cast<mlx_array*>(&block_table),
+      reinterpret_cast<mlx_array*>(&seq_lens),
+      reinterpret_cast<mlx_array*>(&cu_seqlens_q),
+      reinterpret_cast<mlx_array*>(&k_scale),
+      reinterpret_cast<mlx_array*>(&v_scale),
+      /*scale=*/0.125f,
+      /*softcap=*/0.0f,
+      /*sliding_window=*/0,
+      /*block_size=*/16,
+      /*num_q_heads=*/8,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*kv_dtype_raw=*/3);
+  if (out == nullptr) {
+    return 1;
+  }
+
+  delete reinterpret_cast<array*>(out);
+  return 0;
+}
+
+/// A per-sequence query span larger than its declared context must be rejected
+/// during `eval_gpu`, before the Metal kernel can leave early query rows in the
+/// malloc-backed output unwritten.
+///
+/// Return codes:
+///   1  — eval_gpu produced the expected runtime validation error.
+///   0  — evaluation reached dispatch without rejecting the bad span.
+///  -1  — setup failed or a different exception was produced.
+///  -3  — Metal is unavailable; eval-based verification skipped.
+int mlx_paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_seq_len() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  std::vector<uint16_t> q_host(2 * 8 * 64, 0);
+  std::vector<uint16_t> k_pool_host(4 * 4 * 8 * 16 * 8, 0);
+  std::vector<uint16_t> v_pool_host(4 * 4 * 64 * 16, 0);
+  std::vector<int32_t> block_table_host = {0, 0, 0, 0};
+  std::vector<int32_t> seq_lens_host = {1};
+  std::vector<int32_t> cu_seqlens_q_host = {0, 2};
+
+  auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
+    auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
+    return array(p, std::move(shape), bfloat16);
+  };
+
+  array q = bf16_arr(q_host, Shape{2, 8, 64});
+  array k_pool = bf16_arr(k_pool_host, Shape{4, 4, 8, 16, 8});
+  array v_pool = bf16_arr(v_pool_host, Shape{4, 4, 64, 16});
+  array block_table(block_table_host.data(), Shape{1, 4}, int32);
+  array seq_lens(seq_lens_host.data(), Shape{1}, int32);
+  array cu_seqlens_q(cu_seqlens_q_host.data(), Shape{2}, int32);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    auto out = paged_attention_varlen(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        cu_seqlens_q,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+    mlx::core::eval(out);
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    if (what.find("[runtime] PagedAttentionVarlen::eval_gpu") !=
+            std::string::npos &&
+        what.find("query span") != std::string::npos) {
+      return 1;
+    }
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_"
+        "seq_len] unexpected invalid_argument: %s\n",
+        e.what());
+    return -1;
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_"
+        "seq_len] unexpected exception: %s\n",
+        e.what());
+    return -1;
+  }
+
+  return 0;
+}
+
 /// cu_seqlens_q with the wrong length must be rejected.
 int mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() {
   using namespace mlx::core;
@@ -6324,6 +6561,323 @@ int mlx_paged_attention_varlen_compile_trace_smoke() {
     return -1;
   }
   return 1;
+}
+
+/// Shared model-free numerical parity implementation for the graph-native
+/// grouped paged kernels. The block table is a non-identity physical
+/// permutation and unused slots in the final physical block are NaNs, so an
+/// addressing, staging, or causal-mask regression fails loudly.
+static int grouped_graph_parity_impl(
+    int query_rows,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int context_len,
+    float attention_scale,
+    int sliding_window,
+    const char* label) {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+  if ((query_rows != 1 && query_rows != 2) || num_q_heads <= 0 ||
+      num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0 ||
+      head_size <= 0 || context_len <= 512) {
+    return -1;
+  }
+
+  const int kNumQHeads = num_q_heads;
+  const int kNumKvHeads = num_kv_heads;
+  const int kHeadSize = head_size;
+  constexpr int kBlockSize = 16;
+  constexpr int kXPack = 8;
+  const float kScale = attention_scale;
+  const int kSlidingWindow = sliding_window;
+  const int logical_blocks =
+      (context_len + kBlockSize - 1) / kBlockSize;
+  const int num_physical_blocks = logical_blocks + 3;
+
+  auto f32_to_bf16 = [](float value) -> uint16_t {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    return static_cast<uint16_t>((bits + 0x7fffu + lsb) >> 16);
+  };
+  auto bf16_to_f32 = [](uint16_t bits) -> float {
+    uint32_t wide = static_cast<uint32_t>(bits) << 16;
+    float value;
+    std::memcpy(&value, &wide, sizeof(value));
+    return value;
+  };
+
+  try {
+    const size_t elems_per_kv_head =
+        static_cast<size_t>(kHeadSize) * kBlockSize;
+    const size_t elems_per_physical_block =
+        static_cast<size_t>(kNumKvHeads) * elems_per_kv_head;
+    // Quiet BF16 NaN. Real logical tokens overwrite every K/V dimension;
+    // unused tail slots deliberately remain NaN.
+    std::vector<uint16_t> k_pool_bits(
+        static_cast<size_t>(num_physical_blocks) * elems_per_physical_block,
+        0x7fc1u);
+    std::vector<uint16_t> v_pool_bits(k_pool_bits.size(), 0x7fc1u);
+    std::vector<int32_t> block_table(logical_blocks);
+
+    for (int logical_block = 0; logical_block < logical_blocks;
+         ++logical_block) {
+      // Reverse the logical pages into distinct non-zero physical pages.
+      block_table[logical_block] = logical_blocks - logical_block;
+    }
+
+    auto k_value = [](int token, int kv_head, int dim) -> float {
+      return std::sin(
+                 0.019f * static_cast<float>(token) +
+                 0.31f * static_cast<float>(kv_head) +
+                 0.011f * static_cast<float>(dim)) *
+          0.32f;
+    };
+    auto v_value = [](int token, int kv_head, int dim) -> float {
+      return std::sin(
+                 0.013f * static_cast<float>(token) +
+                 0.17f * static_cast<float>(kv_head) +
+                 0.007f * static_cast<float>(dim)) *
+          0.25f;
+    };
+    auto q_value = [](int row, int q_head, int dim) -> float {
+      return std::cos(
+                 0.37f * static_cast<float>(row) +
+                 0.071f * static_cast<float>(q_head) +
+                 0.017f * static_cast<float>(dim)) *
+          0.29f;
+    };
+
+    for (int token = 0; token < context_len; ++token) {
+      const int logical_block = token / kBlockSize;
+      const int block_offset = token % kBlockSize;
+      const int physical_block = block_table[logical_block];
+      for (int kv_head = 0; kv_head < kNumKvHeads; ++kv_head) {
+        const size_t head_base =
+            static_cast<size_t>(physical_block) * elems_per_physical_block +
+            static_cast<size_t>(kv_head) * elems_per_kv_head;
+        for (int dim = 0; dim < kHeadSize; ++dim) {
+          const size_t k_idx = head_base +
+              static_cast<size_t>(dim / kXPack) * kBlockSize * kXPack +
+              static_cast<size_t>(block_offset) * kXPack + dim % kXPack;
+          const size_t v_idx =
+              head_base + static_cast<size_t>(dim) * kBlockSize + block_offset;
+          k_pool_bits[k_idx] = f32_to_bf16(k_value(token, kv_head, dim));
+          v_pool_bits[v_idx] = f32_to_bf16(v_value(token, kv_head, dim));
+        }
+      }
+    }
+
+    std::vector<uint16_t> q_bits(
+        static_cast<size_t>(query_rows) * kNumQHeads * kHeadSize);
+    for (int row = 0; row < query_rows; ++row) {
+      for (int head = 0; head < kNumQHeads; ++head) {
+        for (int dim = 0; dim < kHeadSize; ++dim) {
+          const size_t idx =
+              (static_cast<size_t>(row) * kNumQHeads + head) * kHeadSize + dim;
+          q_bits[idx] = f32_to_bf16(q_value(row, head, dim));
+        }
+      }
+    }
+
+    auto* q_data = reinterpret_cast<const bfloat16_t*>(q_bits.data());
+    auto* k_data = reinterpret_cast<const bfloat16_t*>(k_pool_bits.data());
+    auto* v_data = reinterpret_cast<const bfloat16_t*>(v_pool_bits.data());
+    array q(
+        q_data,
+        Shape{query_rows, kNumQHeads, kHeadSize},
+        bfloat16);
+    array k_pool(
+        k_data,
+        Shape{
+            num_physical_blocks,
+            kNumKvHeads,
+            kHeadSize / kXPack,
+            kBlockSize,
+            kXPack},
+        bfloat16);
+    array v_pool(
+        v_data,
+        Shape{num_physical_blocks, kNumKvHeads, kHeadSize, kBlockSize},
+        bfloat16);
+    array block_table_arr(
+        block_table.data(), Shape{1, logical_blocks}, int32);
+    const int32_t seq_len_value = context_len;
+    array seq_lens(&seq_len_value, Shape{1}, int32);
+    array k_scale(1.0f, float32);
+    array v_scale(1.0f, float32);
+
+    array out = [&]() {
+      if (query_rows == 1) {
+        return paged_attention(
+            q,
+            k_pool,
+            v_pool,
+            block_table_arr,
+            seq_lens,
+            k_scale,
+            v_scale,
+            /*scale=*/kScale,
+            /*softcap=*/1.0f,
+            /*sliding_window=*/kSlidingWindow,
+            kBlockSize,
+            kNumQHeads,
+            kNumKvHeads,
+            kHeadSize,
+            KvDtype::Bf16);
+      }
+      const int32_t cu_values[2] = {0, 2};
+      array cu_seqlens_q(cu_values, Shape{2}, int32);
+      return paged_attention_varlen(
+          q,
+          k_pool,
+          v_pool,
+          block_table_arr,
+          seq_lens,
+          cu_seqlens_q,
+          k_scale,
+          v_scale,
+          /*scale=*/kScale,
+          /*softcap=*/1.0f,
+          /*sliding_window=*/kSlidingWindow,
+          kBlockSize,
+          kNumQHeads,
+          kNumKvHeads,
+          kHeadSize,
+          KvDtype::Bf16);
+    }();
+    mlx::core::eval(out);
+
+    const auto* out_bits =
+        reinterpret_cast<const uint16_t*>(out.data<bfloat16_t>());
+    float max_diff = 0.0f;
+    size_t max_idx = 0;
+    for (int row = 0; row < query_rows; ++row) {
+      const int effective_context = context_len - query_rows + row + 1;
+      const int first_token = kSlidingWindow > 0
+          ? std::max(0, effective_context - kSlidingWindow)
+          : 0;
+      const int visible_tokens = effective_context - first_token;
+      for (int head = 0; head < kNumQHeads; ++head) {
+        const int kv_head = head / (kNumQHeads / kNumKvHeads);
+        const size_t q_idx =
+            (static_cast<size_t>(row) * kNumQHeads + head) * kHeadSize;
+        std::vector<float> weights(visible_tokens);
+        float max_score = -INFINITY;
+        for (int token = first_token; token < effective_context; ++token) {
+          float score = 0.0f;
+          for (int dim = 0; dim < kHeadSize; ++dim) {
+            const float q_dim = bf16_to_f32(q_bits[q_idx + dim]);
+            const float k_dim = bf16_to_f32(
+                f32_to_bf16(k_value(token, kv_head, dim)));
+            score += q_dim * k_dim;
+          }
+          const int visible_idx = token - first_token;
+          weights[visible_idx] = score * kScale;
+          if (weights[visible_idx] > max_score) {
+            max_score = weights[visible_idx];
+          }
+        }
+        float sum = 0.0f;
+        for (float& weight : weights) {
+          weight = std::exp(weight - max_score);
+          sum += weight;
+        }
+        const float inv_sum = 1.0f / (sum + 1e-6f);
+
+        for (int dim = 0; dim < kHeadSize; ++dim) {
+          float expected = 0.0f;
+          for (int token = first_token; token < effective_context; ++token) {
+            const float value = bf16_to_f32(
+                f32_to_bf16(v_value(token, kv_head, dim)));
+            expected += weights[token - first_token] * inv_sum * value;
+          }
+          const size_t out_idx =
+              (static_cast<size_t>(row) * kNumQHeads + head) * kHeadSize + dim;
+          const float actual = bf16_to_f32(out_bits[out_idx]);
+          const float diff = std::fabs(actual - expected);
+          if (!std::isfinite(actual) || diff > max_diff) {
+            max_diff = diff;
+            max_idx = out_idx;
+          }
+        }
+      }
+    }
+
+    // BF16 output quantization dominates; this is roughly five ULP at the
+    // synthetic output magnitudes and still catches indexing/masking errors.
+    if (!std::isfinite(max_diff) || max_diff > 0.01f) {
+      fprintf(
+          stderr,
+          "[%s] q=%d kv=%d rows=%d "
+          "max_diff=%g at output index %zu\n",
+          label,
+          kNumQHeads,
+          kNumKvHeads,
+          query_rows,
+          static_cast<double>(max_diff),
+          max_idx);
+      return -1;
+    }
+    return 1;
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[%s] q=%d kv=%d rows=%d "
+        "threw: %s\n",
+        label,
+        kNumQHeads,
+        kNumKvHeads,
+        query_rows,
+        e.what());
+    return -1;
+  } catch (...) {
+    return -1;
+  }
+}
+
+/// Exact-shape graph parity for the established Qwen3.5/3.6 grouped route.
+int mlx_paged_grouped_qwen35_graph_parity(
+    int query_rows,
+    int num_q_heads,
+    int num_kv_heads) {
+  const bool supported_heads =
+      (num_q_heads == 24 && num_kv_heads == 4) ||
+      (num_q_heads == 16 && num_kv_heads == 2);
+  if ((query_rows != 1 && query_rows != 2) || !supported_heads) {
+    return -1;
+  }
+  const bool moe_shape = num_q_heads == 16;
+  const int context_len = query_rows == 1
+      ? (moe_shape ? 32769 : 16385)
+      : (moe_shape ? 16386 : 8194);
+  return grouped_graph_parity_impl(
+      query_rows,
+      num_q_heads,
+      num_kv_heads,
+      /*head_size=*/256,
+      context_len,
+      /*attention_scale=*/1.0f / 16.0f,
+      /*sliding_window=*/73,
+      "mlx_paged_grouped_qwen35_graph_parity");
+}
+
+/// Exact-shape graph parity for Gemma 4's staged D512/16Q/1KV route.
+int mlx_paged_grouped_gemma4_graph_parity(int context_len) {
+  return grouped_graph_parity_impl(
+      /*query_rows=*/1,
+      /*num_q_heads=*/16,
+      /*num_kv_heads=*/1,
+      /*head_size=*/512,
+      context_len,
+      /*attention_scale=*/1.0f,
+      /*sliding_window=*/0,
+      "mlx_paged_grouped_gemma4_graph_parity");
 }
 
 } // extern "C"

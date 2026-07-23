@@ -173,6 +173,7 @@ impl DecoderLayer {
         position_ids: Option<&MxArray>,
         use_kernel: bool,
         rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -214,6 +215,7 @@ impl DecoderLayer {
                     is_prefill,
                     position_ids,
                     rope_position_offset,
+                    mrope_cache,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
@@ -255,5 +257,19 @@ impl DecoderLayer {
             up_proj,
             down_proj,
         });
+    }
+
+    /// Whether any main-model projection in this decoder layer is quantized,
+    /// including routed experts and shared-expert projections.
+    pub fn is_quantized(&self) -> bool {
+        let attention = match &self.attn {
+            AttentionType::Linear(gdn) => gdn.is_quantized(),
+            AttentionType::Full(attn) => attn.is_quantized(),
+        };
+        let mlp = match &self.mlp {
+            MLPType::Dense(mlp) => mlp.is_quantized(),
+            MLPType::MoE(moe) => moe.is_quantized(),
+        };
+        attention || mlp
     }
 }

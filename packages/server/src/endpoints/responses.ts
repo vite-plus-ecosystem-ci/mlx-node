@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
+import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -340,6 +341,10 @@ async function handleStreamingNative(
   visibility: TransportVisibility,
   serverTiming?: ServerTimingForUsage,
 ): Promise<StreamingHandlerOutcome> {
+  // `runSessionStreaming` completed the exact token/capacity preflight before
+  // handing us this iterator. Commit SSE immediately instead of entering the
+  // generator here: its first `next()` also starts image processing/prefill and
+  // may not resolve until the first generated token.
   beginSSE(res);
   // Commit to SSE wire format synchronously so the outer catch
   // branches on `responseMode` (not `headersSent`) and routes an
@@ -1461,7 +1466,18 @@ async function runSessionStreaming(
   signal: AbortSignal | undefined,
   isFreshSession: boolean,
 ): Promise<StreamingOutcome> {
+  // Preserve the startFromHistoryStream precondition outside the lazy
+  // generator. Without this guard an accepted `input: []` request would commit
+  // SSE and only then throw when iteration begins; the former eager-first-item
+  // path surfaced the same deterministic error before selecting wire format.
+  if (messages.length === 0) {
+    throw new Error('ChatSession: startFromHistoryStream() requires a primed history');
+  }
   if (session.turns === 0) {
+    // Fresh/replay requests carry their complete canonical history in
+    // `messages`. Validate it before reset so context overflow cannot mutate
+    // native state and still receives a JSON 400 before SSE begins.
+    const constrainedConfig = await session.preflightContextCapacity(messages, config);
     // See `runSessionNonStreaming` for the full rationale. A fresh
     // JS session inherits the shared native model's KV cache from
     // prior requests; without an explicit `reset()` here the native
@@ -1479,7 +1495,7 @@ async function runSessionStreaming(
     session.primeHistory(messages);
     const initialTurns = session.turns;
     return {
-      stream: session.startFromHistoryStream(config, signal),
+      stream: session.startFromHistoryStream(constrainedConfig, signal),
       wasCommitted: () => session.turns > initialTurns,
     };
   }
@@ -1491,10 +1507,17 @@ async function runSessionStreaming(
   if (newInputMessages.length === 1) {
     const last = newInputMessages[0]!;
     if (last.role === 'user') {
+      // Tier-2 prompt-cache hits may carry only this new message in the HTTP
+      // request while the leased ChatSession owns the prior conversation.
+      // Preflight against that authoritative private history, not `messages`.
+      const constrainedConfig = await session.preflightPendingContextCapacity(last, config);
       const initialTurns = session.turns;
       const images = last.images ?? undefined;
       return {
-        stream: session.sendStream(last.content, images ? { images, config, signal } : { config, signal }),
+        stream: session.sendStream(
+          last.content,
+          images ? { images, config: constrainedConfig, signal } : { config: constrainedConfig, signal },
+        ),
         wasCommitted: () => session.turns > initialTurns,
       };
     }
@@ -1502,13 +1525,18 @@ async function runSessionStreaming(
       if (!last.toolCallId) {
         throw new Error('tool message missing toolCallId');
       }
+      const constrainedConfig = await session.preflightPendingContextCapacity(last, config);
       const initialTurns = session.turns;
       return {
         // Forward the structured `isError` field through to the native
         // renderer so the streaming wire-format `[tool error]` marker
         // stays in sync with the Anthropic `tool_result.is_error === true`
         // source field — same contract as the non-streaming path above.
-        stream: session.sendToolResultStream(last.toolCallId, last.content, { config, signal, isError: last.isError }),
+        stream: session.sendToolResultStream(last.toolCallId, last.content, {
+          config: constrainedConfig,
+          signal,
+          isError: last.isError,
+        }),
         wasCommitted: () => session.turns > initialTurns,
       };
     }
@@ -1523,6 +1551,7 @@ async function runSessionStreaming(
   // messages), keep the native KV cache so the prefix verifier can
   // reuse it on the replayed `chat_session_start_sync`; on MISS, wipe
   // to block cross-request cache-affinity leakage.
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   if (isFreshSession) {
     await session.reset();
   } else {
@@ -1531,7 +1560,7 @@ async function runSessionStreaming(
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
-    stream: session.startFromHistoryStream(config, signal),
+    stream: session.startFromHistoryStream(constrainedConfig, signal),
     wasCommitted: () => session.turns > initialTurns,
   };
 }
@@ -3439,9 +3468,14 @@ export async function handleCreateResponse(
             // already received — or no output at all if the terminal
             // already landed.
             if (visibility.responseMode === null) {
-              // Headers never went out. Safe to emit a clean 500 JSON
-              // error.
-              sendInternalError(res, message);
+              // Capacity failures are deterministic request errors, raised
+              // before native cache mutation. Keep them out of the generic
+              // 500 path so clients can compact/truncate and retry.
+              if (isContextCapacityError(err)) {
+                sendBadRequest(res, message);
+              } else {
+                sendInternalError(res, message);
+              }
             } else if (visibility.responseMode === 'json') {
               // We already wrote `Content-Type: application/json` and
               // possibly some body bytes; emitting an SSE frame here
